@@ -7156,8 +7156,18 @@ impl GatewayHandler {
                 // collide with a previous one.
                 match shard_db.get_idempotency_epoch(0, key_hash).await {
                     Ok(Some(_prev_epoch)) => {
-                        // Already committed — discard buffer and return COMMIT noop
+                        // Already committed — discard buffer and return COMMIT noop.
+                        // Clear the consumed key from session state: it has done its
+                        // job (recognising this exact retry), and if we left it set,
+                        // the *next* commit on this connection — e.g. the next
+                        // autocommitting bare INSERT — would reuse it, be misread as
+                        // another replay of the same key, and be silently discarded
+                        // instead of persisted. See RS write.idempotency_key_stuck.
                         entry.clear();
+                        if let Some(mut session) = self.sessions.get_mut(conn_id) {
+                            session.idempotency_key = None;
+                            session.source_epoch_envelope = None;
+                        }
                         return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
                             "COMMIT",
                         )))]);
@@ -7205,6 +7215,23 @@ impl GatewayHandler {
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
         self.frontier_published_at_ms
             .store(current_time_ms(), Ordering::SeqCst);
+
+        // The explicit idempotency envelope (if any) has now been durably
+        // recorded against this epoch and its write applied. Clear it from
+        // session state so a *subsequent* commit on this connection — e.g.
+        // the next autocommitting bare INSERT after a `SET
+        // rockstream.idempotency_key` the caller forgot to re-issue — mints
+        // its own fresh, collision-free server-generated key instead of
+        // silently matching this commit's key and being discarded as a
+        // duplicate. Left unset on error paths above so a commit that
+        // genuinely failed to persist (epoch exhaustion, storage error) can
+        // still be safely retried with the same client-supplied key.
+        if !server_generated {
+            if let Some(mut session) = self.sessions.get_mut(conn_id) {
+                session.idempotency_key = None;
+                session.source_epoch_envelope = None;
+            }
+        }
 
         // ── Last hop: materialise dependent views ─────────────────────────────
         // Collect the unique tables touched by this commit, then re-evaluate
@@ -10261,6 +10288,37 @@ impl GatewayServer {
 
                         let mut peek_buf = [0u8; 8];
                         if let Ok(8) = socket.peek(&mut peek_buf).await {
+                            if tls_acceptor_ref.is_none() {
+                                // A modern libpq client probes with SSLRequest before its
+                                // real StartupMessage even on a plaintext connection
+                                // (`sslmode=prefer` is the default). The grease-detection
+                                // block below only ever inspected the *first* thing on the
+                                // wire, so whenever that was an SSLRequest, grease detection
+                                // never ran and the client's real StartupMessage — still
+                                // carrying the `_pq_.` probe — went straight into
+                                // `pgwire::tokio::process_socket` below, which cannot parse
+                                // `_pq_.` parameters and silently closed the connection.
+                                // Decline the SSLRequest ourselves so we can inspect what
+                                // follows it too, exactly as we already do when a client
+                                // skips SSLRequest and sends its StartupMessage directly.
+                                if peek_buf == [0, 0, 0, 8, 4, 210, 22, 47] {
+                                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                    let mut ssl_req = [0u8; 8];
+                                    let declined = socket.read_exact(&mut ssl_req).await.is_ok()
+                                        && socket.write_all(b"N").await.is_ok()
+                                        && socket.flush().await.is_ok();
+                                    if declined {
+                                        // Re-peek: this is now either the client's real
+                                        // StartupMessage, or nothing (client hung up after
+                                        // 'N'). A failed peek leaves `peek_buf` holding the
+                                        // stale SSLRequest bytes, which no longer match a
+                                        // startup-packet shape below and fall through to
+                                        // `process_socket`, which handles EOF the same way
+                                        // it always did.
+                                        let _ = socket.peek(&mut peek_buf).await;
+                                    }
+                                }
+                            }
                             if tls_acceptor_ref.is_none()
                                 && peek_buf != [0, 0, 0, 8, 4, 210, 22, 47]
                             {
@@ -10282,8 +10340,17 @@ impl GatewayServer {
                                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                                     let mut full_msg = vec![0u8; msg_len];
                                     if socket.read_exact(&mut full_msg).await.is_ok() {
-                                        // Parse _pq_.* parameters for NegotiateProtocolVersion ('v')
+                                        // Parse _pq_.* parameters for NegotiateProtocolVersion ('v'),
+                                        // recording each one's byte span so it can be stripped from
+                                        // the relayed startup packet below — a real Postgres backend
+                                        // recognises and discards `_pq_.` keys rather than forwarding
+                                        // them as regular connection parameters, and the underlying
+                                        // `pgwire` crate has no notion of them at all: relaying them
+                                        // unstripped causes it to reject the startup packet, which is
+                                        // why a `psql`/libpq client that sends this protocol-version
+                                        // "grease" probe used to see the connection silently closed.
                                         let mut pq_options = Vec::new();
+                                        let mut strip_spans: Vec<(usize, usize)> = Vec::new();
                                         let mut idx = 8;
                                         while idx < full_msg.len() {
                                             let key_start = idx;
@@ -10308,12 +10375,21 @@ impl GatewayServer {
                                             }
                                             if key.starts_with("_pq_.") {
                                                 pq_options.push(key);
+                                                strip_spans.push((key_start, idx));
                                             }
                                         }
 
                                         // Send NegotiateProtocolVersion ('v') specifying minor version 0
                                         let mut payload = Vec::new();
-                                        payload.extend_from_slice(&0u32.to_be_bytes()); // minor ver 0
+                                        // NegotiateProtocolVersion's Int32 encodes the full
+                                        // negotiated protocol version as (major << 16 | minor) —
+                                        // the same packed encoding used in StartupMessage's own
+                                        // version field — not the bare minor number alone. Sending
+                                        // a bare `0` here decodes on the client side as major=0,
+                                        // which real libpq rejects as "downgrade to pre-3.0
+                                        // protocol version" (confirmed against the error strings
+                                        // in libpq.so): the fix is to send the packed 3.0 value.
+                                        payload.extend_from_slice(&196608u32.to_be_bytes());
                                         payload.extend_from_slice(
                                             &(pq_options.len() as u32).to_be_bytes(),
                                         );
@@ -10330,8 +10406,16 @@ impl GatewayServer {
                                         let _ = socket.write_all(&neg_msg).await;
                                         let _ = socket.flush().await;
 
-                                        // Downgrade requested version in full_msg to 196608 (3.0)
+                                        // Strip the `_pq_.` parameter spans (highest offset first, so
+                                        // earlier recorded offsets stay valid) before relaying, then
+                                        // downgrade the version field to 196608 (3.0) and fix up the
+                                        // packet's length prefix now that bytes may have been removed.
+                                        for (start, end) in strip_spans.into_iter().rev() {
+                                            full_msg.drain(start..end);
+                                        }
                                         full_msg[4..8].copy_from_slice(&196608u32.to_be_bytes());
+                                        let new_len = full_msg.len() as u32;
+                                        full_msg[0..4].copy_from_slice(&new_len.to_be_bytes());
 
                                         relay_negotiated_3_2_connection(
                                             socket,
@@ -10446,6 +10530,37 @@ impl GatewayServer {
 
                             let mut peek_buf = [0u8; 8];
                             if let Ok(8) = socket.peek(&mut peek_buf).await {
+                                if tls_acceptor_ref.is_none() {
+                                    // A modern libpq client probes with SSLRequest before its
+                                    // real StartupMessage even on a plaintext connection
+                                    // (`sslmode=prefer` is the default). The grease-detection
+                                    // block below only ever inspected the *first* thing on the
+                                    // wire, so whenever that was an SSLRequest, grease detection
+                                    // never ran and the client's real StartupMessage — still
+                                    // carrying the `_pq_.` probe — went straight into
+                                    // `pgwire::tokio::process_socket` below, which cannot parse
+                                    // `_pq_.` parameters and silently closed the connection.
+                                    // Decline the SSLRequest ourselves so we can inspect what
+                                    // follows it too, exactly as we already do when a client
+                                    // skips SSLRequest and sends its StartupMessage directly.
+                                    if peek_buf == [0, 0, 0, 8, 4, 210, 22, 47] {
+                                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                        let mut ssl_req = [0u8; 8];
+                                        let declined = socket.read_exact(&mut ssl_req).await.is_ok()
+                                            && socket.write_all(b"N").await.is_ok()
+                                            && socket.flush().await.is_ok();
+                                        if declined {
+                                            // Re-peek: this is now either the client's real
+                                            // StartupMessage, or nothing (client hung up after
+                                            // 'N'). A failed peek leaves `peek_buf` holding the
+                                            // stale SSLRequest bytes, which no longer match a
+                                            // startup-packet shape below and fall through to
+                                            // `process_socket`, which handles EOF the same way
+                                            // it always did.
+                                            let _ = socket.peek(&mut peek_buf).await;
+                                        }
+                                    }
+                                }
                                 if tls_acceptor_ref.is_none()
                                     && peek_buf != [0, 0, 0, 8, 4, 210, 22, 47]
                                 {
@@ -10467,8 +10582,17 @@ impl GatewayServer {
                                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                                         let mut full_msg = vec![0u8; msg_len];
                                         if socket.read_exact(&mut full_msg).await.is_ok() {
-                                            // Parse _pq_.* parameters for NegotiateProtocolVersion ('v')
+                                            // Parse _pq_.* parameters for NegotiateProtocolVersion ('v'),
+                                            // recording each one's byte span so it can be stripped from
+                                            // the relayed startup packet below — a real Postgres backend
+                                            // recognises and discards `_pq_.` keys rather than forwarding
+                                            // them as regular connection parameters, and the underlying
+                                            // `pgwire` crate has no notion of them at all: relaying them
+                                            // unstripped causes it to reject the startup packet, which is
+                                            // why a `psql`/libpq client that sends this protocol-version
+                                            // "grease" probe used to see the connection silently closed.
                                             let mut pq_options = Vec::new();
+                                            let mut strip_spans: Vec<(usize, usize)> = Vec::new();
                                             let mut idx = 8;
                                             while idx < full_msg.len() {
                                                 let key_start = idx;
@@ -10494,12 +10618,21 @@ impl GatewayServer {
                                                 }
                                                 if key.starts_with("_pq_.") {
                                                     pq_options.push(key);
+                                                    strip_spans.push((key_start, idx));
                                                 }
                                             }
 
                                             // Send NegotiateProtocolVersion ('v') specifying minor version 0
                                             let mut payload = Vec::new();
-                                            payload.extend_from_slice(&0u32.to_be_bytes()); // minor ver 0
+                                            // NegotiateProtocolVersion's Int32 encodes the full
+                                            // negotiated protocol version as (major << 16 | minor) —
+                                            // the same packed encoding used in StartupMessage's own
+                                            // version field — not the bare minor number alone. Sending
+                                            // a bare `0` here decodes on the client side as major=0,
+                                            // which real libpq rejects as "downgrade to pre-3.0
+                                            // protocol version" (confirmed against the error strings
+                                            // in libpq.so): the fix is to send the packed 3.0 value.
+                                            payload.extend_from_slice(&196608u32.to_be_bytes());
                                             payload.extend_from_slice(
                                                 &(pq_options.len() as u32).to_be_bytes(),
                                             );
@@ -10516,9 +10649,17 @@ impl GatewayServer {
                                             let _ = socket.write_all(&neg_msg).await;
                                             let _ = socket.flush().await;
 
-                                            // Downgrade requested version in full_msg to 196608 (3.0)
+                                            // Strip the `_pq_.` parameter spans (highest offset first, so
+                                            // earlier recorded offsets stay valid) before relaying, then
+                                            // downgrade the version field to 196608 (3.0) and fix up the
+                                            // packet's length prefix now that bytes may have been removed.
+                                            for (start, end) in strip_spans.into_iter().rev() {
+                                                full_msg.drain(start..end);
+                                            }
                                             full_msg[4..8]
                                                 .copy_from_slice(&196608u32.to_be_bytes());
+                                            let new_len = full_msg.len() as u32;
+                                            full_msg[0..4].copy_from_slice(&new_len.to_be_bytes());
 
                                             relay_negotiated_3_2_connection(
                                                 socket,
@@ -13281,7 +13422,16 @@ fn parse_create_view_query(q: &str) -> Option<String> {
     let after_lower = &ql[name_start..];
     let as_pos_in_after = find_as_separator(after_lower)?;
     // Skip the leading space (1) + "as" (2) = 3 bytes, then trim surrounding whitespace.
-    Some(q[name_start + as_pos_in_after + 3..].trim().to_string())
+    let query = q[name_start + as_pos_in_after + 3..].trim();
+    // Strip a trailing statement-terminating `;`, if present. Without this, the
+    // semicolon becomes part of the *stored* view SQL, and `inline_view_dependencies`
+    // later embeds that stored text verbatim inside a subquery — e.g. a view that
+    // joins against another view gets compiled as `JOIN (SELECT ... GROUP BY x;) v
+    // ON ...`, a stray `;` stranded inside the parentheses that the SQL parser
+    // rejects. A trailing `;` is a statement separator, never part of the SELECT
+    // itself, so it must never be persisted as part of a view's definition.
+    let query = query.strip_suffix(';').unwrap_or(query).trim_end();
+    Some(query.to_string())
 }
 
 #[derive(Default)]
