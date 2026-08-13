@@ -60,10 +60,20 @@ async fn test_protocol_3_2_negotiation_reply() {
     );
 
     let msg_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    let minor_ver = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
+    // NegotiateProtocolVersion's Int32 encodes the full negotiated protocol
+    // version as (major << 16 | minor) — the same packed encoding used in
+    // StartupMessage's own version field — not a bare minor number. 196608
+    // (0x00030000) is protocol 3.0. A bare `0` here would decode on the
+    // client side as major version 0, which real libpq rejects as
+    // "downgrade to pre-3.0 protocol version" (confirmed against the error
+    // strings in libpq.so while diagnosing this exact miscoding elsewhere).
+    let negotiated_version = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
     let option_count = u32::from_be_bytes([buf[9], buf[10], buf[11], buf[12]]);
 
-    assert_eq!(minor_ver, 0, "Server must downgrade to minor version 0");
+    assert_eq!(
+        negotiated_version, 196608,
+        "Server must downgrade to protocol 3.0, packed as (major << 16 | minor)"
+    );
     assert!(
         option_count >= 1,
         "Expected at least 1 unrecognized _pq_ option"
