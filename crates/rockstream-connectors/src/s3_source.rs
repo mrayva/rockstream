@@ -143,10 +143,24 @@ impl S3Source {
     fn parse_rows(data: &[u8]) -> Result<Vec<SourceRow>, SourceError> {
         let text = String::from_utf8_lossy(data);
         let trimmed = text.trim();
-        if trimmed.starts_with('[') {
-            return serde_json::from_str(trimmed).map_err(|error| SourceError::PollDeltaFailed {
-                reason: format!("S3 JSON array decoding failed: {error}"),
-            });
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Try the whole body as a single JSON array of rows first. This is
+        // NOT gated on the body starting with `[`: that heuristic is
+        // ambiguous, because NDJSON (one row per line) also starts with `[`
+        // whenever the row shape is itself array-like (e.g. `[0]\n[1]\n...`),
+        // which is indistinguishable from a genuine single combined array
+        // (`[[0],[1],...]`) by looking at the first character alone.
+        // `serde_json::from_str` requires the entire input to be consumed,
+        // so a real NDJSON body reliably fails this parse (the first line's
+        // closing bracket becomes unconsumed trailing data, or — for a body
+        // whose first line decodes as a bare non-array/object row — the
+        // untagged `SourceRow` enum fails to match at all) and falls through
+        // to the line-by-line path below, while a genuine single-array body
+        // parses here directly.
+        if let Ok(rows) = serde_json::from_str::<Vec<SourceRow>>(trimmed) {
+            return Ok(rows);
         }
         trimmed
             .lines()
