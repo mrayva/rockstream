@@ -1045,8 +1045,14 @@ impl StatefulPipeline {
 /// `compile_multi_aggregate_lanes` in `compile.rs`.
 #[derive(Debug, Clone, Copy)]
 pub enum FinalizeCol {
-    /// Pass the payload column at this index through unchanged.
-    Direct(usize),
+    /// Pass the payload column at this index through, collapsing any NULL
+    /// produced by the cascade join's `OuterJoinOp` NULL-pad (an unmatched
+    /// group for this lane — see `MultiAggregatePipeline`'s doc comment)
+    /// down to `0` when `zero_for_no_match` is set (`SUM`/`COUNT`'s SQL
+    /// identity for "no rows"), or leaving it as a genuine SQL `NULL`
+    /// otherwise (`MIN`/`MAX`'s identity — there is no extremum of an
+    /// empty set).
+    Direct { idx: usize, zero_for_no_match: bool },
     /// v0.51.6 Slice 4: combine a `(sum, count)` `Int64` pair — forwarded
     /// through the join cascade instead of `AggregateOp`'s already-`Float64`
     /// `avg_v` (see the `AggregateFunc::Avg` arm in `compile.rs`) because
@@ -1138,13 +1144,43 @@ impl MultiAggregatePipeline {
         let mut cols: Vec<ArrayRef> = vec![k_col];
         for (i, col_kind) in self.finalize.iter().enumerate() {
             match *col_kind {
-                FinalizeCol::Direct(idx) => {
+                FinalizeCol::Direct {
+                    idx,
+                    zero_for_no_match,
+                } => {
                     let col = acc.data.column(1 + idx).clone();
-                    fields.push(Field::new(
-                        format!("agg{i}"),
-                        col.data_type().clone(),
-                        false,
-                    ));
+                    // A NULL here is `OuterJoinOp`'s NULL-pad for a group
+                    // that had zero matching rows in this lane (e.g. a
+                    // `COUNT(DISTINCT CASE WHEN .. THEN col END)` lane where
+                    // no row in the group matched the CASE condition — see
+                    // `MultiAggregatePipeline`'s doc comment). For
+                    // `SUM`/`COUNT` lanes that NULL must read back as `0`
+                    // (their SQL identity for "no rows"), not a genuine SQL
+                    // NULL — otherwise a query like Nexmark q15 reports
+                    // `high_bidders = NULL` instead of `0` for buckets with
+                    // no high bids. `MIN`/`MAX` lanes keep the NULL as-is:
+                    // the extremum of an empty set genuinely is NULL.
+                    let col = if zero_for_no_match {
+                        let ints = col
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("Direct finalize column must be Int64");
+                        Arc::new(Int64Array::new(ints.values().clone(), None)) as ArrayRef
+                    } else {
+                        col
+                    };
+                    // Nullable, not `false`: a hardcoded `false` here caused
+                    // `RecordBatch::try_new` below to reject the batch
+                    // outright ("Column 'aggN' is declared as non-nullable
+                    // but contains null values") whenever a `MIN`/`MAX` lane
+                    // legitimately produced NULL, silently killing the
+                    // refresh for every subsequent commit. A stable `true`
+                    // here is also safer than computing nullability from
+                    // this one batch's data (`col.null_count() > 0`), since
+                    // this schema is reconstructed fresh on every
+                    // `finalize_row` call and must not flip nullability
+                    // across refresh cycles.
+                    fields.push(Field::new(format!("agg{i}"), col.data_type().clone(), true));
                     cols.push(col);
                 }
                 FinalizeCol::Avg { sum_idx, count_idx } => {

@@ -803,7 +803,16 @@ fn compile_multi_aggregate_lanes(
                 NamedExpr::new("agg", Expr::Column(result_col)),
             ]))));
             lane_widths.push(1);
-            finalize.push(crate::live_exec::FinalizeCol::Direct(next_payload_idx));
+            // SUM/COUNT's SQL identity for "no rows matched this lane" is
+            // `0` (the `OuterJoinOp` NULL-pad case — see `FinalizeCol`'s
+            // doc comment); MIN/MAX's is a genuine SQL `NULL` (there is no
+            // extremum of an empty set), so their NULL-pad must stay NULL.
+            let zero_for_no_match =
+                !matches!(agg.func, AggregateFunc::Min | AggregateFunc::Max);
+            finalize.push(crate::live_exec::FinalizeCol::Direct {
+                idx: next_payload_idx,
+                zero_for_no_match,
+            });
             next_payload_idx += 1;
         }
         let mut pipeline = StatefulPipeline::new();
