@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::compatibility::{
+    ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
+};
 use crate::ids::{ShardId, WorkerId};
 use crate::lease::{ShardLease, ShardRevokeReason};
 
@@ -138,6 +141,12 @@ pub struct WorkerRegistration {
     /// Worker feature/capability advertisement.
     #[serde(default)]
     pub capabilities: WorkerCapabilities,
+    /// Inclusive gRPC protocol range accepted by this worker.
+    #[serde(default)]
+    pub protocol_range: SupportedVersionRange,
+    /// Inclusive shard storage-format range accepted by this worker.
+    #[serde(default)]
+    pub storage_format_range: SupportedStorageFormatRange,
     /// Wall-clock timestamp (ms since Unix epoch) when the registration was
     /// sent.
     pub registered_at_ms: u64,
@@ -162,6 +171,8 @@ impl WorkerRegistration {
             capacity_headroom,
             location: WorkerLocation::default(),
             capabilities: WorkerCapabilities::default(),
+            protocol_range: SupportedVersionRange::default(),
+            storage_format_range: SupportedStorageFormatRange::default(),
             registered_at_ms,
         }
     }
@@ -173,6 +184,16 @@ impl WorkerRegistration {
 
     pub fn with_capabilities(mut self, capabilities: WorkerCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_compatibility(
+        mut self,
+        protocol_range: SupportedVersionRange,
+        storage_format_range: SupportedStorageFormatRange,
+    ) -> Self {
+        self.protocol_range = protocol_range;
+        self.storage_format_range = storage_format_range;
         self
     }
 }
@@ -194,6 +215,12 @@ pub struct WorkerInfo {
     /// Worker feature/capability advertisement.
     #[serde(default)]
     pub capabilities: WorkerCapabilities,
+    /// Inclusive gRPC protocol range accepted by this worker.
+    #[serde(default)]
+    pub protocol_range: SupportedVersionRange,
+    /// Inclusive shard storage-format range accepted by this worker.
+    #[serde(default)]
+    pub storage_format_range: SupportedStorageFormatRange,
     /// When this worker registered (ms since Unix epoch).
     pub registered_at_ms: u64,
     /// Whether the worker is currently considered healthy.
@@ -213,6 +240,8 @@ impl WorkerInfo {
             capacity_headroom: reg.capacity_headroom,
             location: reg.location.clone(),
             capabilities: reg.capabilities,
+            protocol_range: reg.protocol_range,
+            storage_format_range: reg.storage_format_range,
             registered_at_ms: reg.registered_at_ms,
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
@@ -223,6 +252,19 @@ impl WorkerInfo {
     pub fn update_capacity(&mut self, headroom: CapacityHeadroom) {
         self.capacity_headroom = headroom;
     }
+}
+
+/// Whether every worker can run the requested protocol and storage format.
+pub fn assignment_compatible(
+    workers: &[WorkerInfo],
+    protocol: ProtocolVersion,
+    storage_format: StorageFormatVersion,
+) -> bool {
+    !workers.is_empty()
+        && workers.iter().all(|worker| {
+            worker.protocol_range.contains(protocol)
+                && worker.storage_format_range.contains(storage_format)
+        })
 }
 
 /// A control-plane message sent from the control service to a worker.
@@ -292,6 +334,12 @@ pub enum ControlMessage {
         message: String,
         /// Actionable operator guidance.
         next_steps: String,
+    },
+    /// Short-lived secret token encrypted for this worker identity.
+    SecretTokenIssued { token: crate::secret::SecretToken },
+    /// A secret changed and workers should request a fresh token at an epoch boundary.
+    SecretRotated {
+        rotation: crate::secret::SecretRotation,
     },
     /// Published by the control plane after all workers have reported their
     /// pressure samples; consumers (HPA adapters) read this gauge (v0.47).
@@ -364,6 +412,18 @@ pub enum WorkerLifecycleState {
         shards_remaining: u32,
         /// Wall-clock time (ms since Unix epoch) when the drain was requested.
         started_at_ms: u64,
+        /// Total bytes across owned shards at drain start.
+        #[serde(default)]
+        total_bytes: Option<u64>,
+        /// Estimated bytes remaining to drain.
+        #[serde(default)]
+        bytes_remaining: Option<u64>,
+        /// Total rows across owned shards at drain start.
+        #[serde(default)]
+        total_rows: Option<u64>,
+        /// Estimated rows remaining to drain.
+        #[serde(default)]
+        rows_remaining: Option<u64>,
     },
     /// All shards have been migrated away; the worker is idle and may exit.
     Decommissioned {
@@ -373,6 +433,18 @@ pub enum WorkerLifecycleState {
 }
 
 impl WorkerLifecycleState {
+    /// Construct a new `Draining` state.
+    pub fn draining(shards_remaining: u32, started_at_ms: u64) -> Self {
+        Self::Draining {
+            shards_remaining,
+            started_at_ms,
+            total_bytes: None,
+            bytes_remaining: None,
+            total_rows: None,
+            rows_remaining: None,
+        }
+    }
+
     /// Returns `true` if the worker is in the `Active` state.
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Active)
@@ -382,6 +454,144 @@ impl WorkerLifecycleState {
     /// (i.e., should not receive new shard assignments).
     pub fn is_draining_or_decommissioned(&self) -> bool {
         !self.is_active()
+    }
+
+    /// Progress phase description.
+    pub fn progress_phase(&self) -> String {
+        match self {
+            Self::Active => "active".to_string(),
+            Self::Draining { .. } => "draining".to_string(),
+            Self::Decommissioned { .. } => "decommissioned".to_string(),
+        }
+    }
+
+    /// Number of shards remaining to migrate.
+    pub fn shards_remaining(&self) -> Option<u32> {
+        match self {
+            Self::Active => None,
+            Self::Draining {
+                shards_remaining, ..
+            } => Some(*shards_remaining),
+            Self::Decommissioned { .. } => Some(0),
+        }
+    }
+
+    /// Bytes remaining to drain.
+    pub fn bytes_remaining(&self) -> Option<u64> {
+        match self {
+            Self::Active => None,
+            Self::Draining {
+                bytes_remaining,
+                shards_remaining,
+                total_bytes,
+                ..
+            } => {
+                if *shards_remaining == 0 {
+                    Some(0)
+                } else {
+                    bytes_remaining.or(*total_bytes)
+                }
+            }
+            Self::Decommissioned { .. } => Some(0),
+        }
+    }
+
+    /// Rows remaining to drain.
+    pub fn rows_remaining(&self) -> Option<u64> {
+        match self {
+            Self::Active => None,
+            Self::Draining {
+                rows_remaining,
+                shards_remaining,
+                total_rows,
+                ..
+            } => {
+                if *shards_remaining == 0 {
+                    Some(0)
+                } else {
+                    rows_remaining.or(*total_rows)
+                }
+            }
+            Self::Decommissioned { .. } => Some(0),
+        }
+    }
+
+    /// Bounded estimate of remaining drain time in milliseconds.
+    pub fn estimated_remaining_ms(&self) -> Option<u64> {
+        match self {
+            Self::Active => None,
+            Self::Decommissioned { .. } => Some(0),
+            Self::Draining {
+                shards_remaining,
+                started_at_ms,
+                total_bytes,
+                bytes_remaining,
+                ..
+            } => {
+                if *shards_remaining == 0 {
+                    return Some(0);
+                }
+                let bytes = bytes_remaining
+                    .or(*total_bytes)
+                    .unwrap_or((*shards_remaining as u64) * 10_000_000);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let elapsed_ms = now.saturating_sub(*started_at_ms).max(1);
+                let total = total_bytes.unwrap_or(bytes);
+                let drained = total.saturating_sub(bytes);
+                if drained > 0 {
+                    let rate = (drained as f64) / (elapsed_ms as f64);
+                    if rate > 0.0 {
+                        let ms = (bytes as f64 / rate) as u64;
+                        return Some(ms.min(600_000));
+                    }
+                }
+                Some(((bytes / (10 * 1024 * 1024)) * 1000).clamp(50, 60_000))
+            }
+        }
+    }
+
+    /// Monotonically advance drain progress.
+    pub fn advance_drain_progress(
+        &mut self,
+        new_shards_remaining: u32,
+        new_bytes_remaining: Option<u64>,
+        new_rows_remaining: Option<u64>,
+    ) {
+        if let Self::Draining {
+            shards_remaining,
+            total_bytes,
+            bytes_remaining,
+            total_rows,
+            rows_remaining,
+            ..
+        } = self
+        {
+            if new_shards_remaining == 0 {
+                *self = Self::Decommissioned {
+                    completed_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                };
+            } else {
+                *shards_remaining = (*shards_remaining).min(new_shards_remaining);
+                if let Some(b) = new_bytes_remaining {
+                    *bytes_remaining = Some(bytes_remaining.unwrap_or(b).min(b));
+                    if total_bytes.is_none() {
+                        *total_bytes = Some(b);
+                    }
+                }
+                if let Some(r) = new_rows_remaining {
+                    *rows_remaining = Some(rows_remaining.unwrap_or(r).min(r));
+                    if total_rows.is_none() {
+                        *total_rows = Some(r);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -604,6 +814,8 @@ pub enum WorkerMessage {
         /// migrate away its current shard set.
         worker_id: WorkerId,
     },
+    /// Request a short-lived token for a catalog secret.
+    ResolveSecretToken { secret_name: String },
 }
 
 #[cfg(test)]

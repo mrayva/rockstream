@@ -22,6 +22,7 @@ pub mod copy_state;
 pub mod error;
 pub mod multi_shard_reader;
 pub mod notify_registry;
+pub mod pgoutput_coordinator;
 pub mod protocol;
 pub mod role_catalog;
 pub mod server;
@@ -30,7 +31,6 @@ pub mod subscribe_handler;
 pub mod subscribe_parser;
 pub mod tls;
 pub mod view_reader;
-pub mod webhook_source;
 pub mod write_buffer;
 
 pub use error::GatewayError;
@@ -45,9 +45,5 @@ pub use server::{
 pub use session::{CursorState, TxStatus, MAX_CURSORS_PER_CONNECTION};
 pub use view_reader::{
     HotOnlyViewReader, ViewReadStrategy, ViewReader, ROWS_IN_FLIGHT_BATCH, STREAM_BATCH_BYTES,
-};
-pub use webhook_source::{
-    HttpWebhookSource, WebhookEpoch, WebhookFormat, WebhookResult, HTTP_WEBHOOK_DEDUP_MAX_ENTRIES,
-    HTTP_WEBHOOK_LOCAL_BUFFER_MAX_EPOCHS, HTTP_WEBHOOK_MAX_REQUEST_BYTES,
 };
 pub use write_buffer::{DmlOp, WriteBuffer, WRITE_BUFFER_LIMIT_BYTES};

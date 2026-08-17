@@ -520,6 +520,13 @@ No new product-surface milestone should enter the roadmap without answering the 
 
 If these answers are weak, the feature should stay out of the strategic roadmap even if it sounds useful.
 
+For machine enforcement, a roadmap table row that proposes new SQL, connector,
+catalog, protocol, policy, governance, transaction, or product-surface breadth
+must be followed by `### Admission: <version>` containing completed
+`Product fit`, `Semantic fit`, `Operational fit`, `Scope cost`, and `Proof`
+checklists. `scripts/check-exit-criteria.sh` rejects a marked row when that
+block is missing, incomplete, or contains unchecked items.
+
 ---
 
 ## 9. Concrete repository and planning changes
@@ -579,12 +586,12 @@ For public-facing features, track:
 | Resumable online backfill & the snapshot/delta fence | Planned | v0.52.1 | Core | Yes |
 | Transaction-preserving PostgreSQL CDC & upstream schema evolution | Planned | v0.52.2 | Core | Yes |
 | Connector surface reduction to 2 sources / 1 sink (`RS-4017`, deletion, three-connector guarantee matrix) | Planned | v0.52.3–v0.52.5 | Core | Yes |
-| Operator CLI & arrangement debugger | Planned | v0.53 | Core | Yes |
-| Freshness explainability & lag decomposition | Planned | v0.54 | Core | Yes |
-| Internal mTLS, secrets management & security review | Planned | v0.55 | Core | Yes |
-| Rolling upgrade proof & disaster recovery | Planned | v0.56 | Core | Yes |
-| The v1 public contract & compatibility freeze | Planned | v0.57 | Core | Yes |
-| Production failure-matrix proof | Planned | v0.58 | Core | Yes |
+| Operator CLI & arrangement debugger | Planned | v0.53–v0.53.2 | Core | Yes |
+| Freshness explainability & lag decomposition | Planned | v0.54–v0.54.1 | Core | Yes |
+| Internal mTLS, secrets management & security review | Planned | v0.55–v0.55.2 | Core | Yes |
+| Rolling upgrade proof & disaster recovery | Planned | v0.56–v0.56.1 | Core | Yes |
+| The v1 public contract & compatibility freeze | Planned | v0.57–v0.57.1 | Core | Yes |
+| Production failure-matrix proof | Planned | v0.58–v0.58.3 | Core | Yes |
 | Inline expectations, lineage diagnostics & governance policy language | Deferred by decision | — | Candidate | No; readmission requires a design partner needing policy in the engine |
 | Isolation & validation hooks (broader transactional semantics) | Deferred by decision | — | Candidate | No; readmission requires a workload that cannot use PostgreSQL/Kafka as source of truth |
 | New connector family (beyond PostgreSQL CDC / Kafka) | Not applicable | — | Candidate | No without admission, machine-enforced from v0.52.5 |

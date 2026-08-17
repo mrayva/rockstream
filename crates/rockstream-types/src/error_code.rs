@@ -60,6 +60,10 @@ pub const RS_0001: ErrorCode = ErrorCode::new(1);
 pub const RS_0002: ErrorCode = ErrorCode::new(2);
 /// Storage unavailable.
 pub const RS_0003: ErrorCode = ErrorCode::new(3);
+/// Cluster control plane unreachable.
+pub const RS_0004: ErrorCode = ErrorCode::new(4);
+/// Destructive command confirmation required.
+pub const RS_0005: ErrorCode = ErrorCode::new(5);
 
 // 1xxx: Pipeline / plan
 /// Pipeline not found.
@@ -120,6 +124,10 @@ pub const RS_1018: ErrorCode = ErrorCode::new(1018);
 /// into an executable operator pipeline (v0.51.4 Slice 8 — there is no
 /// DataFusion-materializer fallback left to silently serve it from).
 pub const RS_1019: ErrorCode = ErrorCode::new(1019);
+/// Operator not found in pipeline (v0.53.2 IVM arrangement debugger).
+pub const RS_1020: ErrorCode = ErrorCode::new(1020);
+/// Arrangement key decoding failed or unsupported family (v0.53.2 IVM arrangement debugger).
+pub const RS_1021: ErrorCode = ErrorCode::new(1021);
 
 // 17xx: Lease management
 /// Shard is already leased by a different worker; acquire rejected (v0.29).
@@ -228,6 +236,41 @@ pub const RS_2405: ErrorCode = ErrorCode::new(2405);
 /// next_steps: "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity."
 pub const RS_2406: ErrorCode = ErrorCode::new(2406);
 
+/// Internal mTLS connection rejected: client certificate required (v0.55, `auth.internal_mtls_required`).
+/// next_steps: "Configure internal TLS client certificates (--internal-tls-cert-path, --internal-tls-key-path, --internal-tls-ca-cert-path) so the node can authenticate with the cluster."
+pub const RS_2410: ErrorCode = ErrorCode::new(2410);
+/// Internal mTLS client certificate invalid, expired, or signed by an untrusted CA (v0.55, `auth.internal_mtls_invalid_cert`).
+/// next_steps: "Verify the internal TLS client certificate is valid, not expired, and signed by the trusted cluster CA root certificate."
+pub const RS_2411: ErrorCode = ErrorCode::new(2411);
+/// Presented client certificate node identity does not match registration payload (v0.55, `auth.internal_mtls_node_identity_mismatch`).
+/// next_steps: "Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters."
+pub const RS_2412: ErrorCode = ErrorCode::new(2412);
+/// Internal mTLS certificate rotation or reload failed (v0.55, `auth.internal_mtls_rotation_failed`).
+/// next_steps: "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA."
+pub const RS_2413: ErrorCode = ErrorCode::new(2413);
+
+/// Secret not found in secret catalog (v0.55.1, `secret.not_found`).
+/// next_steps: "Verify the secret name or run CREATE SECRET to define it."
+pub const RS_2420: ErrorCode = ErrorCode::new(2420);
+/// Secret already exists in catalog (v0.55.1, `secret.already_exists`).
+/// next_steps: "Choose a distinct secret name or run ALTER SECRET to modify the existing secret."
+pub const RS_2421: ErrorCode = ErrorCode::new(2421);
+/// Secret encryption or envelope DEK wrap/unwrap failed (v0.55.1, `secret.encryption_failed`).
+/// next_steps: "Check KEK provider configuration and key access permissions."
+pub const RS_2422: ErrorCode = ErrorCode::new(2422);
+/// Secret token is invalid, expired, or failed node-identity verification (v0.55.1, `secret.token_invalid`).
+/// next_steps: "Request a fresh secret token using valid mTLS node credentials."
+pub const RS_2423: ErrorCode = ErrorCode::new(2423);
+/// Secret DDL syntax or configuration is invalid (v0.55.1, `secret.ddl_invalid`).
+/// next_steps: "Check CREATE/ALTER SECRET syntax and required options (e.g. TYPE)."
+pub const RS_2424: ErrorCode = ErrorCode::new(2424);
+/// Secret or KEK rotation failed (v0.55.1, `secret.rotation_failed`).
+/// next_steps: "Verify the target KEK provider is reachable and active connectors are responsive."
+pub const RS_2425: ErrorCode = ErrorCode::new(2425);
+/// Secret drop rejected because it is in active use by a source or sink (v0.55.1, `secret.in_use_by_source_or_sink`).
+/// next_steps: "Drop or alter referencing sources and sinks before dropping the secret."
+pub const RS_2426: ErrorCode = ErrorCode::new(2426);
+
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Durable shuffle rate-limit retry budget exhausted (v0.45.7, split from RS-3010).
@@ -287,6 +330,22 @@ pub const RS_3607: ErrorCode = ErrorCode::new(3607);
 pub const RS_3608: ErrorCode = ErrorCode::new(3608);
 /// Clone backfill lag exceeded the allowed threshold before flip (v0.39).
 pub const RS_3609: ErrorCode = ErrorCode::new(3609);
+/// View is waiting on upstream source/frontier progress (v0.54.1).
+pub const RS_3701: ErrorCode = ErrorCode::new(3701);
+/// View admission was rejected by quota controls (v0.54.1).
+pub const RS_3702: ErrorCode = ErrorCode::new(3702);
+/// View is spilling and lag is dominated by spill delay (v0.54.1).
+pub const RS_3703: ErrorCode = ErrorCode::new(3703);
+/// View is running in over-budget relaxed mode (v0.54.1).
+pub const RS_3704: ErrorCode = ErrorCode::new(3704);
+/// Checkpoint alignment is stalled on at least one shard/operator (v0.54.1).
+pub const RS_3705: ErrorCode = ErrorCode::new(3705);
+/// Sink commit path is blocked and dominates freshness lag (v0.54.1).
+pub const RS_3706: ErrorCode = ErrorCode::new(3706);
+/// Topology transition (migration or drain) is in progress (v0.54.1).
+pub const RS_3707: ErrorCode = ErrorCode::new(3707);
+/// View is recovering from checkpoint/reassignment work (v0.54.1).
+pub const RS_3708: ErrorCode = ErrorCode::new(3708);
 
 // 3500-3999: Merge laws
 /// Merge-law accumulator wire bytes have the wrong size and cannot be decoded (v0.45.7).
@@ -315,16 +374,28 @@ pub const RS_4009: ErrorCode = ErrorCode::new(4009);
 pub const RS_4010: ErrorCode = ErrorCode::new(4010);
 /// PostgreSQL CDC replication cannot proceed without recovery.
 pub const RS_4011: ErrorCode = ErrorCode::new(4011);
-/// Webhook request authentication failed.
+/// Source owner registration requires checkpoint recovery.
 pub const RS_4012: ErrorCode = ErrorCode::new(4012);
-/// Webhook source is paused.
+/// PostgreSQL CDC protocol or ownership validation failed.
 pub const RS_4013: ErrorCode = ErrorCode::new(4013);
-/// Webhook request exceeded the configured byte bound.
+/// Source bounded in-flight capacity was exceeded.
 pub const RS_4014: ErrorCode = ErrorCode::new(4014);
-/// Webhook epoch buffer is full.
+/// Source checkpoint fence did not advance monotonically.
 pub const RS_4015: ErrorCode = ErrorCode::new(4015);
-/// Webhook payload or watermark is invalid.
+/// Source checkpoint acknowledgement failed.
 pub const RS_4016: ErrorCode = ErrorCode::new(4016);
+/// Connector surface removed; creation and ingress are fail-closed.
+pub const RS_4017: ErrorCode = ErrorCode::new(4017);
+/// Source epoch exhausted; no further fenced epoch can be created.
+pub const RS_4018: ErrorCode = ErrorCode::new(4018);
+/// Source backfill cursor or lifecycle is invalid.
+pub const RS_4019: ErrorCode = ErrorCode::new(4019);
+/// Backfill live-delta buffer exceeded its configured bound.
+pub const RS_4020: ErrorCode = ErrorCode::new(4020);
+/// Backfill admission reservation exceeded its configured capacity.
+pub const RS_4021: ErrorCode = ErrorCode::new(4021);
+/// Materialized view backfill is not published.
+pub const RS_4022: ErrorCode = ErrorCode::new(4022);
 
 /// Self-fencing configuration invalid: self_fence_after must satisfy
 /// dead_after < self_fence_after < 2 × shard_recovery_budget.
@@ -335,8 +406,10 @@ pub const RS_3005: ErrorCode = ErrorCode::new(3005);
 pub const RS_5001: ErrorCode = ErrorCode::new(5001);
 /// Unknown merge law referenced in arrangement header.
 pub const RS_5002: ErrorCode = ErrorCode::new(5002);
-/// Wire protocol version not supported; rolling upgrade version skew (v0.36, DESIGN.md §5.5).
+/// Legacy validation failures retained outside the wire-version gate.
 pub const RS_5003: ErrorCode = ErrorCode::new(5003);
+/// Wire protocol version not supported during a rolling upgrade.
+pub const RS_5021: ErrorCode = ErrorCode::new(5021);
 /// Illegal shard-migration state transition rejected (v0.46).
 pub const RS_5030: ErrorCode = ErrorCode::new(5030);
 /// Shard-migration verify scan window exceeded its configured bound (v0.46).
@@ -410,9 +483,54 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2404 => "auth.mtls_no_verified_cert",
         2405 => "auth.tls_config_invalid",
         2406 => "auth.mtls_connection_cap_exceeded",
+        2410 => "auth.internal_mtls_required",
+        2411 => "auth.internal_mtls_invalid_cert",
+        2412 => "auth.internal_mtls_node_identity_mismatch",
+        2413 => "auth.internal_mtls_rotation_failed",
+        2420 => "secret.not_found",
+        2421 => "secret.already_exists",
+        2422 => "secret.encryption_failed",
+        2423 => "secret.token_invalid",
+        2424 => "secret.ddl_invalid",
+        2425 => "secret.rotation_failed",
+        2426 => "secret.in_use_by_source_or_sink",
+        3701 => "view.waiting_on_source",
+        3702 => "view.quota_admission_rejected",
+        3703 => "view.spilling",
+        3704 => "view.over_budget_relaxed",
+        3705 => "view.checkpoint_alignment_stalled",
+        3706 => "view.sink_blocked",
+        3707 => "view.topology_transition_in_progress",
+        3708 => "view.recovering",
         1014 => "workload.has_assigned_views",
+        1020 => "operator.not_found",
+        1021 => "arrangement.key_decode_failed",
         9001 => "admission_control.rejected",
         1731 => "control.not_leader",
+        4001 => "source.connection_failed",
+        4002 => "sink.write_failed",
+        4003 => "sink.pre_commit_failed",
+        4004 => "sink.commit_failed",
+        4005 => "sink.duplicate_delivery",
+        4006 => "source.epoch_registry_full",
+        4007 => "sink.ddl_invalid",
+        4008 => "source.ddl_invalid",
+        4009 => "source.not_found",
+        4010 => "source.already_exists",
+        4011 => "postgres_cdc.recovery_required",
+        4012 => "source.owner_recovery_required",
+        4013 => "postgres_cdc.protocol_error",
+        4014 => "source.bounds_exceeded",
+        4015 => "source.fence_mismatch",
+        4016 => "source.acknowledgement_failed",
+        4017 => "connector.removed",
+        4018 => "source.epoch_exhausted",
+        4019 => "source.backfill_cursor_invalid",
+        4020 => "backfill.live_delta_buffer_full",
+        4021 => "backfill.admission_rejected",
+        4022 => "backfill.not_published",
+        4 => "control.unreachable",
+        5 => "cli.confirmation_required",
         _ => "unknown",
     }
 }
@@ -423,6 +541,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1 => "Internal error",
         2 => "Configuration error",
         3 => "Storage unavailable",
+        4 => "Cluster control plane unreachable",
+        5 => "Destructive command confirmation required",
         1001 => "Pipeline not found",
         1002 => "Incompatible schema change",
         1003 => "Record decode error",
@@ -444,6 +564,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
         1018 => "TopK buffer overflow: too many unique rows in a single partition",
         1019 => "View query could not be compiled into an executable operator pipeline",
+        1020 => "Operator not found in pipeline",
+        1021 => "Arrangement key decoding failed or unsupported",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         3601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
@@ -485,6 +607,14 @@ pub fn description(code: ErrorCode) -> &'static str {
         3607 => "Schema change requires blue/green clone; in-place apply rejected",
         3608 => "A blue/green clone operation is already in progress for this view",
         3609 => "Clone backfill lag exceeded the allowed threshold before flip",
+        3701 => "View is waiting on source/frontier progress",
+        3702 => "View admission rejected by quota controls",
+        3703 => "View lag is dominated by spill delay",
+        3704 => "View is in over-budget relaxed mode",
+        3705 => "View checkpoint alignment is stalled",
+        3706 => "View sink commit path is blocked",
+        3707 => "View topology transition is in progress",
+        3708 => "View is recovering from checkpoint/reassignment work",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         4003 => "Sink 2PC pre-commit failed; epoch not staged",
@@ -492,10 +622,26 @@ pub fn description(code: ErrorCode) -> &'static str {
         4005 => "Sink 2PC duplicate delivery detected and suppressed",
         4006 => "Source-epoch registry full; too many uncommitted epochs in flight",
         4007 => "CREATE SINK DDL parse or validation failed",
+        4008 => "CREATE SOURCE DDL parse or validation failed",
+        4009 => "Source not found",
+        4010 => "Source already exists",
+        4011 => "PostgreSQL CDC replication cannot proceed without recovery",
+        4012 => "Source owner registration requires checkpoint recovery",
+        4013 => "PostgreSQL CDC protocol or ownership validation failed",
+        4014 => "Source bounded in-flight capacity was exceeded",
+        4015 => "Source checkpoint fence did not advance monotonically",
+        4016 => "Source checkpoint acknowledgement failed",
+        4017 => "Connector has been removed",
+        4018 => "Source epoch exhausted",
+        4019 => "Source backfill cursor or lifecycle is invalid",
+        4020 => "Backfill live-delta buffer is full",
+        4021 => "Backfill admission reservation rejected",
+        4022 => "Materialized view backfill is not published",
         3005 => "Self-fencing configuration invalid: self_fence_after constraint violated",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
-        5003 => "Wire protocol version not supported; rolling upgrade version skew",
+        5003 => "Legacy validation failure",
+        5021 => "Wire protocol version not supported; rolling upgrade version skew",
         5030 => "Illegal shard-migration state transition rejected",
         5031 => "Shard-migration verify scan window exceeded its configured bound",
         5032 => "Shard-migration bucket-map version or watcher acknowledgement mismatch",
@@ -524,6 +670,17 @@ pub fn description(code: ErrorCode) -> &'static str {
         2404 => "mTLS connection has no verified client certificate CN for its peer address",
         2405 => "Gateway TLS certificate/key/CA material failed to load or parse",
         2406 => "mTLS handshake rejected: connection identity map is at capacity",
+        2410 => "Internal mTLS connection rejected: client certificate required",
+        2411 => "Internal mTLS client certificate invalid, expired, or signed by an untrusted CA",
+        2412 => "Presented client certificate node identity does not match registration payload",
+        2413 => "Internal mTLS certificate rotation or reload failed",
+        2420 => "Secret not found in secret catalog",
+        2421 => "Secret already exists in catalog",
+        2422 => "Secret encryption or envelope DEK wrap/unwrap failed",
+        2423 => "Secret token is invalid, expired, or failed node-identity verification",
+        2424 => "Secret DDL syntax or configuration is invalid",
+        2425 => "Secret or KEK rotation failed",
+        2426 => "Secret drop rejected because it is in active use by a source or sink",
         _ => "Unknown error",
     }
 }
@@ -548,6 +705,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         3501 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
+        5021 => Severity::Fatal,
         5030 => Severity::Error,
         5031 => Severity::Error,
         5032 => Severity::Error,
@@ -562,6 +720,26 @@ pub fn severity(code: ErrorCode) -> Severity {
         2404 => Severity::Fatal,
         2405 => Severity::Fatal,
         2406 => Severity::Error,
+        2410 => Severity::Fatal,
+        2411 => Severity::Fatal,
+        2412 => Severity::Fatal,
+        2413 => Severity::Error,
+        2420 => Severity::Error,
+        2421 => Severity::Error,
+        2422 => Severity::Fatal,
+        2423 => Severity::Error,
+        2424 => Severity::Error,
+        2425 => Severity::Fatal,
+        2426 => Severity::Error,
+        4017 => Severity::Error,
+        3701 => Severity::Warning,
+        3702 => Severity::Warning,
+        3703 => Severity::Warning,
+        3704 => Severity::Warning,
+        3705 => Severity::Warning,
+        3706 => Severity::Warning,
+        3707 => Severity::Warning,
+        3708 => Severity::Warning,
         _ => Severity::Error,
     }
 }
@@ -572,6 +750,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1 => "Report this bug with the support bundle.",
         2 => "Check configuration file and CLI flags.",
         3 => "Verify storage directory permissions and disk space.",
+        4 => "Verify the control service URL and ensure the control node is running and reachable.",
+        5 => "Pass --yes for script execution or answer y at the prompt.",
         1001 => "Check pipeline name and ensure it has been created.",
         1002 => "Review schema evolution rules; a new view may be required.",
         1003 => "Inspect the dead-letter queue for malformed records.",
@@ -593,6 +773,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
         1018 => "Reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add more partition columns.",
         1019 => "Simplify the query to a supported shape (see docs/language-features.md), or reference only base tables — views over other views are not yet compiled.",
+        1020 => "Run rockstream explain <view> --op-ids to inspect available operator IDs for this view.",
+        1021 => "Check arrangement key syntax or verify if the operator family key codec is supported.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
@@ -641,17 +823,41 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         3607 => "Perform a zero-downtime view replacement using a blue/green deployment strategy.",
         3608 => "Wait for the existing clone backfill to finish before starting a new one.",
         3609 => "Reduce write load or check worker resource usage to allow backfill to catch up before flip.",
+        3701 => "Check source/frontier health and producer lag; verify watermark advancement for the upstream source.",
+        3702 => "Reduce state pressure, free quota in competing workloads, or adjust admission and memory budgets before retrying.",
+        3703 => "Reduce spill pressure by lowering hot-key skew, increasing memory budget, or reducing ingest burst size.",
+        3704 => "Reduce view memory usage or increase workload memory limit so the view can exit relaxed mode.",
+        3705 => "Inspect checkpoint barrier holders and slow shards; resolve stalled operators before retrying.",
+        3706 => "Check sink connectivity/commit latency and transactional backpressure; recover sink health before retrying.",
+        3707 => "Wait for migration/drain to complete, or inspect topology transition progress and blocked shard ownership.",
+        3708 => "Wait for recovery to complete; monitor checkpoint and shard reassignment progress via SHOW VIEW STATUS.",
         4001 => "Verify source connection settings and network connectivity.",
         4002 => "Check sink availability and credentials.",
         4003 => "Retry the epoch; check sink connector health and connectivity.",
         4004 => "Trigger manual recovery or restart the connector; check sink idempotency profile.",
-        4005 => "This is informational; the duplicate was suppressed. Check source for duplicate delivery.",
+        4005 => "This is informational; the duplicate was suppressed. Check the source for duplicate delivery.",
         4006 => "Reduce source epoch rate or increase max_in_flight_source_epochs.",
         4007 => "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake.",
+        4008 => "Check CREATE SOURCE syntax, connector options, and source credentials.",
+        4009 => "Check the source name and ensure it has been created.",
+        4010 => "Use a different source name or drop the existing source first.",
+        4011 => "Repair the PostgreSQL slot or publication, then run the bounded resnapshot workflow.",
+        4012 => "Run checkpoint recovery before registering the source owner, then retry owner registration.",
+        4013 => "Validate pgoutput protocol, source identity, slot ownership, and durable routing before retrying.",
+        4014 => "Drain the source or reduce transaction and epoch size before increasing the configured bound.",
+        4015 => "Recover the highest committed source checkpoint and retry with the next fenced epoch.",
+        4016 => "Retain source ownership, recover the committed checkpoint, and retry upstream acknowledgement.",
+        4017 => "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.",
+        4018 => "Create a new connector before retrying.",
+        4019 => "Recover or recreate the committed backfill cursor or lifecycle, then retry.",
+        4020 => "Wait for snapshot catch-up or reduce live-delta volume before retrying.",
+        4021 => "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying.",
+        4022 => "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first.",
         3005 => "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
-        5001 => "Run the storage migration tool before upgrading.",
+        5001 => "Run rockstream migrate --from=N --to=M --storage=<url> before upgrading the binary.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
-        5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
+        5003 => "Inspect the failing component and its version-specific validation guidance.",
+        5021 => "Use a peer with an overlapping protocol range, or finish the rolling upgrade before retrying.",
         5030 => "Drive the migration through the documented next state only, or resume from the persisted record instead of forcing a skipped state.",
         5031 => "Reduce verify_sample_rate, split the migration into fewer buckets, or increase the configured verify scan bound if memory headroom allows.",
         5032 => "Wait for every reader, exchange receiver, and gateway to observe the new bucket_map_version, then retry the migration step under the current version.",
@@ -670,6 +876,17 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2404 => "Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls.",
         2405 => "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.",
         2406 => "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity.",
+        2410 => "Configure internal TLS client certificates (--internal-tls-cert-path, --internal-tls-key-path, --internal-tls-ca-cert-path) so the node can authenticate with the cluster.",
+        2411 => "Verify the internal TLS client certificate is valid, not expired, and signed by the trusted cluster CA root certificate.",
+        2412 => "Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters.",
+        2413 => "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA before triggering certificate rotation.",
+        2420 => "Verify the secret name or run CREATE SECRET to define it.",
+        2421 => "Choose a distinct secret name or run ALTER SECRET to modify the existing secret.",
+        2422 => "Check KEK provider configuration and key access permissions.",
+        2423 => "Request a fresh secret token using valid mTLS node credentials.",
+        2424 => "Check CREATE/ALTER SECRET syntax and required options (e.g. TYPE).",
+        2425 => "Verify the target KEK provider is reachable and active connectors are responsive.",
+        2426 => "Drop or alter referencing sources and sinks before dropping the secret.",
         _ => "See documentation for this error code.",
     }
 }
@@ -696,6 +913,18 @@ mod tests {
         assert_eq!(description(RS_0001), "Internal error");
         assert_eq!(description(RS_1002), "Incompatible schema change");
         assert_eq!(description(RS_5001), "Incompatible storage format");
+        assert_eq!(
+            description(RS_5021),
+            "Wire protocol version not supported; rolling upgrade version skew"
+        );
+        assert_eq!(
+            next_steps(RS_5001),
+            "Run rockstream migrate --from=N --to=M --storage=<url> before upgrading the binary."
+        );
+        assert_eq!(
+            next_steps(RS_5021),
+            "Use a peer with an overlapping protocol range, or finish the rolling upgrade before retrying."
+        );
     }
 
     #[test]
@@ -706,16 +935,17 @@ mod tests {
     #[test]
     fn all_codes_have_descriptions_and_actionable_next_steps() {
         let codes = [
-            RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
-            RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
-            RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018, RS_2021, RS_3003,
-            RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018,
-            RS_3022, RS_3023, RS_3024, RS_3501, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003,
-            RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602,
-            RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016,
-            RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
-            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
-            RS_2402, // v0.26 auth
+            RS_0001, RS_0002, RS_0003, RS_0004, RS_0005, RS_1001, RS_1002, RS_1003, RS_1004,
+            RS_1005, RS_1006, RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004,
+            RS_2005, RS_2006, RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018,
+            RS_2021, RS_3003, RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016,
+            RS_3017, RS_3018, RS_3022, RS_3023, RS_3024, RS_3501, RS_4001, RS_4002, RS_5001,
+            RS_5002, RS_5003, RS_5021, RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512,
+            RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019,
+            RS_6001, RS_1015, RS_1016, RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
+            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010, RS_4011,
+            RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
+            RS_4021, RS_4022, RS_3005, RS_1018, RS_2400, RS_2401, RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control
             RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
@@ -723,6 +953,9 @@ mod tests {
             RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
             RS_2403, RS_2404, RS_2405, RS_2406, // v0.51.5-v0.51.26 gateway TLS/mTLS
             RS_2028, // v0.51.12 bounded late-data side-channel
+            RS_1020, RS_1021, // v0.53.2 IVM arrangement debugger
+            RS_3701, RS_3702, RS_3703, RS_3704, RS_3705, RS_3706, RS_3707,
+            RS_3708, // v0.54.1 explainability taxonomy
         ];
         for code in codes {
             assert_ne!(
@@ -739,6 +972,62 @@ mod tests {
                 !next_steps(code).is_empty(),
                 "Code {code} has empty next steps"
             );
+        }
+    }
+
+    #[test]
+    fn debugger_error_codes_registered() {
+        assert_eq!(RS_1020.value(), 1020);
+        assert_eq!(RS_1021.value(), 1021);
+
+        assert_eq!(slug(RS_1020), "operator.not_found");
+        assert_eq!(slug(RS_1021), "arrangement.key_decode_failed");
+
+        assert_eq!(description(RS_1020), "Operator not found in pipeline");
+        assert_eq!(
+            description(RS_1021),
+            "Arrangement key decoding failed or unsupported"
+        );
+
+        assert_eq!(severity(RS_1020), Severity::Error);
+        assert_eq!(severity(RS_1021), Severity::Error);
+
+        assert!(next_steps(RS_1020).contains("explain <view> --op-ids"));
+        assert!(next_steps(RS_1021).contains("key syntax"));
+    }
+
+    #[test]
+    fn connector_error_codes_registered_and_actionable() {
+        let expected = [
+            (RS_4001, "source.connection_failed", "Source connection failed", "Verify source connection settings and network connectivity."),
+            (RS_4002, "sink.write_failed", "Sink write failed", "Check sink availability and credentials."),
+            (RS_4003, "sink.pre_commit_failed", "Sink 2PC pre-commit failed; epoch not staged", "Retry the epoch; check sink connector health and connectivity."),
+            (RS_4004, "sink.commit_failed", "Sink 2PC commit failed after pre-commit; recovery required", "Trigger manual recovery or restart the connector; check sink idempotency profile."),
+            (RS_4005, "sink.duplicate_delivery", "Sink 2PC duplicate delivery detected and suppressed", "This is informational; the duplicate was suppressed. Check the source for duplicate delivery."),
+            (RS_4006, "source.epoch_registry_full", "Source-epoch registry full; too many uncommitted epochs in flight", "Reduce source epoch rate or increase max_in_flight_source_epochs."),
+            (RS_4007, "sink.ddl_invalid", "CREATE SINK DDL parse or validation failed", "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake."),
+            (RS_4008, "source.ddl_invalid", "CREATE SOURCE DDL parse or validation failed", "Check CREATE SOURCE syntax, connector options, and source credentials."),
+            (RS_4009, "source.not_found", "Source not found", "Check the source name and ensure it has been created."),
+            (RS_4010, "source.already_exists", "Source already exists", "Use a different source name or drop the existing source first."),
+            (RS_4011, "postgres_cdc.recovery_required", "PostgreSQL CDC replication cannot proceed without recovery", "Repair the PostgreSQL slot or publication, then run the bounded resnapshot workflow."),
+            (RS_4012, "source.owner_recovery_required", "Source owner registration requires checkpoint recovery", "Run checkpoint recovery before registering the source owner, then retry owner registration."),
+            (RS_4013, "postgres_cdc.protocol_error", "PostgreSQL CDC protocol or ownership validation failed", "Validate pgoutput protocol, source identity, slot ownership, and durable routing before retrying."),
+            (RS_4014, "source.bounds_exceeded", "Source bounded in-flight capacity was exceeded", "Drain the source or reduce transaction and epoch size before increasing the configured bound."),
+            (RS_4015, "source.fence_mismatch", "Source checkpoint fence did not advance monotonically", "Recover the highest committed source checkpoint and retry with the next fenced epoch."),
+            (RS_4016, "source.acknowledgement_failed", "Source checkpoint acknowledgement failed", "Retain source ownership, recover the committed checkpoint, and retry upstream acknowledgement."),
+            (RS_4017, "connector.removed", "Connector has been removed", "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output."),
+            (RS_4018, "source.epoch_exhausted", "Source epoch exhausted", "Create a new connector before retrying."),
+            (RS_4019, "source.backfill_cursor_invalid", "Source backfill cursor or lifecycle is invalid", "Recover or recreate the committed backfill cursor or lifecycle, then retry."),
+            (RS_4020, "backfill.live_delta_buffer_full", "Backfill live-delta buffer is full", "Wait for snapshot catch-up or reduce live-delta volume before retrying."),
+            (RS_4021, "backfill.admission_rejected", "Backfill admission reservation rejected", "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying."),
+            (RS_4022, "backfill.not_published", "Materialized view backfill is not published", "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first."),
+        ];
+
+        for (code, expected_slug, expected_description, expected_next_steps) in expected {
+            assert_eq!(code.to_string(), format!("RS-{:04}", code.value()));
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(description(code), expected_description);
+            assert_eq!(next_steps(code), expected_next_steps);
         }
     }
 
@@ -816,5 +1105,118 @@ mod tests {
         assert!(next_steps(RS_2017).contains("shard_stats"));
         assert!(description(RS_2022).contains("RETURNING"));
         assert!(next_steps(RS_2013).contains("frontier"));
+    }
+
+    #[test]
+    fn degradation_reason_error_codes_registered() {
+        let expected = [
+            (
+                RS_3701,
+                "view.waiting_on_source",
+                "View is waiting on source/frontier progress",
+            ),
+            (
+                RS_3702,
+                "view.quota_admission_rejected",
+                "View admission rejected by quota controls",
+            ),
+            (
+                RS_3703,
+                "view.spilling",
+                "View lag is dominated by spill delay",
+            ),
+            (
+                RS_3704,
+                "view.over_budget_relaxed",
+                "View is in over-budget relaxed mode",
+            ),
+            (
+                RS_3705,
+                "view.checkpoint_alignment_stalled",
+                "View checkpoint alignment is stalled",
+            ),
+            (
+                RS_3706,
+                "view.sink_blocked",
+                "View sink commit path is blocked",
+            ),
+            (
+                RS_3707,
+                "view.topology_transition_in_progress",
+                "View topology transition is in progress",
+            ),
+            (
+                RS_3708,
+                "view.recovering",
+                "View is recovering from checkpoint/reassignment work",
+            ),
+        ];
+        for (code, expected_slug, expected_description) in expected {
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(description(code), expected_description);
+            assert_eq!(severity(code), Severity::Warning);
+            assert!(!next_steps(code).is_empty());
+        }
+    }
+
+    #[test]
+    fn cli_safeguard_error_codes_registered() {
+        assert_eq!(RS_0005.value(), 5);
+        assert_eq!(slug(RS_0005), "cli.confirmation_required");
+        assert_eq!(
+            description(RS_0005),
+            "Destructive command confirmation required"
+        );
+        assert_eq!(severity(RS_0005), Severity::Error);
+        assert!(next_steps(RS_0005).contains("--yes"));
+    }
+
+    #[test]
+    fn internal_mtls_error_codes_registered() {
+        assert_eq!(RS_2410.value(), 2410);
+        assert_eq!(RS_2411.value(), 2411);
+        assert_eq!(RS_2412.value(), 2412);
+        assert_eq!(RS_2413.value(), 2413);
+
+        assert_eq!(slug(RS_2410), "auth.internal_mtls_required");
+        assert_eq!(slug(RS_2411), "auth.internal_mtls_invalid_cert");
+        assert_eq!(slug(RS_2412), "auth.internal_mtls_node_identity_mismatch");
+        assert_eq!(slug(RS_2413), "auth.internal_mtls_rotation_failed");
+
+        assert_eq!(severity(RS_2410), Severity::Fatal);
+        assert_eq!(severity(RS_2411), Severity::Fatal);
+        assert_eq!(severity(RS_2412), Severity::Fatal);
+        assert_eq!(severity(RS_2413), Severity::Error);
+
+        assert!(next_steps(RS_2410).contains("internal-tls"));
+        assert!(next_steps(RS_2411).contains("cluster CA"));
+        assert!(next_steps(RS_2412).contains("Common Name"));
+        assert!(next_steps(RS_2413).contains("rotation"));
+    }
+
+    #[test]
+    fn secrets_error_codes_registered() {
+        let codes = [
+            (RS_2420, 2420, "secret.not_found", Severity::Error),
+            (RS_2421, 2421, "secret.already_exists", Severity::Error),
+            (RS_2422, 2422, "secret.encryption_failed", Severity::Fatal),
+            (RS_2423, 2423, "secret.token_invalid", Severity::Error),
+            (RS_2424, 2424, "secret.ddl_invalid", Severity::Error),
+            (RS_2425, 2425, "secret.rotation_failed", Severity::Fatal),
+            (
+                RS_2426,
+                2426,
+                "secret.in_use_by_source_or_sink",
+                Severity::Error,
+            ),
+        ];
+
+        for (code, val, expected_slug, expected_sev) in codes {
+            assert_eq!(code.value(), val);
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(severity(code), expected_sev);
+            assert!(!description(code).is_empty());
+            assert!(!next_steps(code).is_empty());
+        }
     }
 }

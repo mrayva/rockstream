@@ -6,7 +6,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -62,9 +62,9 @@ use tokio::net::TcpListener;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
 use rockstream_connectors::{
-    BackfillCursor, BackfillLifecycle, BackfillPhase, KafkaSource, OffsetToken, PgOutputConfig,
-    PostgresCdcSource, S3Source, SnapshotDeltaFence, SourceCheckpointStore, SourceConnector,
-    SourceOwnerLease, SourceRuntimeCoordinator,
+    BackfillCursor, BackfillLifecycle, BackfillPhase, CdcOperation, KafkaSource, OffsetToken,
+    PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata, PostgresCdcSource, SnapshotDeltaFence,
+    SourceCheckpointStore, SourceConnector, SourceOwnerLease, SourceRuntimeCoordinator,
 };
 use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
@@ -73,6 +73,7 @@ use rockstream_types::config::ScatterPruningConfig;
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
 use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId};
+use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
@@ -81,19 +82,21 @@ use crate::auth::{
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
-    CatalogStubs, CatalogTable,
+    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail,
 };
 
 use crate::copy_state::{
     CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
 };
 use crate::notify_registry::NotifyRegistry;
+use crate::pgoutput_coordinator::{
+    append_blocked_state, BlockedRelationState, BufferedPgOutputEnvelope, ColumnRoute,
+    EncodedChange, RelationChange, RelationRoute, ReplicaIdentity, SharedPgOutputCoordinator,
+    SourceIdentityV1,
+};
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
-use crate::webhook_source::{
-    HttpWebhookSource, WebhookFormat, WebhookResult, HTTP_WEBHOOK_MAX_REQUEST_BYTES,
-};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
 use pgwire::messages::response::NotificationResponse;
@@ -1701,21 +1704,129 @@ pub struct GatewayHandler {
     /// outright (`RS-1019`) when compilation fails — there is no
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
-    /// Runtime-only webhook credentials and bounded epoch buffers.  Entries
-    /// are installed and removed with the catalog source lifecycle.
-    // Audit: each guard protects a synchronous source-state transition that
-    // remains valid after a holder panic; guards are dropped before awaits.
-    webhook_sources: Arc<DashMap<String, Arc<Mutex<HttpWebhookSource>>>>,
     backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
     self_ref: Arc<Mutex<Weak<GatewayHandler>>>,
     source_workers: Arc<DashMap<String, ()>>,
+    pgoutput_coordinators:
+        Arc<DashMap<ConnectorId, Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>>>,
+    /// ponytail: source creation is rare; replace this global lock with
+    /// per-identity locks only after measured contention.
+    pgoutput_registry_lock: Arc<tokio::sync::Mutex<()>>,
+    /// ponytail: shard-wide serialization is the correctness ceiling; split
+    /// by dependency component only after measured contention.
+    shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    pub secret_store: Arc<rockstream_control::SecretStore>,
 }
 
 impl GatewayHandler {
     fn bind_server(&self, handler: &Arc<Self>) {
         *self.self_ref.lock() = Arc::downgrade(handler);
+    }
+
+    fn mutation_resource(query: &str, operation: &str) -> String {
+        let words: Vec<&str> = query
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect();
+        let after = |keyword: &str| {
+            words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case(keyword))
+                .and_then(|index| words.get(index + 1).copied())
+        };
+        let token = |value: &str| {
+            value
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .trim_end_matches(';')
+                .to_ascii_lowercase()
+        };
+        match operation {
+            "CREATE VIEW" | "REFRESH MATERIALIZED VIEW" => after("view"),
+            "CREATE TABLE" => after("table").and_then(|name| {
+                if name.eq_ignore_ascii_case("if") {
+                    words
+                        .iter()
+                        .position(|word| word.eq_ignore_ascii_case("exists"))
+                        .and_then(|index| words.get(index + 1).copied())
+                } else {
+                    Some(name)
+                }
+            }),
+            "CREATE SINK" => after("sink"),
+            "CREATE SOURCE"
+            | "DROP SOURCE"
+            | "ALTER SOURCE"
+            | "ALTER SOURCE PAUSE"
+            | "ALTER SOURCE RESUME" => after("source"),
+            "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET" => after("secret"),
+            "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => after("index"),
+            "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => after("workload"),
+            "INSERT" => after("into"),
+            "UPDATE" => words.get(1).copied(),
+            "DELETE" => after("from"),
+            "COPY FROM STDIN" => words.get(1).copied(),
+            "CREATE NAMESPACE" => after("namespace"),
+            _ => None,
+        }
+        .map(token)
+        .unwrap_or_else(|| "<unknown>".to_string())
+    }
+
+    fn authorize_mutation(
+        &self,
+        query: &str,
+        conn_id: Option<&str>,
+    ) -> Option<Vec<Response<'static>>> {
+        let spec = pgwire_mutation_policy(query)?;
+        let id = conn_id?;
+        let (principal, namespace) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+            .unwrap_or((Principal::System, "public".to_string()));
+        if principal.is_system() {
+            return None;
+        }
+
+        let resource = Self::mutation_resource(query, spec.operation);
+        if self
+            .acl_store
+            .check(
+                principal.identity(),
+                &namespace,
+                Some(&resource),
+                spec.minimum_role.clone(),
+            )
+            .is_ok()
+        {
+            return None;
+        }
+
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(
+                &rockstream_types::audit::AuditEvent::now(
+                    principal.actor(),
+                    spec.audit_action,
+                    &resource,
+                )
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401"),
+            );
+        }
+
+        Some(vec![promote_response(Response::Error(Box::new(
+            ErrorInfo::new(
+                "ERROR".to_string(),
+                "42501".to_string(),
+                format!(
+                    "[RS-2401] auth.permission_denied: principal '{}' lacks required role '{:?}' on {}. next_steps: Request an ACL grant for the required role, then retry.",
+                    principal.identity(), spec.minimum_role, resource
+                ),
+            ),
+        )))])
     }
 
     /// Fill-level snapshot of every per-connection state map (v0.51.6
@@ -1734,82 +1845,11 @@ impl GatewayHandler {
         }
     }
 
-    async fn accept_webhook(
-        &self,
-        source_name: &str,
-        token: &[u8],
-        delivery_id: Option<&str>,
-        payload: &[u8],
-    ) -> WebhookResult {
-        let Some(source_entry) = self.catalog.get_source(source_name) else {
-            return WebhookResult::NotFound;
-        };
-        if source_entry.source_type != "http_webhook" {
-            return WebhookResult::NotFound;
-        }
-        let Some(source) = self
-            .webhook_sources
-            .get(source_name)
-            .map(|source| source.value().clone())
-        else {
-            return WebhookResult::NotFound;
-        };
-        let (result, pending) = {
-            let mut source = source.lock();
-            let result = source.accept(token, delivery_id, payload);
-            let pending = if result == WebhookResult::Accepted {
-                source.next_pending()
-            } else {
-                None
-            };
-            (result, pending)
-        };
-        if let Some(pending) = pending {
-            if let Some(shard_db) = &self.shard_db {
-                let key = format!(
-                    "source_input/{source_name}/epoch/{:020}",
-                    pending.source_epoch
-                );
-                let payload = match serde_json::to_vec(&pending) {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        source.lock().abort_pending(&pending.delivery_id);
-                        return WebhookResult::DurabilityFailed;
-                    }
-                };
-                let mut batch = rockstream_storage::WriteBatch::new();
-                batch.put(key.as_bytes(), &payload);
-                if shard_db.write_batch(batch).await.is_err() || shard_db.flush().await.is_err() {
-                    source.lock().abort_pending(&pending.delivery_id);
-                    return WebhookResult::DurabilityFailed;
-                }
-            }
-
-            // The success response is emitted only after the M3 source-input
-            // transaction commits. A gateway without an attached ShardDb is
-            // the in-memory test/control-plane mode and retains its bounded
-            // local acknowledgement semantics.
-            let mut source = source.lock();
-            let Some(committed) = source.commit_pending(&pending.delivery_id) else {
-                // Delivery ID was not found in the accepted queue — return
-                // DurabilityFailed rather than panicking. This can occur
-                // if a concurrent abort already removed the entry (RS-4017).
-                return WebhookResult::DurabilityFailed;
-            };
-            self.catalog.update_source_runtime_detail(
-                source_name,
-                Some("gateway:webhook".to_string()),
-                Some(committed.source_epoch),
-                committed.digest,
-                source.buffered_epochs() as u64,
-                Some(source.buffered_epochs()),
-                None,
-            );
-        }
-        result
-    }
-
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
+        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
+            "rockstream-default-kek",
+        ));
+        let secret_store = Arc::new(rockstream_control::SecretStore::new(None, kek_provider));
         GatewayHandler {
             catalog: catalog.clone(),
             view_reader,
@@ -1835,10 +1875,13 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
-            webhook_sources: Arc::new(DashMap::new()),
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
+            pgoutput_coordinators: Arc::new(DashMap::new()),
+            pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
+            shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            secret_store,
         }
     }
 
@@ -1847,6 +1890,10 @@ impl GatewayHandler {
         view_reader: Arc<dyn ViewReader>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) -> Self {
+        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
+            "rockstream-default-kek",
+        ));
+        let secret_store = Arc::new(rockstream_control::SecretStore::new(None, kek_provider));
         GatewayHandler {
             catalog: catalog.clone(),
             view_reader,
@@ -1872,11 +1919,19 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
-            webhook_sources: Arc::new(DashMap::new()),
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
+            pgoutput_coordinators: Arc::new(DashMap::new()),
+            pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
+            shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            secret_store,
         }
+    }
+
+    pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
+        self.secret_store = secret_store;
+        self
     }
 
     /// Inject the complete pinned shard-reader topology used by query-time
@@ -2095,7 +2150,7 @@ impl GatewayHandler {
                         let mut estimated_rows = 0;
                         let mut all_running = true;
                         for source in &sources {
-                            let connector_id = source_view_connector_id(&source.name, &view.name);
+                            let connector_id = source_checkpoint_connector_id(source, &view.name);
                             let lifecycle = SourceCheckpointStore::new(
                                 Arc::clone(&shard_db),
                                 connector_id.0 as u128,
@@ -2125,11 +2180,6 @@ impl GatewayHandler {
                             self.catalog.publish_backfill(&view.name);
                             for source in sources {
                                 match source.source_type.as_str() {
-                                    "s3" => self.spawn_s3_source_worker(
-                                        source,
-                                        view.name.clone(),
-                                        Arc::clone(&shard_db),
-                                    ),
                                     "kafka" => self.spawn_kafka_source_worker(
                                         source,
                                         view.name.clone(),
@@ -2260,26 +2310,57 @@ impl GatewayHandler {
 
     fn reachable_compiled_views(&self, changed_relations: &HashSet<String>) -> Vec<String> {
         let mut reachable = changed_relations.clone();
-        let mut ordered = Vec::new();
-        let mut scheduled = HashSet::new();
         loop {
             let mut progressed = false;
             for view in self.catalog.list_views() {
-                if scheduled.contains(&view.name) {
-                    continue;
-                }
                 let deps = self.catalog.get_view_deps(&view.name);
-                if deps.iter().any(|dep| reachable.contains(dep)) {
-                    reachable.insert(view.name.clone());
-                    scheduled.insert(view.name.clone());
-                    if self.compiled_views.contains_key(&view.name) {
-                        ordered.push(view.name.clone());
-                    }
+                if deps.iter().any(|dep| reachable.contains(dep)) && reachable.insert(view.name) {
                     progressed = true;
                 }
             }
             if !progressed {
                 break;
+            }
+        }
+
+        let candidates = reachable
+            .iter()
+            .filter(|name| self.compiled_views.contains_key(*name))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut indegree = BTreeMap::new();
+        let mut dependents = HashMap::<String, Vec<String>>::new();
+        for view in &candidates {
+            let dependencies = self.catalog.get_view_deps(view);
+            indegree.insert(
+                view.clone(),
+                dependencies
+                    .iter()
+                    .filter(|dependency| candidates.contains(*dependency))
+                    .count(),
+            );
+            for dependency in dependencies {
+                if candidates.contains(&dependency) {
+                    dependents.entry(dependency).or_default().push(view.clone());
+                }
+            }
+        }
+        let mut ready = indegree
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(view, _)| view.clone())
+            .collect::<BTreeSet<_>>();
+        let mut ordered = Vec::with_capacity(candidates.len());
+        while let Some(view) = ready.iter().next().cloned() {
+            ready.remove(&view);
+            ordered.push(view.clone());
+            for dependent in dependents.get(&view).into_iter().flatten() {
+                if let Some(degree) = indegree.get_mut(dependent) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.insert(dependent.clone());
+                    }
+                }
             }
         }
         ordered
@@ -2664,57 +2745,6 @@ impl GatewayHandler {
         Ok(())
     }
 
-    fn build_s3_source(
-        &self,
-        source: &CatalogSourceEntry,
-        view_name: &str,
-    ) -> Result<(CatalogTable, ConnectorId, S3Source), GatewayError> {
-        let table = self.catalog.source_table(&source.name).ok_or_else(|| {
-            GatewayError::QueryTimeExecutionFailed {
-                detail: format!("source '{}' is not bound to a table", source.name),
-            }
-        })?;
-        let bucket =
-            source
-                .options
-                .get("bucket")
-                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!("S3 source '{}' requires bucket", source.name),
-                })?;
-        let connector_id = source_view_connector_id(&source.name, view_name);
-        let mut builder = object_store::aws::AmazonS3Builder::new()
-            .with_bucket_name(bucket)
-            .with_region(
-                source
-                    .options
-                    .get("region")
-                    .map(String::as_str)
-                    .unwrap_or("us-east-1"),
-            );
-        if let Some(endpoint) = source.options.get("endpoint") {
-            builder = builder
-                .with_endpoint(endpoint)
-                .with_allow_http(endpoint.starts_with("http://"));
-        }
-        if let Some(access_key) = source.options.get("access_key") {
-            builder = builder.with_access_key_id(access_key);
-        }
-        if let Some(secret_key) = source.options.get("secret_key") {
-            builder = builder.with_secret_access_key(secret_key);
-        }
-        let object_store =
-            Arc::new(
-                builder
-                    .build()
-                    .map_err(|error| GatewayError::QueryTimeExecutionFailed {
-                        detail: format!("build S3 source '{}': {error}", source.name),
-                    })?,
-            );
-        let runtime = S3Source::new(connector_id, catalog_columns_to_schema(&table.columns))
-            .with_object_store(object_store, source.options.get("prefix").cloned());
-        Ok((table, connector_id, runtime))
-    }
-
     fn build_kafka_source(
         &self,
         source: &CatalogSourceEntry,
@@ -2746,7 +2776,7 @@ impl GatewayHandler {
             .or_else(|| source.options.get("group_id"))
             .cloned()
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
-        let runtime = KafkaSource::connect(
+        let mut runtime = KafkaSource::connect(
             connector_id,
             catalog_columns_to_schema(&table.columns),
             bootstrap,
@@ -2754,13 +2784,16 @@ impl GatewayHandler {
             &group_id,
         )
         .map_err(source_backfill_error)?;
+        if let Some(secret_name) = source.options.get("secret") {
+            runtime.bind_secret(secret_name.clone());
+        }
         Ok((table, connector_id, runtime))
     }
 
     async fn build_postgres_cdc_source(
         &self,
         source: &CatalogSourceEntry,
-        view_name: &str,
+        _view_name: &str,
     ) -> Result<(CatalogTable, ConnectorId, PostgresCdcSource), GatewayError> {
         if source.format != "pgoutput" {
             return Err(GatewayError::QueryTimeExecutionFailed {
@@ -2782,112 +2815,65 @@ impl GatewayHandler {
                 }
             })
         };
-        let credential_ref = option("credential_ref")?;
-        let password = if let Some(variable) = credential_ref.strip_prefix("env://") {
-            Some(
-                std::env::var(variable).map_err(|_| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
+        let secret_name = source.options.get("secret").cloned();
+        let (password, secret_name) = if let Some(secret_name) = secret_name {
+            let secret = self
+                .secret_store
+                .get_secret(0, &secret_name)
+                .await
+                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: error.to_string(),
+                })?;
+            let password = secret.payload.get("password").cloned();
+            (password, Some(secret_name))
+        } else {
+            let credential_ref = option("credential_ref")?;
+            let password = if let Some(variable) = credential_ref.strip_prefix("env://") {
+                Some(std::env::var(variable).map_err(|_| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
                     "PostgreSQL CDC source '{}' cannot resolve credential_ref '{credential_ref}'",
                     source.name
                 ),
-                })?,
-            )
-        } else if credential_ref == "none://trusted" {
-            None
-        } else {
-            return Err(GatewayError::QueryTimeExecutionFailed {
-                detail: format!(
-                    "PostgreSQL CDC source '{}' requires credential_ref env://<PASSWORD_ENV> or none://trusted",
-                    source.name
-                ),
-            });
-        };
-        let connector_id = source_view_connector_id(&source.name, view_name);
-        let port = source.options.get("port").map_or(Ok(5432), |port| {
-            port.parse()
-                .map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                    }
+                })?)
+            } else if credential_ref == "none://trusted" {
+                None
+            } else {
+                return Err(GatewayError::QueryTimeExecutionFailed {
                     detail: format!(
-                        "PostgreSQL CDC source '{}' has invalid port '{port}'",
+                        "PostgreSQL CDC source '{}' requires credential_ref env://<PASSWORD_ENV> or none://trusted",
                         source.name
                     ),
-                })
-        })?;
-        let runtime = PostgresCdcSource::connect_pgoutput(
+                });
+            };
+            (password, None)
+        };
+        let identity = pgoutput_source_identity(source)?;
+        let connector_id = identity.connector_id();
+        let mut runtime = PostgresCdcSource::configured_pgoutput(
             connector_id,
             catalog_columns_to_schema(&table.columns),
             PgOutputConfig {
-                host: source
-                    .options
-                    .get("host")
-                    .cloned()
-                    .unwrap_or_else(|| "127.0.0.1".to_string()),
-                port,
-                database: source
-                    .options
-                    .get("database")
-                    .cloned()
-                    .unwrap_or_else(|| "postgres".to_string()),
-                user: source
-                    .options
-                    .get("user")
-                    .cloned()
-                    .unwrap_or_else(|| "postgres".to_string()),
+                host: identity.host,
+                port: identity.port,
+                database: identity.database,
+                user: identity.auth_principal,
                 password,
-                slot: option("slot")?,
-                publication: option("publication")?,
-                table: table.name.clone(),
+                slot: identity.slot,
+                publication: identity.publication,
+                table: source
+                    .options
+                    .get("table")
+                    .cloned()
+                    .unwrap_or_else(|| table.name.clone()),
             },
         )
-        .await
         .map_err(source_backfill_error)?;
+        if let Some(secret_name) = secret_name {
+            runtime.bind_secret(secret_name);
+        }
         Ok((table, connector_id, runtime))
-    }
-
-    async fn backfill_s3_source(
-        &self,
-        source: &CatalogSourceEntry,
-        view_name: &str,
-        publish: bool,
-        shard_db: &Arc<rockstream_storage::ShardDb>,
-    ) -> Result<(), GatewayError> {
-        if let crate::admission::BackfillAdmissionDecision::Reject { code, reason } =
-            self.backfill_admission.reserve(
-                BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
-                BACKFILL_ADMISSION_CAPACITY_BYTES,
-            )
-        {
-            return Err(GatewayError::QueryTimeExecutionFailed {
-                detail: format!("[{code}] {reason}"),
-            });
-        }
-        let _reservation = BackfillReservation {
-            controller: Arc::clone(&self.backfill_admission),
-            bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
-        };
-        let (_, connector_id, source_runtime) = self.build_s3_source(source, view_name)?;
-        let checkpoint_store =
-            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
-        self.backfill_bound_source(
-            &source.name,
-            view_name,
-            SourceRuntimeCoordinator::new(
-                source_runtime,
-                connector_id,
-                OffsetToken::new(Vec::new()),
-                checkpoint_store,
-            ),
-            publish,
-            shard_db,
-        )
-        .await?;
-        if publish {
-            self.spawn_s3_source_worker(
-                source.clone(),
-                view_name.to_string(),
-                Arc::clone(shard_db),
-            );
-        }
-        Ok(())
     }
 
     async fn backfill_kafka_source(
@@ -2944,6 +2930,30 @@ impl GatewayHandler {
         publish: bool,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
+        if self.catalog.is_backfill_published(view_name) {
+            self.catalog.begin_backfill(view_name, 0);
+        }
+        let identity = pgoutput_source_identity(source)?;
+        let _registry_guard = self.pgoutput_registry_lock.lock().await;
+        {
+            let _guard = self.shard_commit_lock.lock().await;
+            identity.register(shard_db).await?;
+        }
+        if let Some(coordinator) = self
+            .pgoutput_coordinators
+            .get(&identity.connector_id())
+            .map(|entry| entry.value().clone())
+        {
+            if !coordinator.lock().await.shares_shard(shard_db) {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "RS-4013: pgoutput aliases and dependent views must share one shard"
+                        .to_string(),
+                });
+            }
+            return self
+                .backfill_attached_pgoutput_view(source, view_name, publish, coordinator, shard_db)
+                .await;
+        }
         if let crate::admission::BackfillAdmissionDecision::Reject { code, reason } =
             self.backfill_admission.reserve(
                 BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
@@ -2958,23 +2968,8 @@ impl GatewayHandler {
             controller: Arc::clone(&self.backfill_admission),
             bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
         };
-        let (_, connector_id, source_runtime) =
-            self.build_postgres_cdc_source(source, view_name).await?;
-        let checkpoint_store =
-            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
-        self.backfill_bound_source(
-            &source.name,
-            view_name,
-            SourceRuntimeCoordinator::new(
-                source_runtime,
-                connector_id,
-                OffsetToken::new(Vec::new()),
-                checkpoint_store,
-            ),
-            publish,
-            shard_db,
-        )
-        .await?;
+        self.backfill_new_pgoutput_coordinator(source, view_name, publish, shard_db)
+            .await?;
         if publish {
             self.spawn_postgres_cdc_source_worker(
                 source.clone(),
@@ -2985,23 +2980,278 @@ impl GatewayHandler {
         Ok(())
     }
 
+    async fn backfill_new_pgoutput_coordinator(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let identity = pgoutput_source_identity(source)?;
+        let connector_id = identity.connector_id();
+        let aliases = self.pgoutput_source_aliases(connector_id);
+        let (_, _, source_runtime) = self.build_postgres_cdc_source(source, view_name).await?;
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
+        let coordinator = Arc::new(tokio::sync::Mutex::new(SharedPgOutputCoordinator::new(
+            identity,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            Arc::clone(shard_db),
+        )));
+        let mut needs_attachment = false;
+        {
+            let mut coordinator = coordinator.lock().await;
+            for alias in &aliases {
+                coordinator.attach_alias(alias.name.clone());
+            }
+            coordinator.restore_catalog(shard_db).await?;
+            if let Some(blocked) = &coordinator.blocked_state {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "{}: pgoutput source remains blocked at xid {} after incompatible relation {}",
+                        blocked.code, blocked.xid, blocked.relation.relation_id
+                    ),
+                });
+            }
+            coordinator
+                .runtime
+                .recover()
+                .await
+                .map_err(source_backfill_error)?;
+            self.validate_pgoutput_lifecycles(&coordinator).await?;
+            let lease = coordinator
+                .runtime
+                .acquire_owner(format!("gateway:pgoutput:{}", connector_id.0))
+                .map_err(source_backfill_error)?;
+            coordinator.owner_lease = Some(lease.clone());
+            coordinator
+                .runtime
+                .open_pgoutput(&lease)
+                .await
+                .map_err(source_backfill_error)?;
+            if coordinator.runtime.committed_epoch() != 0 {
+                needs_attachment = true;
+                let durable = rockstream_connectors::PgLsn::from_offset_token(
+                    coordinator.runtime.committed_offset(),
+                )
+                .map_err(source_backfill_error)?;
+                if coordinator
+                    .runtime
+                    .pgoutput_confirmed_lsn(&lease)
+                    .await
+                    .map_err(source_backfill_error)?
+                    .is_some_and(|slot| slot > durable)
+                {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: "RS-4013: PostgreSQL slot is ahead of the durable M3 checkpoint"
+                            .to_string(),
+                    });
+                }
+                coordinator
+                    .runtime
+                    .acknowledge_recovered(&lease)
+                    .await
+                    .map_err(source_backfill_error)?;
+                coordinator.cleanup_recovered_spill(shard_db).await?;
+            } else {
+                let relations = aliases
+                    .iter()
+                    .filter_map(|alias| {
+                        let table = self.catalog.source_table(&alias.name)?;
+                        Some((
+                            alias
+                                .options
+                                .get("table")
+                                .cloned()
+                                .unwrap_or_else(|| table.name.clone()),
+                            catalog_columns_to_schema(&table.columns),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let snapshot = coordinator
+                    .runtime
+                    .capture_pgoutput_source_snapshot(&lease, &relations)
+                    .await
+                    .map_err(source_backfill_error)?;
+                let estimated_rows = snapshot
+                    .relations
+                    .iter()
+                    .map(|relation| relation.rows.len() as u64)
+                    .sum();
+                self.catalog.begin_backfill(view_name, estimated_rows);
+                coordinator.begin(0)?;
+                coordinator.activate_view(view_name);
+                for relation in snapshot.relations {
+                    let relation_id = relation.relation.relation_id;
+                    self.stage_pgoutput_relation(
+                        &mut coordinator,
+                        &aliases,
+                        0,
+                        relation.relation,
+                        &relation.column_policies,
+                        shard_db,
+                    )
+                    .await?;
+                    for row in relation.rows {
+                        coordinator.push_change(
+                            0,
+                            relation_id,
+                            CdcOperation::Insert,
+                            None,
+                            Some(row),
+                        )?;
+                    }
+                }
+                let envelope = coordinator.finish_envelope(0, snapshot.lsn)?;
+                if let Err(error) = coordinator.commit_envelope(envelope, self, shard_db).await {
+                    self.restore_compiled_pipeline_state(shard_db).await;
+                    return Err(error);
+                }
+                self.catalog.update_backfill_progress(
+                    view_name,
+                    coordinator.runtime.committed_epoch().to_string(),
+                    0,
+                    estimated_rows,
+                );
+            }
+        }
+        self.pgoutput_coordinators
+            .insert(connector_id, Arc::clone(&coordinator));
+        if needs_attachment {
+            self.backfill_attached_pgoutput_view(source, view_name, publish, coordinator, shard_db)
+                .await?;
+        }
+        if publish {
+            self.catalog.publish_backfill(view_name);
+        }
+        Ok(())
+    }
+
+    async fn backfill_attached_pgoutput_view(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        coordinator: Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let mut coordinator = coordinator.lock().await;
+        let _guard = self.shard_commit_lock.lock().await;
+        let compiled = self
+            .compiled_views
+            .get(view_name)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view '{view_name}' is unavailable"),
+            })?;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let output = if self.catalog.backfill_has_cursor(view_name) {
+            None
+        } else {
+            Some(
+                if let Some(join) = &compiled.join {
+                    let left = self.full_table_zset(&join.left_source, shard_db).await?;
+                    let right = self.full_table_zset(&join.right_source, shard_db).await?;
+                    join.pipeline.process(left, right)
+                } else {
+                    let dependency = self
+                        .catalog
+                        .get_view_deps(view_name)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("compiled view '{view_name}' has no dependency"),
+                        })?;
+                    compiled
+                        .pipeline
+                        .process(self.full_table_zset(&dependency, shard_db).await?)
+                }
+                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled pipeline backfill({view_name}): {error}"),
+                })?,
+            )
+        };
+        let mut m3 = rockstream_storage::WriteBatch::new();
+        if let Some(output) = &output {
+            compiled.sink.append_epoch(&mut m3, output, epoch);
+            if let Some(join) = &compiled.join {
+                join.pipeline.append_state(shard_db, &mut m3).await
+            } else {
+                compiled.pipeline.append_state(shard_db, &mut m3).await
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("append compiled pipeline backfill state({view_name}): {error}"),
+            })?;
+        }
+        m3.put(
+            &rockstream_storage::ShardKeyEncoder::frontier_key(),
+            &epoch.to_be_bytes(),
+        );
+        let offset = coordinator.runtime.committed_offset().clone();
+        let lifecycle = BackfillLifecycle::new(
+            BackfillPhase::Running,
+            BackfillCursor::new(
+                view_name,
+                0,
+                offset.as_bytes().to_vec(),
+                SnapshotDeltaFence::new(offset.clone(), offset),
+                epoch,
+            ),
+            0,
+            output.as_ref().map_or(0, ArrowZSet::num_rows) as u64,
+            0,
+            Some(epoch),
+        );
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .commit_attachment(&lease, &lifecycle, m3)
+            .await
+            .map_err(source_backfill_error)?;
+        coordinator.attach_alias(source.name.clone());
+        if let Some(output) = output {
+            self.catalog.update_backfill_progress(
+                view_name,
+                epoch.to_string(),
+                0,
+                output.num_rows() as u64,
+            );
+        }
+        if publish {
+            self.catalog.publish_backfill(view_name);
+        }
+        Ok(())
+    }
+
     async fn backfill_source_view(
         &self,
         sources: &[CatalogSourceEntry],
         view_name: &str,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
+        let mut pgoutput_identities = HashSet::new();
         for source in sources {
             match source.source_type.as_str() {
-                "s3" => {
-                    self.backfill_s3_source(source, view_name, false, shard_db)
-                        .await?
-                }
                 "kafka" => {
                     self.backfill_kafka_source(source, view_name, false, shard_db)
                         .await?
                 }
                 "postgres_cdc" => {
+                    let connector_id = pgoutput_source_identity(source)?.connector_id();
+                    if !pgoutput_identities.insert(connector_id) {
+                        continue;
+                    }
                     self.backfill_postgres_cdc_source(source, view_name, false, shard_db)
                         .await?
                 }
@@ -3018,11 +3268,6 @@ impl GatewayHandler {
         self.catalog.publish_backfill(view_name);
         for source in sources {
             match source.source_type.as_str() {
-                "s3" => self.spawn_s3_source_worker(
-                    source.clone(),
-                    view_name.to_string(),
-                    Arc::clone(shard_db),
-                ),
                 "kafka" => self.spawn_kafka_source_worker(
                     source.clone(),
                     view_name.to_string(),
@@ -3057,7 +3302,7 @@ impl GatewayHandler {
         let mut rows_remaining = 0;
         let mut estimated_rows = 0;
         for source in &sources {
-            let connector_id = source_view_connector_id(&source.name, view_name);
+            let connector_id = source_checkpoint_connector_id(source, view_name);
             let Ok(Some(lifecycle)) = SourceCheckpointStore::new(
                 Arc::clone(shard_db),
                 connector_id.0 as u128,
@@ -3093,29 +3338,6 @@ impl GatewayHandler {
         );
     }
 
-    fn spawn_s3_source_worker(
-        &self,
-        source: CatalogSourceEntry,
-        view_name: String,
-        shard_db: Arc<rockstream_storage::ShardDb>,
-    ) {
-        let key = format!("{}:{view_name}", source.name);
-        if self.source_workers.insert(key.clone(), ()).is_some() {
-            return;
-        }
-        let weak = self.self_ref.lock().clone();
-        if weak.strong_count() == 0 {
-            self.source_workers.remove(&key);
-            return;
-        }
-        tokio::spawn(async move {
-            GatewayHandler::run_s3_source_worker(weak.clone(), source, view_name, shard_db).await;
-            if let Some(handler) = weak.upgrade() {
-                handler.source_workers.remove(&key);
-            }
-        });
-    }
-
     fn spawn_kafka_source_worker(
         &self,
         source: CatalogSourceEntry,
@@ -3146,7 +3368,11 @@ impl GatewayHandler {
         view_name: String,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
-        let key = format!("{}:{view_name}", source.name);
+        let Ok(identity) = pgoutput_source_identity(&source) else {
+            return;
+        };
+        let connector_id = identity.connector_id();
+        let key = format!("pgoutput:{}", connector_id.0);
         if self.source_workers.insert(key.clone(), ()).is_some() {
             return;
         }
@@ -3165,6 +3391,7 @@ impl GatewayHandler {
             .await;
             if let Some(handler) = weak.upgrade() {
                 handler.source_workers.remove(&key);
+                handler.pgoutput_coordinators.remove(&connector_id);
             }
         });
     }
@@ -3211,61 +3438,782 @@ impl GatewayHandler {
         let Some(handler) = weak.upgrade() else {
             return;
         };
-        let Ok((table, connector_id, source_runtime)) =
-            handler.build_postgres_cdc_source(&source, &view_name).await
-        else {
+        let Ok(identity) = pgoutput_source_identity(&source) else {
             return;
         };
-        drop(handler);
-        let checkpoint_store =
-            SourceCheckpointStore::new(Arc::clone(&shard_db), connector_id.0 as u128, connector_id);
-        Self::run_live_source_worker(
-            weak,
-            source,
-            view_name,
-            table,
-            SourceRuntimeCoordinator::new(
-                source_runtime,
+        let connector_id = identity.connector_id();
+        let registry_guard = handler.pgoutput_registry_lock.lock().await;
+        let (coordinator, created) = if let Some(existing) = handler
+            .pgoutput_coordinators
+            .get(&connector_id)
+            .map(|entry| entry.value().clone())
+        {
+            if !existing.lock().await.shares_shard(&shard_db) {
+                handler.block_pgoutput_aliases(
+                    std::slice::from_ref(&source),
+                    "RS-4013: pgoutput aliases and dependent views must share one shard"
+                        .to_string(),
+                );
+                return;
+            }
+            (existing, false)
+        } else {
+            let Ok((_, _, source_runtime)) =
+                handler.build_postgres_cdc_source(&source, &view_name).await
+            else {
+                return;
+            };
+            let checkpoint_store = SourceCheckpointStore::new(
+                Arc::clone(&shard_db),
+                connector_id.0 as u128,
                 connector_id,
-                OffsetToken::new(Vec::new()),
-                checkpoint_store,
-            ),
-            shard_db,
-        )
+            );
+            let coordinator = Arc::new(tokio::sync::Mutex::new(SharedPgOutputCoordinator::new(
+                identity,
+                SourceRuntimeCoordinator::new(
+                    source_runtime,
+                    connector_id,
+                    OffsetToken::new(Vec::new()),
+                    checkpoint_store,
+                ),
+                Arc::clone(&shard_db),
+            )));
+            handler
+                .pgoutput_coordinators
+                .insert(connector_id, Arc::clone(&coordinator));
+            (coordinator, true)
+        };
+        let initialized = async {
+            let mut coordinator = coordinator.lock().await;
+            if coordinator.owner_lease.is_none() {
+                coordinator.attach_alias(source.name.clone());
+                coordinator
+                    .restore_catalog(&shard_db)
+                    .await
+                    .map_err(|_| ())?;
+                if coordinator.blocked_state.is_some() {
+                    handler.block_pgoutput_aliases(
+                        std::slice::from_ref(&source),
+                        "RS-1002: pgoutput source remains blocked by an incompatible relation"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                coordinator.runtime.resume().await.map_err(|_| ())?;
+                handler
+                    .validate_pgoutput_lifecycles(&coordinator)
+                    .await
+                    .map_err(|_| ())?;
+                let lease = coordinator
+                    .runtime
+                    .acquire_owner(format!("gateway:pgoutput:{}", connector_id.0))
+                    .map_err(|_| ())?;
+                coordinator.owner_lease = Some(lease.clone());
+                coordinator
+                    .runtime
+                    .open_pgoutput(&lease)
+                    .await
+                    .map_err(|_| ())?;
+                let durable_lsn = rockstream_connectors::PgLsn::from_offset_token(
+                    coordinator.runtime.committed_offset(),
+                )
+                .map_err(|_| ())?;
+                let slot_lsn = coordinator
+                    .runtime
+                    .pgoutput_confirmed_lsn(&lease)
+                    .await
+                    .map_err(|_| ())?;
+                if coordinator.runtime.committed_epoch() != 0
+                    && slot_lsn.is_some_and(|slot_lsn| slot_lsn > durable_lsn)
+                {
+                    handler.block_pgoutput_aliases(
+                        std::slice::from_ref(&source),
+                        "RS-4013: PostgreSQL slot is ahead of the durable M3 checkpoint"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                coordinator
+                    .runtime
+                    .acknowledge_recovered(&lease)
+                    .await
+                    .map_err(|_| ())?;
+                coordinator
+                    .cleanup_recovered_spill(&shard_db)
+                    .await
+                    .map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+        }
         .await;
+        if initialized.is_err() {
+            if created {
+                handler.pgoutput_coordinators.remove(&connector_id);
+            }
+            return;
+        }
+        drop(registry_guard);
+        drop(handler);
+
+        loop {
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            let aliases = handler.pgoutput_source_aliases(connector_id);
+            if aliases.is_empty() {
+                let mut coordinator = coordinator.lock().await;
+                let dropped = handler.pgoutput_registered_aliases(connector_id).is_empty();
+                let cleaned = if dropped {
+                    coordinator.drop_durable_state(&shard_db).await.is_ok()
+                } else if let Some(lease) = coordinator.owner_lease.clone() {
+                    let closed = coordinator.runtime.close_pgoutput(&lease);
+                    coordinator.owner_lease = None;
+                    closed
+                } else {
+                    true
+                };
+                drop(coordinator);
+                if dropped && cleaned {
+                    handler.pgoutput_coordinators.remove(&connector_id);
+                }
+                break;
+            }
+            let mut coordinator = coordinator.lock().await;
+            for alias in &aliases {
+                coordinator.attach_alias(alias.name.clone());
+            }
+            let Some(lease) = coordinator.owner_lease.clone() else {
+                break;
+            };
+            let event = match coordinator
+                .runtime
+                .poll_pgoutput_event(&lease, BACKFILL_BATCH_MAX_ROWS)
+                .await
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    drop(coordinator);
+                    drop(handler);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => {
+                    handler
+                        .block_pgoutput_aliases(&aliases, format!("pgoutput poll failed: {error}"));
+                    break;
+                }
+            };
+            let result = match event {
+                PgOutputEvent::Begin { xid } => coordinator.begin(xid),
+                PgOutputEvent::Relation { xid, relation } => {
+                    match coordinator
+                        .runtime
+                        .pgoutput_relation_column_policies(&lease, relation.relation_id)
+                        .await
+                    {
+                        Ok(column_policies) => {
+                            handler
+                                .stage_pgoutput_relation(
+                                    &mut coordinator,
+                                    &aliases,
+                                    xid,
+                                    relation,
+                                    &column_policies,
+                                    &shard_db,
+                                )
+                                .await
+                        }
+                        Err(error) => Err(source_backfill_error(error)),
+                    }
+                }
+                PgOutputEvent::Insert {
+                    xid,
+                    relation_id,
+                    new_values,
+                } => coordinator.push_change(
+                    xid,
+                    relation_id,
+                    CdcOperation::Insert,
+                    None,
+                    Some(new_values),
+                ),
+                PgOutputEvent::Update {
+                    xid,
+                    relation_id,
+                    old_values,
+                    new_values,
+                } => coordinator.push_change(
+                    xid,
+                    relation_id,
+                    CdcOperation::Update,
+                    Some(old_values),
+                    Some(new_values),
+                ),
+                PgOutputEvent::Delete {
+                    xid,
+                    relation_id,
+                    old_values,
+                } => coordinator.push_change(
+                    xid,
+                    relation_id,
+                    CdcOperation::Delete,
+                    Some(old_values),
+                    None,
+                ),
+                PgOutputEvent::Commit { xid, commit_lsn } => {
+                    match coordinator.finish_envelope(xid, commit_lsn) {
+                        Ok(envelope) => {
+                            coordinator
+                                .commit_envelope(envelope, &handler, &shard_db)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            if let Err(error) = result {
+                let reason = match &error {
+                    GatewayError::QueryTimeExecutionFailed { detail }
+                        if detail.starts_with("RS-1002:") =>
+                    {
+                        detail.clone()
+                    }
+                    _ => error.to_string(),
+                };
+                handler.block_pgoutput_aliases(&aliases, reason);
+                handler.restore_compiled_pipeline_state(&shard_db).await;
+                let _ = coordinator.runtime.close_pgoutput(&lease);
+                coordinator.owner_lease = None;
+                break;
+            }
+            handler.project_pgoutput_status(&coordinator);
+        }
     }
 
-    async fn run_s3_source_worker(
-        weak: Weak<GatewayHandler>,
-        source: CatalogSourceEntry,
-        view_name: String,
-        shard_db: Arc<rockstream_storage::ShardDb>,
-    ) {
-        let Some(handler) = weak.upgrade() else {
-            return;
+    fn pgoutput_source_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
+        self.pgoutput_registered_aliases(connector_id)
+            .into_iter()
+            .filter(|source| source.status == "OK")
+            .collect()
+    }
+
+    fn pgoutput_registered_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
+        self.catalog
+            .list_sources()
+            .into_iter()
+            .filter(|source| {
+                source.source_type == "postgres_cdc"
+                    && source.format == "pgoutput"
+                    && pgoutput_source_identity(source)
+                        .is_ok_and(|identity| identity.connector_id() == connector_id)
+            })
+            .collect()
+    }
+
+    fn block_pgoutput_aliases(&self, aliases: &[CatalogSourceEntry], reason: String) {
+        for alias in aliases {
+            self.catalog.update_source_status(&alias.name, "BLOCKED");
+            self.catalog.update_source_runtime_detail(
+                &alias.name,
+                Some("gateway:pgoutput:fenced".to_string()),
+                None,
+                alias.live_offset.clone(),
+                alias.live_lag,
+                None,
+                Some(reason.clone()),
+            );
+        }
+    }
+
+    fn project_pgoutput_status(&self, coordinator: &SharedPgOutputCoordinator) {
+        let detail = PgOutputSourceRuntimeDetail {
+            source_identity_hash: format!("{:016x}", coordinator.connector_id.0),
+            active_xid: coordinator
+                .active_envelope
+                .as_ref()
+                .map(|active| active.xid),
+            envelope_bytes: coordinator.envelope_bytes(),
+            in_memory_bytes: coordinator.in_memory_bytes(),
+            spill_bytes: coordinator.spill_bytes(),
+            attached_view_count: coordinator.attached_view_count,
+            affected_view_count: coordinator.affected_view_count,
+            relation_schema_version: coordinator
+                .relation_routes
+                .values()
+                .map(|route| route.schema_version)
+                .max()
+                .unwrap_or(0),
         };
-        let Ok((table, connector_id, source_runtime)) =
-            handler.build_s3_source(&source, &view_name)
-        else {
-            return;
+        for alias in coordinator.aliases() {
+            self.catalog
+                .update_pgoutput_source_runtime(alias, detail.clone());
+        }
+    }
+
+    async fn restore_compiled_pipeline_state(&self, shard_db: &rockstream_storage::ShardDb) {
+        let compiled = self
+            .compiled_views
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for view in compiled {
+            let result = if let Some(join) = &view.join {
+                join.pipeline.restore(shard_db).await
+            } else {
+                view.pipeline.restore(shard_db).await
+            };
+            if let Err(error) = result {
+                tracing::error!(code = "RS-4013", view = %view.view_name, %error, "restore fenced pgoutput pipeline failed");
+            }
+        }
+    }
+
+    async fn validate_pgoutput_lifecycles(
+        &self,
+        coordinator: &SharedPgOutputCoordinator,
+    ) -> Result<(), GatewayError> {
+        if coordinator.runtime.committed_epoch() == 0 {
+            return Ok(());
+        }
+        let relations = coordinator
+            .aliases()
+            .filter_map(|alias| self.catalog.source_table(alias))
+            .map(|table| table.name)
+            .collect::<HashSet<_>>();
+        for view in self
+            .reachable_compiled_views(&relations)
+            .into_iter()
+            .filter(|view| self.catalog.is_backfill_published(view))
+        {
+            let lifecycle = coordinator
+                .runtime
+                .backfill_lifecycle(&view)
+                .await
+                .map_err(source_backfill_error)?
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4019: active pgoutput view '{view}' has no durable lifecycle"
+                    ),
+                })?;
+            if lifecycle.cursor.last_key != coordinator.runtime.committed_offset().as_bytes() {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4019: active pgoutput view '{view}' cursor differs from source checkpoint"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn stage_pgoutput_relation(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        aliases: &[CatalogSourceEntry],
+        xid: u32,
+        relation: PgOutputRelationMetadata,
+        column_policies: &[(bool, bool)],
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        if let Some(existing) = coordinator.relation_routes.get(&relation.relation_id) {
+            if existing.upstream_namespace != relation.namespace
+                || existing.upstream_relation != relation.name
+            {
+                return self
+                    .block_relation_change(coordinator, xid, relation, shard_db)
+                    .await;
+            }
+        }
+        let Some(alias) = aliases.iter().find(|alias| {
+            let configured = alias
+                .options
+                .get("table")
+                .map(String::as_str)
+                .or(alias.table_name.as_deref())
+                .unwrap_or(&alias.name);
+            let (namespace, name) = configured.split_once('.').unwrap_or(("public", configured));
+            namespace == relation.namespace && name == relation.name
+        }) else {
+            return coordinator.stage_unrouted(xid, relation.relation_id);
         };
-        drop(handler);
-        let checkpoint_store =
-            SourceCheckpointStore::new(Arc::clone(&shard_db), connector_id.0 as u128, connector_id);
-        Self::run_live_source_worker(
-            weak,
-            source,
-            view_name,
-            table,
-            SourceRuntimeCoordinator::new(
-                source_runtime,
-                connector_id,
-                OffsetToken::new(Vec::new()),
-                checkpoint_store,
-            ),
-            shard_db,
-        )
-        .await;
+        let table = self.catalog.source_table(&alias.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to an imported table", alias.name),
+            }
+        })?;
+        if column_policies.len() != relation.columns.len()
+            || relation
+                .columns
+                .iter()
+                .any(|column| !matches!(column.type_oid, 20 | 23 | 25 | 1043 | 1700))
+        {
+            return self
+                .block_relation_change(coordinator, xid, relation, shard_db)
+                .await;
+        }
+        let previous = coordinator
+            .relation_routes
+            .get(&relation.relation_id)
+            .cloned();
+        let next_schema_version = coordinator.next_schema_version()?;
+        if previous.is_none()
+            && (table.columns.len() != relation.columns.len()
+                || table
+                    .columns
+                    .iter()
+                    .zip(&relation.columns)
+                    .any(|(imported, upstream)| {
+                        imported.name != upstream.name
+                            || !catalog_type_accepts_pg_oid(&imported.data_type, upstream.type_oid)
+                    }))
+        {
+            return self
+                .block_relation_change(coordinator, xid, relation, shard_db)
+                .await;
+        }
+        let route = RelationRoute {
+            version: 1,
+            relation_id: relation.relation_id,
+            upstream_namespace: relation.namespace,
+            upstream_relation: relation.name,
+            imported_table_id: rockstream_types::rendezvous::fnv1a_64(table.name.as_bytes()),
+            imported_table_name: table.name,
+            columns: relation
+                .columns
+                .into_iter()
+                .enumerate()
+                .map(|(index, upstream)| {
+                    let imported_name = previous
+                        .as_ref()
+                        .and_then(|route| route.columns.get(index))
+                        .map_or_else(
+                            || {
+                                table
+                                    .columns
+                                    .get(index)
+                                    .map(|column| column.name.clone())
+                                    .unwrap_or_else(|| upstream.name.clone())
+                            },
+                            |column| column.imported_name.clone(),
+                        );
+                    ColumnRoute {
+                        upstream_name: upstream.name,
+                        imported_name,
+                        type_oid: upstream.type_oid,
+                        type_modifier: upstream.type_modifier,
+                        nullable: column_policies[index].0,
+                        has_default: column_policies[index].1,
+                        key: upstream.flags & 1 != 0,
+                    }
+                })
+                .collect(),
+            replica_identity: ReplicaIdentity::from_wire(relation.replica_identity)?,
+            schema_version: next_schema_version,
+        };
+        if let Some(previous) = &previous {
+            match previous.classify(&route) {
+                RelationChange::Unchanged => return Ok(()),
+                RelationChange::Compatible => {}
+                RelationChange::Breaking(_) => {
+                    let relation = PgOutputRelationMetadata {
+                        relation_id: route.relation_id,
+                        namespace: route.upstream_namespace,
+                        name: route.upstream_relation,
+                        replica_identity: relation.replica_identity,
+                        columns: route
+                            .columns
+                            .into_iter()
+                            .map(|column| rockstream_connectors::PgOutputColumn {
+                                flags: u8::from(column.key),
+                                name: column.upstream_name,
+                                type_oid: column.type_oid,
+                                type_modifier: column.type_modifier,
+                            })
+                            .collect(),
+                    };
+                    return self
+                        .block_relation_change(coordinator, xid, relation, shard_db)
+                        .await;
+                }
+            }
+        }
+        coordinator.stage_route(xid, route)
+    }
+
+    async fn block_relation_change(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        xid: u32,
+        relation: PgOutputRelationMetadata,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let _guard = self.shard_commit_lock.lock().await;
+        let last_safe_lsn =
+            rockstream_connectors::PgLsn::from_offset_token(coordinator.runtime.committed_offset())
+                .map_err(source_backfill_error)?;
+        let mut batch = rockstream_storage::WriteBatch::new();
+        let blocked = BlockedRelationState {
+            code: "RS-1002".to_string(),
+            xid,
+            relation,
+            last_safe_lsn,
+        };
+        append_blocked_state(&mut batch, coordinator.connector_id, &blocked)?;
+        shard_db.write_batch(batch).await?;
+        shard_db.flush().await?;
+        coordinator.blocked_state = Some(blocked);
+        Err(GatewayError::QueryTimeExecutionFailed {
+            detail: "RS-1002: incompatible upstream relation change blocked the pgoutput source"
+                .to_string(),
+        })
+    }
+
+    pub(crate) async fn commit_pgoutput_envelope(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        envelope: BufferedPgOutputEnvelope,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let _guard = self.shard_commit_lock.lock().await;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let staged_routes = envelope
+            .route_updates
+            .iter()
+            .map(|route| (route.relation_id, route))
+            .collect::<HashMap<_, _>>();
+        let route_schemas = coordinator
+            .relation_routes
+            .values()
+            .chain(&envelope.route_updates)
+            .map(|route| {
+                (
+                    route.imported_table_name.clone(),
+                    self.catalog
+                        .get_table(&route.imported_table_name)
+                        .map(|table| catalog_columns_to_schema(&table.columns))
+                        .unwrap_or_else(|| relation_route_schema(route)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut ops = Vec::new();
+        for change in &envelope.changes {
+            let route = staged_routes
+                .get(&change.relation_id)
+                .copied()
+                .or_else(|| coordinator.relation_routes.get(&change.relation_id))
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4013: pgoutput relation {} has no durable route",
+                        change.relation_id
+                    ),
+                })?;
+            if route.schema_version != change.schema_version {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-1002: pgoutput relation {} change used schema version {}, expected {}",
+                        change.relation_id, change.schema_version, route.schema_version
+                    ),
+                });
+            }
+            ops.push(pgoutput_change_to_dml(route, change)?);
+        }
+        let changed_relations = ops
+            .iter()
+            .map(dml_table_name)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let mut attached_relations = coordinator
+            .relation_routes
+            .values()
+            .chain(&envelope.route_updates)
+            .map(|route| route.imported_table_name.clone())
+            .collect::<HashSet<_>>();
+        for alias in coordinator.aliases() {
+            if let Some(table) = self.catalog.source_table(alias) {
+                attached_relations.insert(table.name);
+            }
+        }
+        let mut active_views = self
+            .reachable_compiled_views(&attached_relations)
+            .into_iter()
+            .filter(|view| self.catalog.is_backfill_published(view))
+            .collect::<Vec<_>>();
+        for view in coordinator.activating_views() {
+            if !active_views.iter().any(|active| active == view) {
+                active_views.push(view.to_string());
+            }
+        }
+        active_views.sort();
+        let affected = self
+            .reachable_compiled_views(&changed_relations)
+            .into_iter()
+            .filter(|view| active_views.contains(view))
+            .collect::<Vec<_>>();
+        coordinator.attached_view_count = active_views.len();
+        coordinator.affected_view_count = affected.len();
+
+        let mut m3 = rockstream_storage::WriteBatch::new();
+        append_dml_ops(&mut m3, &ops);
+        let mut deltas = HashMap::<String, ArrowZSet>::new();
+        for relation in &changed_relations {
+            deltas.insert(
+                relation.clone(),
+                build_delta_zset_for_table(
+                    relation,
+                    &ops,
+                    route_schemas
+                        .get(relation)
+                        .cloned()
+                        .unwrap_or_else(|| query_time_relation_schema(&self.catalog, relation)),
+                )?,
+            );
+        }
+        for view_name in &affected {
+            let compiled = self
+                .compiled_views
+                .get(view_name)
+                .map(|entry| entry.value().clone())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled view '{view_name}' is unavailable"),
+                })?;
+            let output = if let Some(join) = &compiled.join {
+                let left = deltas.get(&join.left_source).cloned().unwrap_or_else(|| {
+                    ArrowZSet::empty(query_time_relation_schema(&self.catalog, &join.left_source))
+                });
+                let right = deltas.get(&join.right_source).cloned().unwrap_or_else(|| {
+                    ArrowZSet::empty(query_time_relation_schema(
+                        &self.catalog,
+                        &join.right_source,
+                    ))
+                });
+                join.pipeline.process(left, right)
+            } else {
+                let deps = self.catalog.get_view_deps(view_name);
+                let schema = deps
+                    .first()
+                    .map(|dep| query_time_relation_schema(&self.catalog, dep))
+                    .unwrap_or_else(|| query_time_relation_schema(&self.catalog, view_name));
+                let inputs = deps
+                    .iter()
+                    .filter_map(|dep| deltas.get(dep).cloned())
+                    .collect::<Vec<_>>();
+                let input =
+                    rockstream_ops::join::concat_zsets(inputs, schema).map_err(|error| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("combine compiled view input({view_name}): {error}"),
+                        }
+                    })?;
+                compiled.pipeline.process(input)
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled pipeline process({view_name}): {error}"),
+            })?;
+            compiled.sink.append_epoch(&mut m3, &output, epoch);
+            if let Some(join) = &compiled.join {
+                join.pipeline.append_state(shard_db, &mut m3).await
+            } else {
+                compiled.pipeline.append_state(shard_db, &mut m3).await
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("append compiled pipeline state({view_name}): {error}"),
+            })?;
+            deltas.insert(view_name.clone(), output);
+        }
+        coordinator.append_route_updates(&mut m3, &envelope.route_updates)?;
+        m3.put(
+            &rockstream_storage::ShardKeyEncoder::frontier_key(),
+            &epoch.to_be_bytes(),
+        );
+
+        let offset = envelope.commit_lsn.to_offset_token();
+        let activating_views = coordinator
+            .activating_views()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let mut lifecycles = Vec::with_capacity(active_views.len());
+        for view_name in &active_views {
+            let previous = coordinator
+                .runtime
+                .backfill_lifecycle(view_name)
+                .await
+                .map_err(source_backfill_error)?;
+            if previous.is_none() && !activating_views.contains(view_name) {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4019: active pgoutput view '{view_name}' has no lifecycle cursor"
+                    ),
+                });
+            }
+            let fence = previous
+                .as_ref()
+                .map(|lifecycle| lifecycle.cursor.fence.clone())
+                .unwrap_or_else(|| SnapshotDeltaFence::new(offset.clone(), offset.clone()));
+            let estimated_rows = previous
+                .as_ref()
+                .map_or(envelope.changes.len() as u64, |lifecycle| {
+                    lifecycle.estimated_rows
+                });
+            lifecycles.push(BackfillLifecycle::new(
+                BackfillPhase::Running,
+                BackfillCursor::new(view_name, 0, offset.as_bytes().to_vec(), fence, epoch),
+                0,
+                estimated_rows,
+                0,
+                Some(epoch),
+            ));
+        }
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
+            .await
+            .map_err(source_backfill_error)?;
+        coordinator.cleanup_committed(shard_db).await?;
+        for route in &envelope.route_updates {
+            let existing_columns = self
+                .catalog
+                .get_table(&route.imported_table_name)
+                .map(|table| table.columns)
+                .unwrap_or_default();
+            self.catalog.update_table_columns(
+                &route.imported_table_name,
+                route
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| CatalogColumn {
+                        name: column.imported_name.clone(),
+                        data_type: existing_columns
+                            .get(index)
+                            .filter(|existing| {
+                                catalog_type_accepts_pg_oid(&existing.data_type, column.type_oid)
+                            })
+                            .map(|existing| existing.data_type.clone())
+                            .unwrap_or_else(|| pg_oid_catalog_type(column.type_oid).to_string()),
+                    })
+                    .collect(),
+            );
+        }
+        self.frontier_published_at_ms
+            .store(current_time_ms(), Ordering::SeqCst);
+        for alias in coordinator.aliases() {
+            self.catalog.update_source_runtime_detail(
+                alias,
+                Some(format!("gateway:pgoutput:{}", coordinator.connector_id.0)),
+                Some(epoch),
+                envelope.commit_lsn.to_string(),
+                0,
+                Some(0),
+                None,
+            );
+        }
+        Ok(())
     }
 
     async fn run_live_source_worker<S: SourceConnector>(
@@ -3375,6 +4323,7 @@ impl GatewayHandler {
         }
     }
 
+    // The source commit boundary must receive the complete runtime state atomically.
     #[allow(clippy::too_many_arguments)]
     async fn commit_bound_source_batch<S: SourceConnector>(
         &self,
@@ -3410,6 +4359,7 @@ impl GatewayHandler {
         .await
     }
 
+    // The source-operation commit boundary must receive the complete runtime state atomically.
     #[allow(clippy::too_many_arguments)]
     async fn commit_bound_source_ops<S: SourceConnector>(
         &self,
@@ -3426,6 +4376,11 @@ impl GatewayHandler {
         estimated_rows: u64,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
+        let _guard = self.shard_commit_lock.lock().await;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let published_frontier = published_frontier.map(|_| epoch);
         let compiled = self
             .compiled_views
             .get(view_name)
@@ -3464,7 +4419,6 @@ impl GatewayHandler {
                 }
             })?
         };
-        let epoch = runtime.next_epoch().map_err(source_backfill_error)?;
         let cursor = BackfillCursor::new(
             view_name,
             0,
@@ -3608,6 +4562,9 @@ impl GatewayHandler {
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+                return Ok(response);
+            }
             return self.handle_copy_from_stdin(query, conn_id);
         }
 
@@ -3724,6 +4681,10 @@ impl GatewayHandler {
     ) -> Option<PgWireResult<Vec<Response<'a>>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
+
+        if is_removed_connector_ddl(&ql) {
+            return Some(Ok(vec![connector_removed_error_response()]));
+        }
 
         // SERIALIZABLE → RS-2003
         if ql.contains("serializable") && ql.contains("isolation") {
@@ -3859,10 +4820,21 @@ impl GatewayHandler {
 
         // CREATE SOURCE / ALTER SOURCE / DROP SOURCE — v0.51.9 pgwire DDL wiring
         if ql.starts_with("create source ") {
-            return Some(self.handle_create_source(q));
+            return Some(self.handle_create_source(q).await);
         }
         if ql.starts_with("alter source ") || ql.starts_with("drop source ") {
             return Some(self.handle_alter_source(q));
+        }
+
+        // CREATE SECRET / ALTER SECRET / DROP SECRET — v0.55.1 pgwire DDL wiring
+        if ql.starts_with("create secret ") {
+            return Some(self.handle_create_secret(q).await);
+        }
+        if ql.starts_with("alter secret ") {
+            return Some(self.handle_alter_secret(q).await);
+        }
+        if ql.starts_with("drop secret ") {
+            return Some(self.handle_drop_secret(q).await);
         }
 
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
@@ -3892,6 +4864,10 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
+
+        if let Some(response) = self.authorize_mutation(q, conn_id) {
+            return Ok(response);
+        }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
         // Any command inside a failed block is bounced with SQLSTATE 25P02, except
@@ -4655,6 +5631,14 @@ impl GatewayHandler {
                 self.catalog.sources_response(),
             ))]);
         }
+        if ql.trim_end_matches(';') == "show sinks" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.sinks_response(),
+            ))]);
+        }
+        if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
+            return Ok(vec![promote_response(self.handle_show_secrets().await)]);
+        }
         if ql.trim_end_matches(';') == "show source status" {
             return Ok(vec![promote_response(catalog_resp_to_response(
                 self.catalog.source_status_response(None),
@@ -4704,6 +5688,54 @@ impl GatewayHandler {
                 "42601".to_owned(),
                 "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name.".to_owned(),
             ))))]);
+        }
+        if ql.trim_end_matches(';') == "show view status" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.view_status_response(None, None),
+            ))]);
+        }
+        if ql.starts_with("show view status for namespace ") {
+            let namespace = q["show view status for namespace ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            let views = self.catalog.list_views();
+            let ns_exists = namespace == "public"
+                || views
+                    .iter()
+                    .any(|v| v.namespace.eq_ignore_ascii_case(namespace));
+            if !ns_exists {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1001] namespace.not_found: namespace '{}' does not exist. Next steps: check namespace name with 'SHOW VIEW STATUS'.",
+                        namespace
+                    ),
+                ))))]);
+            }
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.view_status_response(None, Some(namespace)),
+            ))]);
+        }
+        if ql.starts_with("show view status for ") {
+            let view_name = q["show view status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_view(view_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1001] view.not_found: view '{}' does not exist. Next steps: run CREATE VIEW ... to create it.",
+                        view_name
+                    ),
+                ))))]);
+            }
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.view_status_response(Some(view_name), None),
+            ))]);
         }
         if ql.trim_end_matches(';') == "show resource usage" {
             return Ok(vec![catalog_resp_to_response(
@@ -6346,6 +7378,19 @@ impl GatewayHandler {
             ))]);
         }
 
+        let secret_name = parsed.secret.clone();
+        if let Some(secret_name) = secret_name.as_deref() {
+            if !secret_name.is_empty() {
+                let ns = 0u128;
+                if !self.secret_store.has_secret(ns, secret_name) {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-2420] secret.not_found: referenced secret does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
+                            .to_string(),
+                    )]);
+                }
+            }
+        }
+
         let entry = CatalogSinkEntry {
             name: parsed.name.clone(),
             view: parsed.view.clone(),
@@ -6361,7 +7406,21 @@ impl GatewayHandler {
             state: "OK".to_string(),
         };
 
-        let _ = self.catalog.add_sink(entry);
+        if !self.catalog.add_sink(entry) {
+            return Ok(vec![create_sink_error_response(format!(
+                "[RS-4010] sink.already_exists: sink '{}' already exists for a different view. Next steps: choose a distinct sink name.",
+                parsed.name
+            ))]);
+        }
+        if let Some(secret_name) = secret_name.as_deref() {
+            if let Err(error) = self
+                .secret_store
+                .add_reference(0u128, secret_name, &parsed.name)
+            {
+                self.catalog.remove_sink(&parsed.name);
+                return Ok(vec![create_sink_error_response(error.to_string())]);
+            }
+        }
 
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -6376,7 +7435,7 @@ impl GatewayHandler {
         )])
     }
 
-    fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_source_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_source_error_response(message)]),
@@ -6387,6 +7446,27 @@ impl GatewayHandler {
                 "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
+        }
+
+        let secret_ref = parsed.options.get("secret").cloned();
+        if let Some(secret_name) = secret_ref.as_deref() {
+            if !secret_name.is_empty() {
+                let ns = 0u128;
+                let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
+                    Ok(exists) => exists,
+                    Err(_) => {
+                        return Ok(vec![create_source_error_response(
+                            "[RS-0003] secret.storage_unavailable: unable to check the secret catalog. Next steps: verify catalog storage health and retry."
+                                .to_string(),
+                        )])
+                    }
+                };
+                if !secret_exists {
+                    return Ok(vec![create_source_error_response(format!(
+                        "[RS-2420] secret.not_found: secret '{secret_name}' does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
+                    ))]);
+                }
+            }
         }
 
         let entry = CatalogSourceEntry {
@@ -6403,32 +7483,48 @@ impl GatewayHandler {
             live_lag: 0,
         };
 
+        if entry.source_type == "postgres_cdc" && entry.format == "pgoutput" {
+            let identity = match pgoutput_source_identity(&entry) {
+                Ok(identity) => identity,
+                Err(error) => return Ok(vec![create_source_error_response(error.to_string())]),
+            };
+            if let Some((owner, _)) = self
+                .catalog
+                .list_sources()
+                .into_iter()
+                .filter(|source| {
+                    source.source_type == "postgres_cdc" && source.format == "pgoutput"
+                })
+                .filter_map(|source| {
+                    pgoutput_source_identity(&source)
+                        .ok()
+                        .map(|existing| (source.name, existing))
+                })
+                .find(|(_, existing)| {
+                    identity.has_same_physical_slot(existing) && identity != *existing
+                })
+            {
+                return Ok(vec![create_source_error_response(format!(
+                    "[RS-4013] physical pgoutput slot is already owned by source '{owner}'"
+                ))]);
+            }
+        }
+
         if !self.catalog.add_source(entry) {
             return Ok(vec![create_source_error_response(format!(
                 "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
-        if parsed.source_type == "http_webhook" {
-            // A credential reference is catalog-safe metadata.  The listener
-            // keeps its verifier only in runtime memory and never returns it
-            // through SHOW SOURCE STATUS.
-            let Some(format) = WebhookFormat::parse(&parsed.format) else {
-                return Ok(vec![create_source_error_response(
-                    "[RS-4008] invalid webhook format".to_string(),
-                )]);
-            };
-            let Some(token) = parsed.options.get("credential_ref") else {
-                return Ok(vec![create_source_error_response(
-                    "[RS-4008] missing credential_ref".to_string(),
-                )]);
-            };
-            self.webhook_sources.insert(
-                parsed.name.clone(),
-                Arc::new(Mutex::new(HttpWebhookSource::new(token, format))),
-            );
+        if let Some(secret_name) = secret_ref.as_deref() {
+            if let Err(error) = self
+                .secret_store
+                .add_reference(0u128, secret_name, &parsed.name)
+            {
+                self.catalog.remove_source(&parsed.name);
+                return Ok(vec![create_source_error_response(error.to_string())]);
+            }
         }
-
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                 "system",
@@ -6440,6 +7536,113 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(
             Tag::new("CREATE SOURCE").with_rows(0),
         )])
+    }
+
+    async fn handle_create_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_create_secret_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![secret_error_response(message)]),
+        };
+
+        let ns = 0u128;
+        if let Err(err) = self
+            .secret_store
+            .create_secret(
+                ns,
+                &parsed.name,
+                parsed.secret_type,
+                parsed.payload,
+                "pgwire",
+            )
+            .await
+        {
+            return Ok(vec![secret_error_response(err.to_string())]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE SECRET").with_rows(0),
+        )])
+    }
+
+    async fn handle_alter_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_alter_secret_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![secret_error_response(message)]),
+        };
+
+        let ns = 0u128;
+        if let Err(err) = self
+            .secret_store
+            .alter_secret(ns, &parsed.name, parsed.payload, "pgwire")
+            .await
+        {
+            return Ok(vec![secret_error_response(err.to_string())]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("ALTER SECRET").with_rows(0),
+        )])
+    }
+
+    async fn handle_drop_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_drop_secret_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![secret_error_response(message)]),
+        };
+
+        let ns = 0u128;
+        if let Err(err) = self
+            .secret_store
+            .drop_secret(ns, &parsed.name, "pgwire")
+            .await
+        {
+            if parsed.if_exists
+                && matches!(err, rockstream_control::SecretStoreError::NotFound { .. })
+            {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SECRET").with_rows(0),
+                )]);
+            }
+            return Ok(vec![secret_error_response(err.to_string())]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP SECRET").with_rows(0),
+        )])
+    }
+
+    async fn handle_show_secrets<'a>(&'a self) -> Response<'a> {
+        let ns = 0u128;
+        let listings = match self.secret_store.list_secrets(ns).await {
+            Ok(listings) => listings,
+            Err(_) => {
+                return secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to read the secret catalog. Next steps: verify catalog storage health and retry."
+                        .to_string(),
+                )
+            }
+        };
+        let rows: Vec<Vec<Option<String>>> = listings
+            .into_iter()
+            .map(|s| {
+                vec![
+                    Some(s.name),
+                    Some(s.secret_type.to_string()),
+                    Some(s.created_at.to_string()),
+                    Some(s.updated_at.to_string()),
+                ]
+            })
+            .collect();
+
+        catalog_resp_to_response(CatalogResponse::Rows {
+            columns: vec![
+                "name".to_string(),
+                "type".to_string(),
+                "created_at".to_string(),
+                "updated_at".to_string(),
+            ],
+            rows,
+        })
     }
 
     fn handle_alter_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
@@ -6458,9 +7661,6 @@ impl GatewayHandler {
         match parsed.action {
             AlterSourceAction::Pause => {
                 self.catalog.update_source_status(&parsed.name, "PAUSED");
-                if let Some(source) = self.webhook_sources.get(&parsed.name) {
-                    source.lock().set_paused(true);
-                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -6474,8 +7674,23 @@ impl GatewayHandler {
             }
             AlterSourceAction::Resume => {
                 self.catalog.update_source_status(&parsed.name, "OK");
-                if let Some(source) = self.webhook_sources.get(&parsed.name) {
-                    source.lock().set_paused(false);
+                if let (Some(source), Some(shard_db)) = (
+                    self.catalog.get_source(&parsed.name),
+                    self.shard_db.as_ref(),
+                ) {
+                    if source.source_type == "postgres_cdc" && source.format == "pgoutput" {
+                        if let Some(view) = self.catalog.list_views().into_iter().find(|view| {
+                            self.catalog
+                                .get_view_deps(&view.name)
+                                .contains(&source.name)
+                        }) {
+                            self.spawn_postgres_cdc_source_worker(
+                                source,
+                                view.name,
+                                Arc::clone(shard_db),
+                            );
+                        }
+                    }
                 }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -6489,8 +7704,57 @@ impl GatewayHandler {
                 )])
             }
             AlterSourceAction::Drop => {
+                let source = self.catalog.get_source(&parsed.name);
+                if source.as_ref().is_some_and(|source| {
+                    source.source_type == "postgres_cdc"
+                        && self.catalog.list_views().into_iter().any(|view| {
+                            self.catalog
+                                .get_view_deps(&view.name)
+                                .contains(&parsed.name)
+                        })
+                }) {
+                    return Ok(vec![create_source_error_response(format!(
+                        "[RS-4013] pgoutput source '{}' still has dependent views; drop them before DROP SOURCE",
+                        parsed.name
+                    ))]);
+                }
+                let pgoutput_id = source.as_ref().and_then(|source| {
+                    (source.source_type == "postgres_cdc" && source.format == "pgoutput")
+                        .then(|| pgoutput_source_identity(source).ok())
+                        .flatten()
+                        .map(|identity| identity.connector_id())
+                });
+                if let Some(source_entry) = source.as_ref() {
+                    let secret_name_opt = source_entry.options.get("secret");
+                    if let Some(secret_name) = secret_name_opt {
+                        self.secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name);
+                    }
+                }
                 self.catalog.remove_source(&parsed.name);
-                self.webhook_sources.remove(&parsed.name);
+                if let (Some(connector_id), Some(shard_db), Ok(runtime)) = (
+                    pgoutput_id.filter(|connector_id| {
+                        self.pgoutput_registered_aliases(*connector_id).is_empty()
+                    }),
+                    self.shard_db.as_ref(),
+                    tokio::runtime::Handle::try_current(),
+                ) {
+                    if let Some(coordinator) = self
+                        .pgoutput_coordinators
+                        .get(&connector_id)
+                        .map(|entry| entry.value().clone())
+                    {
+                        let shard_db = Arc::clone(shard_db);
+                        let registry = Arc::clone(&self.pgoutput_coordinators);
+                        runtime.spawn(async move {
+                            let mut coordinator = coordinator.lock().await;
+                            if coordinator.drop_durable_state(&shard_db).await.is_ok() {
+                                drop(coordinator);
+                                registry.remove(&connector_id);
+                            }
+                        });
+                    }
+                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -6502,30 +7766,7 @@ impl GatewayHandler {
                     Tag::new("DROP SOURCE").with_rows(0),
                 )])
             }
-            AlterSourceAction::AdvanceWatermark(watermark) => {
-                let Some(source) = self.webhook_sources.get(&parsed.name) else {
-                    return Ok(vec![create_source_error_response(format!(
-                        "[RS-4016] ALTER SOURCE ADVANCE WATERMARK is supported only for http_webhook sources. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
-                    ))]);
-                };
-                let res = source.lock().advance_watermark(watermark);
-                if let Err(message) = res {
-                    return Ok(vec![create_source_error_response(message.to_string())]);
-                }
-
-                self.catalog
-                    .update_source_runtime(&parsed.name, watermark.to_string(), 0);
-                if let Some(log) = &self.audit_log {
-                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
-                        "system",
-                        "alter_source.advance_watermark",
-                        &parsed.name,
-                    ));
-                }
-                Ok(vec![Response::Execution(
-                    Tag::new("ALTER SOURCE").with_rows(0),
-                )])
-            }
+            AlterSourceAction::AdvanceWatermark(_) => Ok(vec![connector_removed_error_response()]),
             AlterSourceAction::ReplayDlq { since, until } => {
                 let mut count = 0u64;
                 {
@@ -6596,6 +7837,14 @@ impl GatewayHandler {
                 )])
             }
             AlterSourceAction::SetOptions(_options) => {
+                if self.catalog.get_source(&parsed.name).is_some_and(|source| {
+                    source.source_type == "postgres_cdc" && source.status == "OK"
+                }) {
+                    return Ok(vec![create_source_error_response(
+                        "[RS-4013] pgoutput identity options are immutable while running; pause, drain, and explicitly rebind the source"
+                            .to_string(),
+                    )]);
+                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -7185,6 +8434,7 @@ impl GatewayHandler {
         let ops = entry.drain();
         let affected = ops.len();
         drop(entry); // release DashMap entry guard before await
+        let _commit_guard = self.shard_commit_lock.lock().await;
 
         // Allocate next epoch
         let epoch = shard_db.try_next_epoch().ok_or_else(|| {
@@ -8490,6 +9740,9 @@ impl GatewayHandler {
         query: &str,
         conn_id: &str,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+            return Ok(response);
+        }
         self.handle_copy_from_stdin(query, conn_id)
     }
 
@@ -8505,6 +9758,7 @@ impl GatewayHandler {
         let Some(shard_db) = &self.shard_db else {
             return Ok(rows.len()); // no storage — pretend success
         };
+        let _commit_guard = self.shard_commit_lock.lock().await;
 
         let epoch = shard_db.try_next_epoch().ok_or_else(|| {
             PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
@@ -9616,6 +10870,12 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)) {
+                return Ok(response
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Response::Execution(Tag::new("OK"))));
+            }
             let responses = self.handle_copy_from_stdin(query, &conn_id)?;
             return Ok(responses
                 .into_iter()
@@ -10026,6 +11286,14 @@ impl GatewayServer {
         self
     }
 
+    /// Attach a custom `SecretStore` to the server.
+    pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
+        if let Some(h) = Arc::get_mut(&mut self.handler) {
+            h.secret_store = secret_store;
+        }
+        self
+    }
+
     /// Create a new gateway server listening on `addr`.
     pub fn new(addr: std::net::SocketAddr, view_reader: Arc<dyn ViewReader>) -> Self {
         let catalog = Arc::new(CatalogStubs::new());
@@ -10220,22 +11488,15 @@ impl GatewayServer {
         Ok((pgwire_addr, webhook_addr, pgwire_handle, webhook_handle))
     }
 
-    /// Test and embedding hook for routing one already-authenticated webhook
-    /// request through the same source lifecycle as the TCP HTTP listener.
-    pub async fn accept_webhook(
-        &self,
-        source_name: &str,
-        token: &[u8],
-        delivery_id: Option<&str>,
-        payload: &[u8],
-    ) -> WebhookResult {
-        self.handler
-            .accept_webhook(source_name, token, delivery_id, payload)
-            .await
-    }
-
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        if let Some(shard_db) = &self.handler.shard_db {
+            self.handler
+                .catalog
+                .load_v0522_removed_connectors(shard_db)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
         self.handler.bind_server(&self.handler);
         self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
@@ -10474,6 +11735,13 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        if let Some(shard_db) = &self.handler.shard_db {
+            self.handler
+                .catalog
+                .load_v0522_removed_connectors(shard_db)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
         self.handler.bind_server(&self.handler);
         self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
@@ -11507,7 +12775,7 @@ fn full_row_pk(column_count: usize) -> Vec<usize> {
 /// logic.)
 fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{
-        ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+        ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
     };
     use datafusion::arrow::datatypes::DataType;
 
@@ -11528,52 +12796,70 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
         }
     }
 
-    let arrays: Vec<ArrayRef> = schema
+    let arrays: Result<Vec<ArrayRef>, String> = schema
         .fields()
         .iter()
         .enumerate()
-        .map(|(i, field)| match field.data_type() {
-            DataType::Int32 => {
-                let vals: Vec<Option<i32>> = col_strs[i]
-                    .iter()
-                    .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
-                    .collect();
-                Arc::new(Int32Array::from(vals)) as ArrayRef
-            }
-            DataType::Int64 => {
-                let vals: Vec<Option<i64>> = col_strs[i]
-                    .iter()
-                    .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
-                    .collect();
-                Arc::new(Int64Array::from(vals)) as ArrayRef
-            }
-            DataType::Float64 => {
-                let vals: Vec<Option<f64>> = col_strs[i]
-                    .iter()
-                    .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
-                    .collect();
-                Arc::new(Float64Array::from(vals)) as ArrayRef
-            }
-            DataType::Boolean => {
-                let vals: Vec<Option<bool>> = col_strs[i]
-                    .iter()
-                    .map(|s| {
-                        s.as_deref()
-                            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "t" | "1"))
-                    })
-                    .collect();
-                Arc::new(BooleanArray::from(vals)) as ArrayRef
-            }
-            _ => {
-                let vals: Vec<Option<String>> = col_strs[i]
-                    .iter()
-                    .map(|s| s.as_ref().map(|v| v.to_string()))
-                    .collect();
-                Arc::new(StringArray::from(vals)) as ArrayRef
-            }
+        .map(|(i, field)| {
+            Ok(match field.data_type() {
+                DataType::Int32 => {
+                    let vals: Vec<Option<i32>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Int32Array::from(vals)) as ArrayRef
+                }
+                DataType::Int64 => {
+                    let vals: Vec<Option<i64>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Int64Array::from(vals)) as ArrayRef
+                }
+                DataType::Float64 => {
+                    let vals: Vec<Option<f64>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Float64Array::from(vals)) as ArrayRef
+                }
+                DataType::Decimal128(precision, scale) => {
+                    let vals: Vec<Option<i128>> = col_strs[i]
+                        .iter()
+                        .map(|s| {
+                            let mut value = s.as_deref()?.parse::<rust_decimal::Decimal>().ok()?;
+                            value.rescale((*scale).try_into().ok()?);
+                            Some(value.mantissa())
+                        })
+                        .collect();
+                    Arc::new(
+                        Decimal128Array::from(vals)
+                            .with_precision_and_scale(*precision, *scale)
+                            .map_err(|error| error.to_string())?,
+                    ) as ArrayRef
+                }
+                DataType::Boolean => {
+                    let vals: Vec<Option<bool>> = col_strs[i]
+                        .iter()
+                        .map(|s| {
+                            s.as_deref()
+                                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "t" | "1"))
+                        })
+                        .collect();
+                    Arc::new(BooleanArray::from(vals)) as ArrayRef
+                }
+                _ => {
+                    let vals: Vec<Option<String>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_ref().map(|v| v.to_string()))
+                        .collect();
+                    Arc::new(StringArray::from(vals)) as ArrayRef
+                }
+            })
         })
         .collect();
 
+    let arrays = arrays?;
     RecordBatch::try_new(schema, arrays).map_err(|e| e.to_string())
 }
 
@@ -11673,6 +12959,165 @@ fn source_view_connector_id(source_name: &str, view_name: &str) -> ConnectorId {
     ConnectorId(hash)
 }
 
+fn source_checkpoint_connector_id(source: &CatalogSourceEntry, view_name: &str) -> ConnectorId {
+    if source.source_type == "postgres_cdc" && source.format == "pgoutput" {
+        if let Ok(identity) = pgoutput_source_identity(source) {
+            return identity.connector_id();
+        }
+    }
+    source_view_connector_id(&source.name, view_name)
+}
+
+fn pgoutput_source_identity(source: &CatalogSourceEntry) -> Result<SourceIdentityV1, GatewayError> {
+    let port = source.options.get("port").map_or(Ok(None), |port| {
+        port.parse::<u16>()
+            .map(Some)
+            .map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "PostgreSQL CDC source '{}' has invalid port '{port}'",
+                    source.name
+                ),
+            })
+    })?;
+    let required =
+        |name: &str| {
+            source.options.get(name).cloned().ok_or_else(|| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("PostgreSQL CDC source '{}' requires {name}", source.name),
+                }
+            })
+        };
+    SourceIdentityV1::new(
+        source
+            .options
+            .get("host")
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port,
+        source
+            .options
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string()),
+        required("slot")?,
+        required("publication")?,
+        source
+            .options
+            .get("user")
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string()),
+        required("credential_ref")?,
+    )
+}
+
+fn catalog_type_accepts_pg_oid(data_type: &str, oid: u32) -> bool {
+    match data_type.to_ascii_lowercase().as_str() {
+        "int32" | "int" | "integer" => oid == 23,
+        "int64" | "bigint" => oid == 20 || oid == 23,
+        "utf8" | "text" | "varchar" => matches!(oid, 25 | 1043),
+        data_type if data_type.starts_with("decimal") || data_type.starts_with("numeric") => {
+            oid == 1700
+        }
+        _ => false,
+    }
+}
+
+fn pg_oid_catalog_type(oid: u32) -> &'static str {
+    match oid {
+        20 => "Int64",
+        23 => "Int32",
+        25 | 1043 => "Utf8",
+        1700 => "Decimal128(38, 10)",
+        _ => "Utf8",
+    }
+}
+
+fn relation_route_schema(route: &RelationRoute) -> SchemaRef {
+    Arc::new(Schema::new(
+        route
+            .columns
+            .iter()
+            .map(|column| {
+                Field::new(
+                    &column.imported_name,
+                    string_to_arrow_datatype(pg_oid_catalog_type(column.type_oid)),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn pgoutput_change_to_dml(
+    route: &RelationRoute,
+    change: &EncodedChange,
+) -> Result<DmlOp, GatewayError> {
+    let names = route
+        .columns
+        .iter()
+        .map(|column| column.imported_name.clone())
+        .collect::<Vec<_>>();
+    let row = |values: &Option<Vec<Option<String>>>, kind: &str| {
+        let values = values
+            .as_ref()
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("pgoutput {kind} is missing its row image"),
+            })?;
+        if values.len() != names.len() {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "RS-1002: pgoutput {kind} tuple has {} columns, route has {}",
+                    values.len(),
+                    names.len()
+                ),
+            });
+        }
+        let values = values
+            .iter()
+            .map(|value| value.clone().unwrap_or_else(|| r"\N".to_string()))
+            .collect::<Vec<_>>();
+        Ok((values.join("\t"), build_row_key(&names, &values)))
+    };
+    match change.operation {
+        CdcOperation::Insert => {
+            let (values_tsv, row_key) = row(&change.new_values, "INSERT")?;
+            Ok(DmlOp::Insert {
+                table: route.imported_table_name.clone(),
+                cols: names,
+                values_tsv,
+                row_key,
+            })
+        }
+        CdcOperation::Update => {
+            let (old_tsv, old_row_key) = row(&change.old_values, "UPDATE old")?;
+            let (new_tsv, new_row_key) = row(&change.new_values, "UPDATE new")?;
+            Ok(DmlOp::Update {
+                table: route.imported_table_name.clone(),
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            })
+        }
+        CdcOperation::Delete => {
+            let (returning_tsv, row_key) = row(&change.old_values, "DELETE")?;
+            Ok(DmlOp::Delete {
+                table: route.imported_table_name.clone(),
+                row_key,
+                returning_tsv: Some(returning_tsv),
+            })
+        }
+    }
+}
+
+fn dml_table_name(op: &DmlOp) -> &str {
+    match op {
+        DmlOp::Insert { table, .. } | DmlOp::Update { table, .. } | DmlOp::Delete { table, .. } => {
+            table
+        }
+    }
+}
+
 fn source_backfill_error(error: rockstream_connectors::SourceError) -> GatewayError {
     GatewayError::QueryTimeExecutionFailed {
         detail: format!("source-backed backfill: {error}"),
@@ -11693,7 +13138,7 @@ fn source_batch_to_dml_ops(
         .unwrap_or_else(|| (batch.clone(), vec![1; batch.num_rows()]));
     if data.num_columns() != columns.len() {
         return Err(format!(
-            "source batch has {} column(s), but table '{table}' has {}",
+            "[RS-4008] source batch has {} column(s), but table '{table}' has {}",
             data.num_columns(),
             columns.len()
         ));
@@ -12528,6 +13973,7 @@ struct ParsedCreateSink {
     format_version: Option<u64>,
     partition_by: Vec<String>,
     catalog: String,
+    secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12547,6 +13993,25 @@ fn create_sink_error_response(message: String) -> Response<'static> {
         "42601".to_owned(),
         message,
     )))
+}
+
+fn connector_removed_error_response() -> Response<'static> {
+    create_sink_error_response(
+        "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.".to_string(),
+    )
+}
+
+fn is_removed_connector_ddl(query: &str) -> bool {
+    let removed_sink = query.starts_with("create sink ")
+        && query.contains(" for view ")
+        && (query.contains(" to iceberg")
+            || query.contains(" to delta")
+            || query.contains(" to parquet")
+            || query.contains(" to s3")
+            || query.contains(" to object_store"));
+    removed_sink
+        || (query.starts_with("create source ")
+            && (query.contains(" type s3") || query.contains(" type http_webhook")))
 }
 
 fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
@@ -12641,6 +14106,15 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         }
         None => "filesystem".to_string(),
     };
+    let secret = match option_map.get("secret") {
+        Some(CreateSinkOptionValue::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(format!(
+                "[RS-4007] CREATE SINK option secret must be a string. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ))
+        }
+        None => None,
+    };
 
     Ok(ParsedCreateSink {
         name,
@@ -12653,6 +14127,7 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         format_version,
         partition_by,
         catalog,
+        secret,
     })
 }
 
@@ -12779,6 +14254,240 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
     Err(format!(
         "[RS-4007] unterminated string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
     ))
+}
+
+const CREATE_SECRET_NEXT_STEPS: &str =
+    "syntax: CREATE SECRET <name> (TYPE = '<type>', [KEY = 'VAL', ...]); options must include TYPE";
+const ALTER_SECRET_NEXT_STEPS: &str = "syntax: ALTER SECRET <name> SET (KEY = 'VAL', ...)";
+const DROP_SECRET_NEXT_STEPS: &str = "syntax: DROP SECRET [IF EXISTS] <name>";
+
+fn secret_error_response(message: String) -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "42601".to_owned(),
+        message,
+    )))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCreateSecret {
+    name: String,
+    secret_type: rockstream_types::secret::SecretType,
+    payload: std::collections::HashMap<String, String>,
+}
+
+fn parse_key_value_options(
+    options_str: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut map = std::collections::HashMap::new();
+    let pairs = split_top_level_comma_list(options_str).map_err(|_| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: malformed secret option list. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            return Err(format!(
+                "[RS-2424] secret.ddl_invalid: secret options cannot be empty. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+            ));
+        }
+        let eq = find_top_level_equals(pair).ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: each secret option must use KEY = 'VALUE' syntax. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        let key = pair[..eq].trim().trim_matches('"').to_lowercase();
+        let raw_value = pair[eq + 1..].trim();
+        if key.is_empty() || raw_value.is_empty() {
+            return Err(format!(
+                "[RS-2424] secret.ddl_invalid: secret option keys and values cannot be empty. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+            ));
+        }
+        let value = if raw_value.starts_with('\'') {
+            let (value, consumed) = parse_sql_single_quoted_string(raw_value).map_err(|_| {
+                format!(
+                    "[RS-2424] secret.ddl_invalid: malformed secret string literal. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+                )
+            })?;
+            if !raw_value[consumed..].trim().is_empty() {
+                return Err(format!(
+                    "[RS-2424] secret.ddl_invalid: malformed secret string literal. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+                ));
+            }
+            value
+        } else {
+            raw_value.trim_matches('"').to_string()
+        };
+        map.insert(key, value);
+    }
+    Ok(map)
+}
+
+fn parse_create_secret_ddl(q: &str) -> Result<ParsedCreateSecret, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("create secret ") {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET statement must start with CREATE SECRET. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let after_create = trimmed["CREATE SECRET".len()..].trim();
+    let paren_pos = after_create.find('(').ok_or_else(|| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET requires option list in parentheses. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+
+    let name = after_create[..paren_pos]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET requires a secret name. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let close_paren = after_create.rfind(')').ok_or_else(|| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: unterminated parentheses in CREATE SECRET. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+
+    let options_str = &after_create[paren_pos + 1..close_paren];
+    let mut options = parse_key_value_options(options_str)?;
+
+    let type_str = options.remove("type").ok_or_else(|| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET requires TYPE option. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+
+    if type_str.trim().is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: TYPE option cannot be empty. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let secret_type = rockstream_types::secret::SecretType::from(type_str.as_str());
+
+    Ok(ParsedCreateSecret {
+        name,
+        secret_type,
+        payload: options,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAlterSecret {
+    name: String,
+    payload: std::collections::HashMap<String, String>,
+}
+
+fn parse_alter_secret_ddl(q: &str) -> Result<ParsedAlterSecret, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("alter secret ") {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET statement must start with ALTER SECRET. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let after_alter = trimmed["ALTER SECRET".len()..].trim();
+    let lower_after = after_alter.to_lowercase();
+
+    let (name, options_str) = if let Some(set_pos) = lower_after.find(" set ") {
+        let name = after_alter[..set_pos]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        let after_set = after_alter[set_pos + " set ".len()..].trim();
+        let open_paren = after_set.find('(').ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: ALTER SECRET SET requires option list in parentheses. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        let close_paren = after_set.rfind(')').ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: unterminated parentheses in ALTER SECRET. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        (name, &after_set[open_paren + 1..close_paren])
+    } else if let Some(paren_pos) = after_alter.find('(') {
+        let name = after_alter[..paren_pos]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        let close_paren = after_alter.rfind(')').ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: unterminated parentheses in ALTER SECRET. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        (name, &after_alter[paren_pos + 1..close_paren])
+    } else {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET requires SET clause with options. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    };
+
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET requires a secret name. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let options = parse_key_value_options(options_str)?;
+    if options.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET SET cannot have empty options. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    Ok(ParsedAlterSecret {
+        name,
+        payload: options,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ParsedDropSecret {
+    name: String,
+    if_exists: bool,
+}
+
+fn parse_drop_secret_ddl(q: &str) -> Result<ParsedDropSecret, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("drop secret ") {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: DROP SECRET statement must start with DROP SECRET. Next steps: {DROP_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let after_drop = trimmed["DROP SECRET".len()..].trim();
+    let (if_exists, name_part) = if after_drop.to_lowercase().starts_with("if exists ") {
+        (true, after_drop["IF EXISTS ".len()..].trim())
+    } else {
+        (false, after_drop)
+    };
+
+    let name = name_part
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: DROP SECRET requires a secret name. Next steps: {DROP_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    Ok(ParsedDropSecret { name, if_exists })
 }
 
 const CREATE_SOURCE_NEXT_STEPS: &str =
@@ -12914,16 +14623,18 @@ fn validate_typed_source_options(
     if source_type != "postgres_cdc" && source_type != "http_webhook" {
         return Ok(());
     }
-    for key in ["password", "token", "secret", "api_key", "authorization"] {
+    for key in ["password", "token", "api_key", "authorization"] {
         if options.contains_key(key) {
             return Err(format!(
-                "[RS-4008] CREATE SOURCE option '{key}' contains an inline credential; use credential_ref instead. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                "[RS-4008] CREATE SOURCE option '{key}' contains an inline credential; use secret or credential_ref instead. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
             ));
         }
     }
-    if options.get("credential_ref").is_none_or(String::is_empty) {
+    let has_cred_ref = options.get("credential_ref").is_some_and(|s| !s.is_empty())
+        || options.get("secret").is_some_and(|s| !s.is_empty());
+    if !has_cred_ref {
         return Err(format!(
-            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty secret or credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
         ));
     }
     if source_type == "postgres_cdc" {
@@ -12962,123 +14673,13 @@ struct ParsedAlterSource {
 
 async fn serve_webhook_connection(
     mut socket: tokio::net::TcpStream,
-    handler: Arc<GatewayHandler>,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncReadExt;
-
-    const MAX_HEADER_BYTES: usize = 16 * 1024;
-    let mut request = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        let read = socket.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
-        }
-        request.extend_from_slice(&chunk[..read]);
-        if request.len() > MAX_HEADER_BYTES + HTTP_WEBHOOK_MAX_REQUEST_BYTES {
-            return write_webhook_response(&mut socket, WebhookResult::PayloadTooLarge).await;
-        }
-        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-            break end + 4;
-        }
-        if request.len() > MAX_HEADER_BYTES {
-            return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
-        }
-    };
-
-    let headers = match std::str::from_utf8(&request[..header_end]) {
-        Ok(headers) => headers,
-        Err(_) => return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await,
-    };
-    let mut lines = headers.split("\r\n");
-    let Some(request_line) = lines.next() else {
-        return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
-    };
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next();
-    let path = request_parts.next();
-    if method != Some("POST") || request_parts.next().is_none() {
-        return write_webhook_response(&mut socket, WebhookResult::NotFound).await;
-    }
-    let Some(source_name) = path.and_then(|path| path.strip_prefix("/webhook/")) else {
-        return write_webhook_response(&mut socket, WebhookResult::NotFound).await;
-    };
-    if source_name.is_empty() || source_name.contains('/') {
-        return write_webhook_response(&mut socket, WebhookResult::NotFound).await;
-    }
-    let source_name = source_name.to_ascii_lowercase();
-
-    let mut token = None;
-    let mut delivery_id = None;
-    let mut content_length = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("authorization") {
-            token = value
-                .strip_prefix("Bearer ")
-                .map(|value| value.as_bytes().to_vec());
-        } else if name.eq_ignore_ascii_case("idempotency-key")
-            || name.eq_ignore_ascii_case("x-delivery-id")
-        {
-            delivery_id = Some(value.to_string());
-        } else if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.parse::<usize>().ok();
-        }
-    }
-    let Some(content_length) = content_length else {
-        return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
-    };
-    if content_length > HTTP_WEBHOOK_MAX_REQUEST_BYTES {
-        return write_webhook_response(&mut socket, WebhookResult::PayloadTooLarge).await;
-    }
-    let body_start = header_end;
-    let already_read = request.len().saturating_sub(body_start);
-    if already_read > content_length {
-        return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
-    }
-    request.resize(body_start + content_length, 0);
-    if already_read < content_length {
-        socket
-            .read_exact(&mut request[body_start + already_read..])
-            .await?;
-    }
-    let result = handler
-        .accept_webhook(
-            &source_name,
-            token.as_deref().unwrap_or_default(),
-            delivery_id.as_deref(),
-            &request[body_start..],
-        )
-        .await;
-    write_webhook_response(&mut socket, result).await
-}
-
-async fn write_webhook_response(
-    socket: &mut tokio::net::TcpStream,
-    result: WebhookResult,
+    _: Arc<GatewayHandler>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-
-    let body = match result.error_code() {
-        Some(code) => format!("{code}: webhook request rejected. Next steps: verify source, bearer token, payload, and source capacity\n"),
-        None => "accepted\n".to_string(),
-    };
-    let reason = match result.status_code() {
-        202 => "Accepted",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        _ => "Internal Server Error",
-    };
+    const BODY: &str = "[RS-4017] connector.removed: HTTP/webhook sources have been removed. Next steps: use an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter outside RockStream.\n";
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        result.status_code(), reason, body.len(), body
+        "HTTP/1.1 410 Gone\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+        BODY.len(),
     );
     socket.write_all(response.as_bytes()).await
 }
@@ -13256,6 +14857,7 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
     let mut in_string = false;
     let mut chars = input.chars().peekable();
 
@@ -13289,7 +14891,20 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
                 bracket_depth -= 1;
                 current.push(ch);
             }
-            ',' if !in_string && bracket_depth == 0 => {
+            '(' if !in_string => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_string => {
+                if paren_depth == 0 {
+                    return Err(format!(
+                        "[RS-4007] unbalanced ) in WITH clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
+                    ));
+                }
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_string && bracket_depth == 0 && paren_depth == 0 => {
                 parts.push(current.trim().to_string());
                 current.clear();
             }
@@ -13305,6 +14920,11 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
     if bracket_depth != 0 {
         return Err(format!(
             "[RS-4007] unbalanced ARRAY[...] in WITH clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
+    }
+    if paren_depth != 0 {
+        return Err(format!(
+            "[RS-4007] unbalanced () in WITH clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
         ));
     }
     if !current.trim().is_empty() {
@@ -13740,7 +15360,8 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
     let cols_str = &after_table_name[start..end];
     let mut columns = Vec::new();
     let mut generated_columns = HashMap::new();
-    for part in cols_str.split(',') {
+    for part in split_top_level_comma_list(cols_str).unwrap_or_else(|_| vec![cols_str.to_string()])
+    {
         let part = part.trim();
         if let Some((column, generated_kind)) = (|| {
             let part = part.trim();
@@ -13758,7 +15379,14 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             } else {
                 pg_type
             };
-            let arrow_type = pg_type_to_arrow(&full_type);
+            let arrow_type = full_type
+                .strip_prefix("NUMERIC")
+                .or_else(|| full_type.strip_prefix("DECIMAL"))
+                .filter(|suffix| suffix.starts_with('(') && suffix.ends_with(')'))
+                .map(|suffix| format!("Decimal{suffix}"))
+                .unwrap_or_else(|| {
+                    pg_type_to_arrow(full_type.split('(').next().unwrap_or(&full_type)).to_string()
+                });
             let generated_kind = if part.to_lowercase().contains("default gen_random_uuid()") {
                 Some(GeneratedColumnKind::RandomUuid)
             } else if part.to_lowercase().contains("generated always as identity") {
@@ -13769,7 +15397,7 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             Some((
                 CatalogColumn {
                     name: col_name,
-                    data_type: arrow_type.to_string(),
+                    data_type: arrow_type,
                 },
                 generated_kind,
             ))
@@ -14268,57 +15896,6 @@ mod s4_tests {
         let catalog = Arc::new(CatalogStubs::new());
         let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
         Arc::new(GatewayHandler::new(catalog, reader))
-    }
-
-    #[tokio::test]
-    async fn webhook_panic_does_not_block_peer_delivery_or_source_lifecycle() {
-        let handler = make_handler();
-        handler
-            .handle_create_source(
-                "CREATE SOURCE orders TYPE http_webhook (credential_ref='secret') FORMAT json",
-            )
-            .unwrap();
-        let source = handler
-            .webhook_sources
-            .get("orders")
-            .expect("CREATE SOURCE installs the webhook state")
-            .value()
-            .clone();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut source = source.lock();
-            source.set_paused(false);
-            panic!("injected webhook registry holder panic");
-        }));
-        assert!(panic.is_err());
-
-        assert_eq!(
-            handler
-                .accept_webhook("orders", b"secret", Some("delivery-1"), br#"{}"#)
-                .await,
-            WebhookResult::Accepted
-        );
-        assert!(handler
-            .handle_alter_source("ALTER SOURCE orders PAUSE")
-            .is_ok());
-        assert_eq!(
-            handler
-                .accept_webhook("orders", b"secret", Some("delivery-2"), br#"{}"#)
-                .await,
-            WebhookResult::Paused
-        );
-        assert!(handler
-            .handle_alter_source("ALTER SOURCE orders RESUME")
-            .is_ok());
-        assert!(handler
-            .handle_alter_source("ALTER SOURCE orders ADVANCE WATERMARK 7")
-            .is_ok());
-        assert!(handler.handle_alter_source("DROP SOURCE orders").is_ok());
-        assert_eq!(
-            handler
-                .accept_webhook("orders", b"secret", Some("delivery-3"), br#"{}"#)
-                .await,
-            WebhookResult::NotFound
-        );
     }
 
     #[test]
@@ -14856,27 +16433,10 @@ mod parse_delete_returning_tests {
 }
 
 #[cfg(test)]
+// These source-batch fixtures use unwrap for concise assertions.
 #[allow(clippy::unwrap_used)]
 mod source_batch_tests {
     use super::*;
-
-    struct NoopViewReader;
-
-    #[async_trait]
-    impl ViewReader for NoopViewReader {
-        async fn read_view(
-            &self,
-            _view_name: &str,
-            _limit: Option<usize>,
-            _strategy: ViewReadStrategy,
-        ) -> Result<Vec<Vec<u8>>, GatewayError> {
-            Ok(Vec::new())
-        }
-
-        fn published_frontier(&self) -> Option<u64> {
-            None
-        }
-    }
 
     #[test]
     fn source_batch_preserves_exact_insert_and_delete_preimages() {
@@ -14945,419 +16505,44 @@ mod source_batch_tests {
         }
     }
 
-    #[tokio::test]
-    async fn source_snapshot_publishes_output_cursor_and_frontier_in_m3() {
-        let shard_db = Arc::new(
-            rockstream_storage::ShardDb::builder(
-                "source-snapshot-m3",
-                Arc::new(object_store::memory::InMemory::new()),
-            )
-            .build()
-            .await
-            .unwrap(),
-        );
-        let catalog = Arc::new(CatalogStubs::new());
-        assert!(catalog.add_table(CatalogTable {
-            name: "orders".to_string(),
-            columns: vec![
-                CatalogColumn {
-                    name: "id".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-                CatalogColumn {
-                    name: "amount".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-            ],
-        }));
-        let handler = GatewayHandler::with_shard_db(
-            Arc::clone(&catalog),
-            Arc::new(NoopViewReader),
-            Arc::clone(&shard_db),
-        );
-        handler
-            .handle_create_view(
-                "CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders",
-            )
-            .await
-            .unwrap();
-        assert!(catalog.add_source(CatalogSourceEntry {
-            name: "orders".to_string(),
-            table_name: Some("orders".to_string()),
-            source_type: "s3".to_string(),
-            options: HashMap::new(),
-            format: "json".to_string(),
-            status: "OK".to_string(),
-            live_offset: "0".to_string(),
-            live_lag: 0,
-        }));
-        catalog.begin_backfill("order_rows", 2);
+    #[test]
+    fn source_decimal_tsv_round_trip_is_exact() {
+        use datafusion::arrow::array::Decimal128Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::util::display::array_value_to_string;
 
-        let connector_id = ConnectorId(99);
-        let mut source = S3Source::new(
-            connector_id,
-            catalog_columns_to_schema(&catalog.get_table("orders").unwrap().columns),
-        );
-        source.add_file("snapshot.json".to_string(), vec![vec![1, 10], vec![2, 20]]);
-        handler
-            .backfill_bound_source(
-                "orders",
-                "order_rows",
-                SourceRuntimeCoordinator::new(
-                    source,
-                    connector_id,
-                    OffsetToken::new(Vec::new()),
-                    SourceCheckpointStore::new(Arc::clone(&shard_db), 99, connector_id),
-                ),
-                true,
-                &shard_db,
-            )
-            .await
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(12, 2),
+            true,
+        )]));
+        let values = Decimal128Array::from(vec![1025_i128, 550_i128])
+            .with_precision_and_scale(12, 2)
             .unwrap();
-
-        let view = catalog.get_view("order_rows").unwrap();
-        assert_eq!(
-            handler
-                .read_compiled_view_rows("order_rows", &view, &shard_db)
-                .await
-                .unwrap(),
-            vec![b"1\t10".to_vec(), b"2\t20".to_vec()]
-        );
-        let lifecycle = SourceCheckpointStore::new(Arc::clone(&shard_db), 99, connector_id)
-            .backfill_lifecycle("order_rows")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            lifecycle,
-            BackfillLifecycle::new(
-                BackfillPhase::Running,
-                BackfillCursor::new(
-                    "order_rows",
-                    0,
-                    serde_json::to_vec(&vec![("snapshot.json".to_string(), 2_usize)]).unwrap(),
-                    SnapshotDeltaFence::new(
-                        OffsetToken::new(
-                            serde_json::to_vec(&vec![("snapshot.json".to_string(), 2_usize)])
-                                .unwrap(),
-                        ),
-                        OffsetToken::new(
-                            serde_json::to_vec(&vec![("snapshot.json".to_string(), 2_usize)])
-                                .unwrap(),
-                        ),
-                    ),
-                    2,
-                ),
-                0,
-                2,
-                0,
-                Some(2),
-            )
-        );
-        assert_eq!(
-            shard_db
-                .get(&rockstream_storage::ShardKeyEncoder::frontier_key())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(&2_u64.to_be_bytes()[..])
-        );
-    }
-
-    #[tokio::test]
-    async fn source_backfill_uses_the_configured_snapshot_batch_bound() {
-        let shard_db = Arc::new(
-            rockstream_storage::ShardDb::builder(
-                "source-snapshot-bounded-m3",
-                Arc::new(object_store::memory::InMemory::new()),
-            )
-            .build()
-            .await
-            .unwrap(),
-        );
-        let catalog = Arc::new(CatalogStubs::new());
-        assert!(catalog.add_table(CatalogTable {
-            name: "orders".to_string(),
-            columns: vec![
-                CatalogColumn {
-                    name: "id".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-                CatalogColumn {
-                    name: "amount".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-            ],
-        }));
-        let handler = GatewayHandler::with_shard_db(
-            Arc::clone(&catalog),
-            Arc::new(NoopViewReader),
-            Arc::clone(&shard_db),
-        );
-        handler
-            .handle_create_view(
-                "CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders",
-            )
-            .await
-            .unwrap();
-        assert!(catalog.add_source(CatalogSourceEntry {
-            name: "orders".to_string(),
-            table_name: Some("orders".to_string()),
-            source_type: "s3".to_string(),
-            options: HashMap::new(),
-            format: "json".to_string(),
-            status: "OK".to_string(),
-            live_offset: "0".to_string(),
-            live_lag: 0,
-        }));
-        catalog.begin_backfill("order_rows", BACKFILL_BATCH_MAX_ROWS as u64 + 1);
-
-        let connector_id = ConnectorId(101);
-        let rows = (0..=BACKFILL_BATCH_MAX_ROWS as i64)
-            .map(|id| vec![id, id * 10])
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let ops = source_batch_to_dml_ops(
+            "orders",
+            &[CatalogColumn {
+                name: "amount".to_string(),
+                data_type: "Decimal(12,2)".to_string(),
+            }],
+            &batch,
+        )
+        .unwrap();
+        let rows = ops
+            .iter()
+            .map(|op| match op {
+                DmlOp::Insert { values_tsv, .. } => values_tsv.clone().into_bytes(),
+                _ => panic!("positive source weight must insert"),
+            })
             .collect::<Vec<_>>();
-        let mut source = S3Source::new(
-            connector_id,
-            catalog_columns_to_schema(&catalog.get_table("orders").unwrap().columns),
-        );
-        source.add_file("snapshot.json".to_string(), rows);
-        handler
-            .backfill_bound_source(
-                "orders",
-                "order_rows",
-                SourceRuntimeCoordinator::new(
-                    source,
-                    connector_id,
-                    OffsetToken::new(Vec::new()),
-                    SourceCheckpointStore::new(Arc::clone(&shard_db), 101, connector_id),
-                ),
-                true,
-                &shard_db,
-            )
-            .await
-            .unwrap();
-
-        let view = catalog.get_view("order_rows").unwrap();
-        let mut actual = handler
-            .read_compiled_view_rows("order_rows", &view, &shard_db)
-            .await
-            .unwrap();
-        let mut expected = (0..=BACKFILL_BATCH_MAX_ROWS as i64)
-            .map(|id| format!("{id}\t{}", id * 10).into_bytes())
-            .collect::<Vec<_>>();
-        actual.sort();
-        expected.sort();
-        assert_eq!(actual, expected);
-        let lifecycle = SourceCheckpointStore::new(Arc::clone(&shard_db), 101, connector_id)
-            .backfill_lifecycle("order_rows")
-            .await
-            .unwrap()
-            .unwrap();
+        let decoded = tsv_to_record_batch(schema, &rows).unwrap();
         assert_eq!(
             (
-                lifecycle.phase,
-                lifecycle.cursor.last_key,
-                lifecycle.cursor.committed_epoch,
-                lifecycle.published_frontier,
+                array_value_to_string(decoded.column(0).as_ref(), 0).unwrap(),
+                array_value_to_string(decoded.column(0).as_ref(), 1).unwrap()
             ),
-            (
-                BackfillPhase::Running,
-                serde_json::to_vec(&vec![(
-                    "snapshot.json".to_string(),
-                    BACKFILL_BATCH_MAX_ROWS + 1
-                )])
-                .unwrap(),
-                3,
-                Some(3),
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn source_snapshot_restart_resumes_at_committed_cursor_without_replay() {
-        let shard_db = Arc::new(
-            rockstream_storage::ShardDb::builder(
-                "source-snapshot-restart",
-                Arc::new(object_store::memory::InMemory::new()),
-            )
-            .build()
-            .await
-            .unwrap(),
-        );
-        let catalog = Arc::new(CatalogStubs::new());
-        assert!(catalog.add_table(CatalogTable {
-            name: "orders".to_string(),
-            columns: vec![
-                CatalogColumn {
-                    name: "id".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-                CatalogColumn {
-                    name: "amount".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-            ],
-        }));
-        let handler = GatewayHandler::with_shard_db(
-            Arc::clone(&catalog),
-            Arc::new(NoopViewReader),
-            Arc::clone(&shard_db),
-        );
-        handler
-            .handle_create_view(
-                "CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders",
-            )
-            .await
-            .unwrap();
-        assert!(catalog.add_source(CatalogSourceEntry {
-            name: "orders".to_string(),
-            table_name: Some("orders".to_string()),
-            source_type: "s3".to_string(),
-            options: HashMap::new(),
-            format: "json".to_string(),
-            status: "OK".to_string(),
-            live_offset: "0".to_string(),
-            live_lag: 0,
-        }));
-        catalog.begin_backfill("order_rows", BACKFILL_BATCH_MAX_ROWS as u64 + 1);
-
-        let connector_id = ConnectorId(100);
-        let schema = catalog_columns_to_schema(&catalog.get_table("orders").unwrap().columns);
-        let mut source = S3Source::new(connector_id, schema.clone());
-        source.add_file(
-            "snapshot.json".to_string(),
-            (0..=BACKFILL_BATCH_MAX_ROWS as i64)
-                .map(|id| vec![id, id * 10])
-                .collect(),
-        );
-        let checkpoint_store = SourceCheckpointStore::new(Arc::clone(&shard_db), 100, connector_id);
-        let mut runtime = SourceRuntimeCoordinator::new(
-            source,
-            connector_id,
-            OffsetToken::new(Vec::new()),
-            checkpoint_store,
-        );
-        runtime.recover().await.unwrap();
-        let lease = runtime.acquire_owner("gateway:order_rows").unwrap();
-        let fence = runtime.capture_snapshot_delta_fence().await.unwrap();
-        let chunk = runtime
-            .start_snapshot(&fence, None, BACKFILL_BATCH_MAX_ROWS)
-            .await
-            .unwrap()
-            .next()
-            .unwrap();
-        handler
-            .commit_bound_source_batch(
-                &mut runtime,
-                &lease,
-                "order_rows",
-                &catalog.get_table("orders").unwrap(),
-                &fence,
-                chunk.resume_offset,
-                &chunk.batch,
-                BackfillPhase::Snapshotting,
-                None,
-                1,
-                BACKFILL_BATCH_MAX_ROWS as u64 + 1,
-                &shard_db,
-            )
-            .await
-            .unwrap();
-        let CatalogResponse::Rows { columns, rows } =
-            catalog.backfill_status_response("order_rows")
-        else {
-            panic!("backfill status must be tabular");
-        };
-        assert_eq!(
-            (columns, rows),
-            (
-                vec![
-                    "view_name".to_string(),
-                    "phase".to_string(),
-                    "cursor_position".to_string(),
-                    "rows_remaining".to_string(),
-                    "estimated_rows".to_string(),
-                    "budget_state".to_string(),
-                    "blocked_reason".to_string(),
-                ],
-                vec![vec![
-                    Some("order_rows".to_string()),
-                    Some("SNAPSHOTTING".to_string()),
-                    Some("1".to_string()),
-                    Some("1".to_string()),
-                    Some((BACKFILL_BATCH_MAX_ROWS + 1).to_string()),
-                    Some("ADMITTED".to_string()),
-                    None,
-                ]],
-            )
-        );
-
-        let restarted = GatewayHandler::with_shard_db(
-            Arc::clone(&catalog),
-            Arc::new(NoopViewReader),
-            Arc::clone(&shard_db),
-        );
-        restarted.recover_compiled_views().await;
-        let mut resumed_source = S3Source::new(connector_id, schema);
-        resumed_source.add_file(
-            "snapshot.json".to_string(),
-            (0..=BACKFILL_BATCH_MAX_ROWS as i64)
-                .map(|id| vec![id, id * 10])
-                .collect(),
-        );
-        restarted
-            .backfill_bound_source(
-                "orders",
-                "order_rows",
-                SourceRuntimeCoordinator::new(
-                    resumed_source,
-                    connector_id,
-                    OffsetToken::new(Vec::new()),
-                    SourceCheckpointStore::new(Arc::clone(&shard_db), 100, connector_id),
-                ),
-                true,
-                &shard_db,
-            )
-            .await
-            .unwrap();
-
-        let view = catalog.get_view("order_rows").unwrap();
-        let mut actual = restarted
-            .read_compiled_view_rows("order_rows", &view, &shard_db)
-            .await
-            .unwrap();
-        let mut expected = (0..=BACKFILL_BATCH_MAX_ROWS as i64)
-            .map(|id| format!("{id}\t{}", id * 10).into_bytes())
-            .collect::<Vec<_>>();
-        actual.sort();
-        expected.sort();
-        assert_eq!(actual, expected);
-        let lifecycle = SourceCheckpointStore::new(Arc::clone(&shard_db), 100, connector_id)
-            .backfill_lifecycle("order_rows")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (
-                lifecycle.phase,
-                lifecycle.cursor.last_key,
-                lifecycle.cursor.committed_epoch,
-                lifecycle.rows_remaining,
-                lifecycle.estimated_rows,
-                lifecycle.published_frontier,
-            ),
-            (
-                BackfillPhase::Running,
-                serde_json::to_vec(&vec![(
-                    "snapshot.json".to_string(),
-                    BACKFILL_BATCH_MAX_ROWS + 1
-                )])
-                .unwrap(),
-                3,
-                0,
-                BACKFILL_BATCH_MAX_ROWS as u64 + 1,
-                Some(3),
-            )
+            ("10.25".to_string(), "5.50".to_string())
         );
     }
 }

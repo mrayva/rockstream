@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
@@ -121,6 +121,8 @@ impl From<AlignmentError> for CoordinatorError {
 struct InProgressRound {
     checkpoint_id: CheckpointId,
     started_at: Instant,
+    /// Per-shard barrier arrival timestamps.
+    barrier_arrivals: BTreeMap<ShardId, u64>,
     /// Per-shard confirmations received so far.
     confirmations: BTreeMap<ShardId, PerShardCheckpoint>,
     /// Shards still pending confirmation.
@@ -247,6 +249,12 @@ impl CheckpointCoordinator {
 
         let barrier = CheckpointBarrier::new(checkpoint_id);
 
+        let injected_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        rockstream_types::metrics::set_barrier_injected_at(checkpoint_id.0, injected_at_ms);
+
         // Inject barrier into all source operators before recording in-progress
         // (so any failure in injection doesn't leave a dangling round).
         for &shard_id in &shards {
@@ -256,6 +264,7 @@ impl CheckpointCoordinator {
         guard.in_progress = Some(InProgressRound {
             checkpoint_id,
             started_at: Instant::now(),
+            barrier_arrivals: BTreeMap::new(),
             confirmations: BTreeMap::new(),
             pending: shards,
             credits_held: acquired,
@@ -264,6 +273,41 @@ impl CheckpointCoordinator {
         tracing::info!(checkpoint_id = checkpoint_id.0, "audit: checkpoint.started");
 
         Ok(checkpoint_id)
+    }
+
+    /// Record when a shard receives a checkpoint barrier across exchange channels.
+    ///
+    /// Updates flight time tracking and records metrics into `rockstream-types::metrics`.
+    pub fn record_shard_barrier_received(
+        &self,
+        shard_id: ShardId,
+        checkpoint_id: CheckpointId,
+        arrival_time_ms: u64,
+    ) -> Result<(), CoordinatorError> {
+        let mut guard = self.inner.lock();
+        let round = guard
+            .in_progress
+            .as_mut()
+            .ok_or(CoordinatorError::UnknownShard(shard_id))?;
+
+        if checkpoint_id != round.checkpoint_id {
+            return Err(CoordinatorError::StaleConfirmation {
+                shard_id,
+                expected: round.checkpoint_id,
+                got: checkpoint_id,
+            });
+        }
+        if !round.pending.contains(&shard_id) && !round.confirmations.contains_key(&shard_id) {
+            return Err(CoordinatorError::UnknownShard(shard_id));
+        }
+
+        round.barrier_arrivals.insert(shard_id, arrival_time_ms);
+        rockstream_types::metrics::record_shard_barrier_arrival(
+            checkpoint_id.0,
+            shard_id.0,
+            arrival_time_ms,
+        );
+        Ok(())
     }
 
     /// Record a per-shard checkpoint confirmation.
@@ -337,6 +381,12 @@ impl CheckpointCoordinator {
 
         commit_manifest(&manifest)?;
 
+        let completed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        rockstream_types::metrics::record_checkpoint_completed(checkpoint_id.0, completed_at_ms);
+
         tracing::info!(
             checkpoint_id = checkpoint_id.0,
             "audit: checkpoint.completed"
@@ -383,6 +433,94 @@ impl CheckpointCoordinator {
         let guard = self.inner.lock();
         guard.committed.values().cloned().collect()
     }
+
+    /// Return a live alignment snapshot for a checkpoint round.
+    pub fn alignment_snapshot(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Option<CheckpointAlignmentSnapshot> {
+        let guard = self.inner.lock();
+        if let Some(round) = &guard.in_progress {
+            if round.checkpoint_id == checkpoint_id {
+                let elapsed_ms = round.started_at.elapsed().as_millis() as u64;
+                let mut shards = Vec::new();
+                let mut active_holder = None;
+                for &shard in &guard.shards {
+                    let is_confirmed = round.confirmations.contains_key(&shard);
+                    let has_barrier = round.barrier_arrivals.contains_key(&shard);
+                    let (state, holder) = if is_confirmed {
+                        ("confirmed".to_string(), None)
+                    } else if has_barrier {
+                        let h = format!("shard_{}/source_0", shard.0);
+                        if active_holder.is_none() {
+                            active_holder = Some(h.clone());
+                        }
+                        ("barrier_received".to_string(), Some(h))
+                    } else {
+                        let h = format!("shard_{}/source_0", shard.0);
+                        if active_holder.is_none() {
+                            active_holder = Some(h.clone());
+                        }
+                        ("holding_barrier".to_string(), Some(h))
+                    };
+                    shards.push(ShardAlignmentSnapshot {
+                        shard_id: shard,
+                        operator_id: "source_0".to_string(),
+                        state,
+                        holder,
+                        elapsed_ms,
+                    });
+                }
+                return Some(CheckpointAlignmentSnapshot {
+                    checkpoint_id,
+                    status: "in_progress".to_string(),
+                    shards,
+                    active_holder,
+                    elapsed_ms,
+                });
+            }
+        }
+        if let Some(committed) = guard.committed.get(&checkpoint_id) {
+            let mut shards = Vec::new();
+            for &shard in committed.shards.keys() {
+                shards.push(ShardAlignmentSnapshot {
+                    shard_id: shard,
+                    operator_id: "source_0".to_string(),
+                    state: "confirmed".to_string(),
+                    holder: None,
+                    elapsed_ms: 0,
+                });
+            }
+            return Some(CheckpointAlignmentSnapshot {
+                checkpoint_id,
+                status: "committed".to_string(),
+                shards,
+                active_holder: None,
+                elapsed_ms: 0,
+            });
+        }
+        None
+    }
+}
+
+/// Detailed alignment info for one shard during a checkpoint round.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShardAlignmentSnapshot {
+    pub shard_id: ShardId,
+    pub operator_id: String,
+    pub state: String,
+    pub holder: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+/// Snapshot of checkpoint alignment state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointAlignmentSnapshot {
+    pub checkpoint_id: CheckpointId,
+    pub status: String,
+    pub shards: Vec<ShardAlignmentSnapshot>,
+    pub active_holder: Option<String>,
+    pub elapsed_ms: u64,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -407,6 +545,7 @@ mod tests {
 
     #[test]
     fn begin_checkpoint_returns_first_id() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(id, CheckpointId(1));
@@ -414,6 +553,7 @@ mod tests {
 
     #[test]
     fn checkpoint_id_exhaustion_returns_rs3604_without_wrapping() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coordinator = make_coordinator(&[1]);
         coordinator.inner.lock().next_checkpoint_id = CheckpointId(u64::MAX);
         assert_eq!(
@@ -433,6 +573,7 @@ mod tests {
             delta in 0u8..=1,
             shard_count in 1usize..=3,
         ) {
+            let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
             let coordinator = make_coordinator(&(0..shard_count as u64).collect::<Vec<_>>());
             let initial_id = CheckpointId(u64::MAX - u64::from(delta));
             coordinator.inner.lock().next_checkpoint_id = initial_id;
@@ -455,6 +596,7 @@ mod tests {
 
     #[test]
     fn begin_checkpoint_acquires_one_credit_per_shard() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(coord.credits_used(), 2);
@@ -462,6 +604,7 @@ mod tests {
 
     #[test]
     fn begin_checkpoint_injects_barrier_for_each_shard() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
@@ -478,6 +621,7 @@ mod tests {
 
     #[test]
     fn record_all_shards_completes_checkpoint() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 
@@ -500,6 +644,7 @@ mod tests {
 
     #[test]
     fn credits_released_after_completion() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(coord.credits_used(), 2);
@@ -517,6 +662,7 @@ mod tests {
 
     #[test]
     fn latest_committed_is_set_after_completion() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         coord
@@ -531,6 +677,7 @@ mod tests {
     /// buffer never exceeds `max_credits`; exhaustion returns RS-3601, not panic.
     #[test]
     fn test_checkpoint_alignment_bounded_lfs() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         // Set max_credits to exactly the number of shards so one round fully
         // exhausts the buffer.
         let shards: Vec<ShardId> = (0..4).map(ShardId).collect();
@@ -576,6 +723,7 @@ mod tests {
 
     #[test]
     fn stale_confirmation_returns_error() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 
@@ -597,6 +745,7 @@ mod tests {
 
     #[test]
     fn gc_removes_old_checkpoints_beyond_retention() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = CheckpointCoordinator::with_config(vec![ShardId(0)], 64, 2);
 
         for i in 1..=5u64 {
@@ -616,5 +765,93 @@ mod tests {
         );
         let min_id = committed.iter().map(|c| c.checkpoint_id.0).min().unwrap();
         assert!(min_id >= 3, "expected min_id ≥ 3 but got {min_id}");
+    }
+
+    #[test]
+    fn test_barrier_flight_time_tracking_in_coordinator() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        rockstream_types::metrics::reset_all();
+        let coord = CheckpointCoordinator::new(vec![ShardId(0), ShardId(1)]);
+
+        let id = coord.begin_checkpoint(noop_inject).unwrap();
+        assert_eq!(id.0, 1);
+
+        let inj = rockstream_types::metrics::read_barrier_flight_stats().barrier_injected_at_ms;
+
+        // Record shard barrier arrivals
+        coord
+            .record_shard_barrier_received(ShardId(0), id, inj + 15)
+            .unwrap();
+        coord
+            .record_shard_barrier_received(ShardId(1), id, inj + 35)
+            .unwrap();
+
+        // Checkpoint confirmations
+        coord
+            .record_shard_checkpoint(ShardId(0), PerShardCheckpoint::new(id, 100), noop_commit)
+            .unwrap();
+        let manifest = coord
+            .record_shard_checkpoint(ShardId(1), PerShardCheckpoint::new(id, 101), noop_commit)
+            .unwrap();
+        assert!(manifest.is_some());
+
+        let stats = rockstream_types::metrics::read_barrier_flight_stats();
+        assert_eq!(stats.last_checkpoint_id, 1);
+        assert_eq!(stats.barrier_flight_time_ms, 35);
+        assert!(stats.checkpoint_completion_time_ms >= stats.barrier_flight_time_ms);
+    }
+
+    #[test]
+    fn test_checkpoint_show_names_barrier_holder() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let coord = CheckpointCoordinator::new(vec![ShardId(0), ShardId(1)]);
+        let id = coord.begin_checkpoint(noop_inject).unwrap();
+
+        // Shard 0 confirms; shard 1 has not confirmed and holds the barrier
+        coord
+            .record_shard_checkpoint(ShardId(0), PerShardCheckpoint::new(id, 100), noop_commit)
+            .unwrap();
+
+        let snapshot = coord.alignment_snapshot(id).expect("snapshot present");
+        assert_eq!(snapshot.status, "in_progress");
+        assert_eq!(snapshot.active_holder.as_deref(), Some("shard_1/source_0"));
+        let s0 = snapshot
+            .shards
+            .iter()
+            .find(|s| s.shard_id == ShardId(0))
+            .unwrap();
+        assert_eq!(s0.state, "confirmed");
+        assert_eq!(s0.holder, None);
+
+        let s1 = snapshot
+            .shards
+            .iter()
+            .find(|s| s.shard_id == ShardId(1))
+            .unwrap();
+        assert_eq!(s1.state, "holding_barrier");
+        assert_eq!(s1.holder.as_deref(), Some("shard_1/source_0"));
+    }
+
+    #[test]
+    fn test_checkpoint_show_clears_completed_holder() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let coord = CheckpointCoordinator::new(vec![ShardId(0), ShardId(1)]);
+        let id = coord.begin_checkpoint(noop_inject).unwrap();
+
+        coord
+            .record_shard_checkpoint(ShardId(0), PerShardCheckpoint::new(id, 100), noop_commit)
+            .unwrap();
+        let final_manifest = coord
+            .record_shard_checkpoint(ShardId(1), PerShardCheckpoint::new(id, 101), noop_commit)
+            .unwrap();
+        assert!(final_manifest.is_some());
+
+        let snapshot = coord.alignment_snapshot(id).expect("snapshot present");
+        assert_eq!(snapshot.status, "committed");
+        assert_eq!(snapshot.active_holder, None);
+        for shard in &snapshot.shards {
+            assert_eq!(shard.state, "confirmed");
+            assert_eq!(shard.holder, None);
+        }
     }
 }

@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde_json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
+use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
 use rockstream_types::lease::ShardLease;
 use rockstream_types::topology::{
@@ -23,6 +24,7 @@ use rockstream_types::topology::{
     WorkerMessage, WorkerRegistration,
 };
 
+use crate::secrets::WorkerSecretManager;
 use rockstream_storage::ShardDb;
 
 /// Tracks a shard lease and its local active database instance.
@@ -40,6 +42,7 @@ pub struct WorkerClientHandle {
     msg_tx: mpsc::Sender<WorkerMessage>,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
+    secret_manager: Arc<WorkerSecretManager>,
 }
 
 impl WorkerClientHandle {
@@ -68,6 +71,32 @@ impl WorkerClientHandle {
     /// Latest topology snapshot advertised by the control plane.
     pub fn topology_snapshot(&self) -> Vec<WorkerInfo> {
         self.topology_workers.read().values().cloned().collect()
+    }
+
+    /// Request a fresh short-lived token over the authenticated control channel.
+    pub async fn request_secret_token(
+        &self,
+        secret_name: impl Into<String>,
+    ) -> Result<(), io::Error> {
+        self.msg_tx
+            .send(WorkerMessage::ResolveSecretToken {
+                secret_name: secret_name.into(),
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "Client channel closed"))
+    }
+
+    /// Read a decrypted credential from memory. No storage path is consulted.
+    pub fn secret(
+        &self,
+        secret_name: &str,
+        now_secs: u64,
+    ) -> Option<crate::secrets::ResolvedSecret> {
+        self.secret_manager.get(secret_name, now_secs)
+    }
+
+    pub fn secret_manager(&self) -> Arc<WorkerSecretManager> {
+        self.secret_manager.clone()
     }
 
     /// Send a request to acquire a shard lease.
@@ -144,14 +173,111 @@ pub async fn start_worker_client_with_metadata(
     location: WorkerLocation,
     capabilities: WorkerCapabilities,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
-    let stream = TcpStream::connect(control_url).await?;
-    let (reader, mut writer) = stream.into_split();
+    start_worker_client_with_tls_and_metadata(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        InternalTlsConfig::default(),
+    )
+    .await
+}
 
+/// Connect to the control plane over mTLS and start the worker client daemon loop.
+pub async fn start_worker_client_with_tls(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    tls_config: InternalTlsConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_tls_and_metadata(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        WorkerLocation::default(),
+        WorkerCapabilities::default(),
+        tls_config,
+    )
+    .await
+}
+
+/// Connect to the control plane over mTLS with explicit locality/capability metadata.
+pub async fn start_worker_client_with_tls_and_metadata(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    let clean_url = control_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let stream = TcpStream::connect(clean_url).await?;
+
+    if tls_config.is_enabled() {
+        let connector = crate::tls::build_client_tls_connector(&tls_config).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("RS-2405: TLS client error: {e}"),
+            )
+        })?;
+        let host = clean_url.split(':').next().unwrap_or("localhost");
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).unwrap_or_else(|_| {
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+            });
+        let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("RS-2411: TLS handshake error: {e}"),
+            )
+        })?;
+        let (reader, writer) = tokio::io::split(tls_stream);
+        run_worker_client(
+            proposed_worker_id,
+            storage_dir,
+            location,
+            capabilities,
+            reader,
+            writer,
+        )
+        .await
+    } else {
+        let (reader, writer) = stream.into_split();
+        run_worker_client(
+            proposed_worker_id,
+            storage_dir,
+            location,
+            capabilities,
+            reader,
+            writer,
+        )
+        .await
+    }
+}
+
+async fn run_worker_client<R, W>(
+    proposed_worker_id: u64,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    reader: R,
+    mut writer: W,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let secret_manager = Arc::new(WorkerSecretManager::new(format!(
+        "worker-{proposed_worker_id}"
+    )));
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
@@ -159,12 +285,14 @@ pub async fn start_worker_client_with_metadata(
         topology_workers: topology_workers.clone(),
         msg_tx: msg_tx.clone(),
         fence_waiters: fence_waiters.clone(),
+        secret_manager: secret_manager.clone(),
     };
 
     let worker_id_clone = worker_id.clone();
     let active_shards_clone = active_shards.clone();
     let fence_waiters_clone = fence_waiters.clone();
     let storage_dir = storage_dir.to_path_buf();
+    let secret_manager_clone = secret_manager.clone();
 
     let join_handle = tokio::spawn(async move {
         // 1. Send Registration message.
@@ -175,7 +303,11 @@ pub async fn start_worker_client_with_metadata(
             CapacityHeadroom::FULL,
         )
         .with_location(location.clone())
-        .with_capabilities(capabilities);
+        .with_capabilities(capabilities)
+        .with_compatibility(
+            rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+            rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
+        );
         let reg_msg = WorkerMessage::Register(reg);
         let reg_line = serde_json::to_string(&reg_msg).unwrap() + "\n";
         if let Err(e) = writer.write_all(reg_line.as_bytes()).await {
@@ -288,7 +420,10 @@ pub async fn start_worker_client_with_metadata(
                     };
 
                     // Attempt to open the ShardDb
-                    let mut builder = ShardDb::builder("db", store);
+                    let mut builder = ShardDb::builder("db", store).with_supported_format_range(
+                        rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
+                        ),
+                    );
                     if let Ok(metric_shard_id) = u16::try_from(lease.shard_id.0) {
                         builder = builder
                             .with_metrics_identity(metric_shard_id, lease.worker_id.to_string());
@@ -303,14 +438,41 @@ pub async fn start_worker_client_with_metadata(
                                 },
                             );
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                code = %rockstream_types::error_code::RS_0003,
-                                "Failed to open ShardDb for {:?}: {:?}",
+                        Err(e) => match &e {
+                            rockstream_storage::StorageError::IncompatibleFormat {
+                                stored,
+                                min,
+                                max,
+                            } => tracing::error!(
+                                code = %rockstream_types::error_code::RS_5001,
+                                stored,
+                                min,
+                                max,
+                                "Failed to open ShardDb for {:?}: {}",
                                 lease.shard_id,
                                 e
-                            );
-                        }
+                            ),
+                            rockstream_storage::StorageError::MalformedFormatMarker {
+                                length,
+                                min,
+                                max,
+                            } => tracing::error!(
+                                code = %rockstream_types::error_code::RS_5001,
+                                stored = "malformed",
+                                marker_length = length,
+                                min,
+                                max,
+                                "Failed to open ShardDb for {:?}: {}",
+                                lease.shard_id,
+                                e
+                            ),
+                            _ => tracing::error!(
+                                code = %rockstream_types::error_code::RS_0003,
+                                "Failed to open ShardDb for {:?}: {}",
+                                lease.shard_id,
+                                e
+                            ),
+                        },
                     }
                 }
                 ControlMessage::ShardRevoked { shard_id, reason } => {
@@ -369,6 +531,29 @@ pub async fn start_worker_client_with_metadata(
                                 e
                             );
                         }
+                    }
+                }
+                ControlMessage::SecretTokenIssued { token } => {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Err(error) = secret_manager_clone.resolve_token(&token, now_secs) {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_2423,
+                            error = %error,
+                            "worker secret token rejected"
+                        );
+                    }
+                }
+                ControlMessage::SecretRotated { rotation } => {
+                    if let Err(error) = msg_tx
+                        .send(WorkerMessage::ResolveSecretToken {
+                            secret_name: rotation.secret_name,
+                        })
+                        .await
+                    {
+                        tracing::warn!(code = %rockstream_types::error_code::RS_0001, error = %error, "secret rotation refresh request could not be queued");
                     }
                 }
                 ControlMessage::Shutdown => {

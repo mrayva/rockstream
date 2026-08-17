@@ -44,7 +44,7 @@ use rockstream_plan::{AggregateFunc, Expr, PlanNode};
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;
 
-use crate::aggregate::AggregateOp;
+use crate::aggregate::{AggregateOp, DecimalAggregateFormatOp};
 use crate::distinct::DistinctOp;
 use crate::error::OpError;
 use crate::expr::lit;
@@ -286,7 +286,7 @@ fn schema_all_int64(schema: &Schema) -> bool {
 /// wrongly compile, because a `Project` between `Aggregate` and `Source`
 /// fell back to `DataType::Int64` for any column whose type couldn't be
 /// statically determined against the (wrongly empty) schema.
-fn find_source_name(node: &PlanNode) -> Option<String> {
+pub(crate) fn find_source_name(node: &PlanNode) -> Option<String> {
     match node {
         PlanNode::Source { name } => Some(name.clone()),
         PlanNode::Filter { input, .. } => find_source_name(input),
@@ -305,18 +305,18 @@ fn find_source_name(node: &PlanNode) -> Option<String> {
 
 /// The result of successfully recognizing an `InnerJoin`/`OuterJoin`-shaped
 /// subtree — see `try_compile_join_shape`.
-struct JoinShape {
+pub(crate) struct JoinShape {
     /// Stateless stages applied to the left source's delta before the join.
-    left_pre: Vec<Stage>,
+    pub(crate) left_pre: Vec<Stage>,
     /// Stateless stages applied to the right source's delta before the join.
-    right_pre: Vec<Stage>,
-    join: JoinKind,
+    pub(crate) right_pre: Vec<Stage>,
+    pub(crate) join: JoinKind,
     /// Stateless stages applied to the join's output, in application order
     /// (closest-to-the-join stage first) — built bottom-up as the recursion
     /// unwinds back up to `ViewSink`.
-    post: Vec<Stage>,
-    left_source: String,
-    right_source: String,
+    pub(crate) post: Vec<Stage>,
+    pub(crate) left_source: String,
+    pub(crate) right_source: String,
     /// Running output column count after `post` (so far) is applied — the
     /// join's own `left_n_cols + right_n_cols` initially, updated by
     /// `Project`/`Aggregate`/`Window` wrapping arms as they change
@@ -451,7 +451,7 @@ fn compile_join_side(
 /// `compile_node` path (which will itself report `UnsupportedPlanNode` for
 /// anything neither path recognizes, with the same error text as before
 /// this slice).
-fn try_compile_join_shape(
+pub(crate) fn try_compile_join_shape(
     node: &PlanNode,
     table_schemas: &HashMap<String, SchemaRef>,
 ) -> Result<Option<JoinShape>, OpError> {
@@ -878,7 +878,7 @@ fn compile_multi_aggregate_lanes(
 
 /// Recursively compile `node` (everything under `ViewSink`) into an ordered
 /// list of `Stage`s, returning `(stages, output_schema)`.
-fn compile_node(
+pub(crate) fn compile_node(
     node: &PlanNode,
     source_schema: &SchemaRef,
 ) -> Result<(Vec<Stage>, SchemaRef), OpError> {
@@ -1200,6 +1200,14 @@ fn compile_node(
 
             let agg = &aggregates[0];
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
+            let decimal_scale = match static_expr_type(&agg.input, &in_schema) {
+                Some(DataType::Decimal128(_, scale))
+                    if matches!(agg.func, AggregateFunc::Sum | AggregateFunc::Avg) =>
+                {
+                    Some(scale)
+                }
+                _ => None,
+            };
 
             // v0.51.4 Slice 8: a global aggregate with no GROUP BY at all
             // (e.g. `SELECT SUM(balance) FROM accounts`) is compiled as a
@@ -1221,6 +1229,14 @@ fn compile_node(
                 vec![lit(0)]
             };
             let n_keys = effective_group_by.len();
+            if decimal_scale.is_some()
+                && has_real_group_by
+                && (n_keys != 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
+            {
+                return Err(OpError::unsupported_plan_node(
+                    "decimal SUM/AVG requires a single Int64 group-by key",
+                ));
+            }
 
             // Project (arbitrary) input rows down to the fixed (k0..k(n-1), v)
             // shape AggregateOp (via GroupKeyPacker, when n_keys > 1 or key is non-Int64) requires.
@@ -1302,20 +1318,48 @@ fn compile_node(
                     // AggregateOp always emits (k, sum_v, count, avg_v);
                     // project down to the two columns the SQL surface
                     // actually asked for.
-                    stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
-                        NamedExpr::new("k", Expr::Column(0)),
-                        NamedExpr::new("agg", Expr::Column(result_col)),
-                    ]))));
-                    Ok((stages, int64_schema(2)))
+                    if let Some(scale) = decimal_scale {
+                        stages.push(Stage::Stateless(Arc::new(DecimalAggregateFormatOp::new(
+                            scale,
+                            agg.func == AggregateFunc::Avg,
+                        ))));
+                        Ok((
+                            stages,
+                            Arc::new(Schema::new(vec![
+                                Field::new("k", DataType::Int64, false),
+                                Field::new("agg", DataType::Utf8, false),
+                            ])),
+                        ))
+                    } else {
+                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                            NamedExpr::new("k", Expr::Column(0)),
+                            NamedExpr::new("agg", Expr::Column(result_col)),
+                        ]))));
+                        Ok((stages, int64_schema(2)))
+                    }
                 }
                 KeyPacking::None => {
                     // No real GROUP BY: drop the synthetic key entirely —
                     // the frontend expects column 0 to be the aggregate
                     // result itself, not a key (see comment above).
-                    stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
-                        NamedExpr::new("agg", Expr::Column(result_col)),
-                    ]))));
-                    Ok((stages, int64_schema(1)))
+                    if let Some(scale) = decimal_scale {
+                        stages.push(Stage::Stateless(Arc::new(DecimalAggregateFormatOp::new(
+                            scale,
+                            agg.func == AggregateFunc::Avg,
+                        ))));
+                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                            NamedExpr::new("agg", Expr::Column(1)),
+                        ]))));
+                        Ok((
+                            stages,
+                            Arc::new(Schema::new(vec![Field::new("agg", DataType::Utf8, false)])),
+                        ))
+                    } else {
+                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                            NamedExpr::new("agg", Expr::Column(result_col)),
+                        ]))));
+                        Ok((stages, int64_schema(1)))
+                    }
                 }
             }
         }

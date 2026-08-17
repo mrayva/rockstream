@@ -9,6 +9,7 @@ pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
 pub mod checkpoint;
+pub mod compatibility;
 pub mod config;
 pub mod connector;
 pub mod cost;
@@ -17,12 +18,14 @@ pub mod error_code;
 pub mod exchange;
 pub mod explain;
 pub mod frontier;
+pub mod identity;
 pub mod ids;
 pub mod laws;
 pub mod lease;
 pub mod merge_law;
 pub mod metrics;
 pub mod migration;
+pub mod mutation_policy;
 pub mod raft;
 pub mod rendezvous;
 pub mod schema_evolution;
@@ -33,6 +36,10 @@ pub mod tiering;
 pub mod topology;
 pub mod view_lifecycle;
 pub mod workload;
+
+pub use compatibility::{
+    ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
+};
 
 /// Timestamp types.
 pub mod timestamp {

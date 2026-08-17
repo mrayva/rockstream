@@ -17,8 +17,9 @@ use rockstream_types::metrics::{
     set_pipeline_state_bytes, set_workload_memory,
 };
 use rockstream_types::state_budget::{StateBudget, WorkloadBudget};
-use rockstream_types::view_lifecycle::ViewState;
+use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 use rockstream_types::workload::WorkloadDef;
+use serde::{Deserialize, Serialize};
 
 /// Session context passed to catalog query handlers.
 #[derive(Debug, Clone)]
@@ -227,7 +228,7 @@ pub struct CatalogIndexEntry {
 }
 
 /// A sink entry registered via `CREATE SINK` through the pgwire layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSinkEntry {
     pub name: String,
     pub view: String,
@@ -250,7 +251,7 @@ pub struct CatalogSinkEntry {
 }
 
 /// A source entry registered via `CREATE SOURCE` through the pgwire layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSourceEntry {
     pub name: String,
     /// Existing same-named table this source can feed. `None` preserves
@@ -276,6 +277,26 @@ struct CatalogSourceRuntimeEntry {
     committed_checkpoint: u64,
     buffer_fill: usize,
     blocked_reason: Option<String>,
+    source_identity_hash: Option<String>,
+    active_xid: Option<u32>,
+    envelope_bytes: usize,
+    in_memory_bytes: u64,
+    spill_bytes: u64,
+    attached_view_count: usize,
+    affected_view_count: usize,
+    relation_schema_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgOutputSourceRuntimeDetail {
+    pub source_identity_hash: String,
+    pub active_xid: Option<u32>,
+    pub envelope_bytes: usize,
+    pub in_memory_bytes: u64,
+    pub spill_bytes: u64,
+    pub attached_view_count: usize,
+    pub affected_view_count: usize,
+    pub relation_schema_version: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +387,16 @@ pub struct CatalogStubs {
     next_index_op_id: std::sync::atomic::AtomicU64,
 }
 
+const V0522_CONNECTOR_CATALOG_KEY: &[u8] = b"rockstream/catalog/connectors/v0522";
+const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
+
+/// Exact v0.52.2 connector-catalog envelope, read by one bounded key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V0522ConnectorCatalog {
+    pub sinks: Vec<CatalogSinkEntry>,
+    pub sources: Vec<CatalogSourceEntry>,
+}
+
 impl Default for CatalogStubs {
     fn default() -> Self {
         Self::new()
@@ -373,6 +404,47 @@ impl Default for CatalogStubs {
 }
 
 impl CatalogStubs {
+    pub async fn load_v0522_removed_connectors(
+        &self,
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<(), String> {
+        let Some(bytes) = shard_db
+            .get(V0522_CONNECTOR_CATALOG_KEY)
+            .await
+            .map_err(|error| {
+                format!(
+                    "[RS-4017] connector.removed: cannot load legacy connector catalog: {error}"
+                )
+            })?
+        else {
+            return Ok(());
+        };
+        let legacy: V0522ConnectorCatalog = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("[RS-4017] connector.removed: invalid legacy connector catalog: {error}")
+        })?;
+        for mut sink in legacy.sinks {
+            sink.state = "REMOVED".to_string();
+            self.add_sink(sink);
+        }
+        for mut source in legacy.sources {
+            if matches!(source.source_type.as_str(), "s3" | "http_webhook") {
+                source.status = "REMOVED".to_string();
+            }
+            self.add_source(source);
+        }
+        Ok(())
+    }
+
+    pub async fn seed_v0522_connector_catalog(
+        shard_db: &rockstream_storage::ShardDb,
+        catalog: &V0522ConnectorCatalog,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(catalog).map_err(|error| error.to_string())?;
+        shard_db
+            .put(V0522_CONNECTOR_CATALOG_KEY, &bytes)
+            .await
+            .map_err(|error| error.to_string())
+    }
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(CatalogStubsInner::default()),
@@ -575,6 +647,13 @@ impl CatalogStubs {
         let mut inner = self.inner.write().unwrap();
         if let Some(v) = inner.views.get_mut(view_name) {
             v.columns = columns;
+        }
+    }
+
+    pub fn update_table_columns(&self, table_name: &str, columns: Vec<CatalogColumn>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(table) = inner.tables.get_mut(table_name) {
+            table.columns = columns;
         }
     }
 
@@ -793,6 +872,14 @@ impl CatalogStubs {
                 committed_checkpoint: 0,
                 buffer_fill: 0,
                 blocked_reason: None,
+                source_identity_hash: None,
+                active_xid: None,
+                envelope_bytes: 0,
+                in_memory_bytes: 0,
+                spill_bytes: 0,
+                attached_view_count: 0,
+                affected_view_count: 0,
+                relation_schema_version: 0,
             },
         );
         inner.sources.insert(entry.name.clone(), entry);
@@ -877,6 +964,26 @@ impl CatalogStubs {
         true
     }
 
+    pub fn update_pgoutput_source_runtime(
+        &self,
+        name: &str,
+        detail: PgOutputSourceRuntimeDetail,
+    ) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let Some(runtime) = inner.source_runtime.get_mut(name) else {
+            return false;
+        };
+        runtime.source_identity_hash = Some(detail.source_identity_hash);
+        runtime.active_xid = detail.active_xid;
+        runtime.envelope_bytes = detail.envelope_bytes;
+        runtime.in_memory_bytes = detail.in_memory_bytes;
+        runtime.spill_bytes = detail.spill_bytes;
+        runtime.attached_view_count = detail.attached_view_count;
+        runtime.affected_view_count = detail.affected_view_count;
+        runtime.relation_schema_version = detail.relation_schema_version;
+        true
+    }
+
     /// Remove a source entry (DROP SOURCE).
     pub fn remove_source(&self, name: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
@@ -920,14 +1027,36 @@ impl CatalogStubs {
                     Some(s.name),
                     Some(s.source_type),
                     Some(s.format),
-                    Some(s.status),
+                    Some(s.status.clone()),
                     Some(s.live_offset),
                     Some(s.live_lag.to_string()),
+                    (s.status == "REMOVED").then(|| REMOVED_CONNECTOR_REMEDIATION.to_string()),
                 ]
             })
             .collect();
         CatalogResponse::Rows {
             columns: show_sources_columns(),
+            rows,
+        }
+    }
+
+    pub fn sinks_response(&self) -> CatalogResponse {
+        let rows = self
+            .list_sinks()
+            .into_iter()
+            .map(|sink| {
+                vec![
+                    Some(sink.name),
+                    Some(sink.format),
+                    Some(sink.path),
+                    Some(sink.catalog),
+                    Some(sink.state.clone()),
+                    (sink.state == "REMOVED").then(|| REMOVED_CONNECTOR_REMEDIATION.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_sinks_columns(),
             rows,
         }
     }
@@ -963,11 +1092,111 @@ impl CatalogStubs {
                     Some(runtime.buffer_fill.to_string()),
                     runtime.blocked_reason,
                     Some(opts_json),
+                    runtime.source_identity_hash,
+                    s.options.get("slot").cloned(),
+                    s.options.get("publication").cloned(),
+                    runtime.active_xid.map(|xid| xid.to_string()),
+                    Some(runtime.envelope_bytes.to_string()),
+                    Some(runtime.in_memory_bytes.to_string()),
+                    Some(runtime.spill_bytes.to_string()),
+                    Some(runtime.attached_view_count.to_string()),
+                    Some(runtime.affected_view_count.to_string()),
+                    Some(runtime.relation_schema_version.to_string()),
                 ]
             })
             .collect();
         CatalogResponse::Rows {
             columns: show_source_status_columns(),
+            rows,
+        }
+    }
+
+    pub fn view_status_response(
+        &self,
+        name_filter: Option<&str>,
+        namespace_filter: Option<&str>,
+    ) -> CatalogResponse {
+        let views = self.list_views();
+        let rows = views
+            .into_iter()
+            .filter(|v| match name_filter {
+                Some(name) => v.name.eq_ignore_ascii_case(name),
+                None => true,
+            })
+            .filter(|v| match namespace_filter {
+                Some(ns) => v.namespace.eq_ignore_ascii_case(ns),
+                None => true,
+            })
+            .map(|v| {
+                let workload = self
+                    .workload_for_view(&v.name)
+                    .and_then(|name| self.get_workload(&name));
+                let workload_name = workload.as_ref().map(|w| w.name.clone());
+                let freshness_slo_ms = workload
+                    .as_ref()
+                    .and_then(|w| w.freshness_slo.map(|s| s.target_ms.to_string()));
+                let memory_limit_bytes = workload
+                    .as_ref()
+                    .and_then(|w| w.memory_limit.map(|m| m.bytes.to_string()));
+                let view_state = self
+                    .view_states
+                    .read()
+                    .unwrap()
+                    .get(&v.name)
+                    .cloned()
+                    .unwrap_or(ViewState::Running);
+                let state_str = view_state.to_string();
+                let stage_lag = rockstream_types::metrics::read_view_stage_lag(&v.name)
+                    .or_else(|| {
+                        rockstream_types::metrics::read_freshness_lag(&v.name).map(|tot| {
+                            rockstream_types::metrics::StageLagBreakdown {
+                                source_lag_ms: 0,
+                                decode_lag_ms: 0,
+                                compute_lag_ms: 0,
+                                alignment_lag_ms: 0,
+                                sink_lag_ms: 0,
+                                spill_lag_ms: 0,
+                                storage_pressure_ms: 0,
+                                total_lag_ms: tot,
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                let degradation_status = derive_degradation_status(&view_state, Some(stage_lag));
+                vec![
+                    Some(v.namespace),
+                    Some(v.name),
+                    Some(state_str),
+                    workload_name,
+                    freshness_slo_ms,
+                    memory_limit_bytes,
+                    Some("-".to_string()),
+                    Some(stage_lag.source_lag_ms.to_string()),
+                    Some(stage_lag.decode_lag_ms.to_string()),
+                    Some(stage_lag.compute_lag_ms.to_string()),
+                    Some(stage_lag.alignment_lag_ms.to_string()),
+                    Some(stage_lag.sink_lag_ms.to_string()),
+                    Some(stage_lag.spill_lag_ms.to_string()),
+                    Some(stage_lag.storage_pressure_ms.to_string()),
+                    Some(stage_lag.total_lag_ms.to_string()),
+                    Some(degradation_status.degradation_reason.to_string()),
+                    Some(degradation_status.reason_code.clone()),
+                    Some(degradation_status.dominant_contributor.to_string()),
+                    degradation_status.progress_phase,
+                    degradation_status
+                        .bytes_remaining
+                        .map(|value| value.to_string()),
+                    degradation_status
+                        .rows_remaining
+                        .map(|value| value.to_string()),
+                    degradation_status
+                        .estimated_remaining_ms
+                        .map(|value| value.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: view_status_columns(),
             rows,
         }
     }
@@ -1261,6 +1490,24 @@ impl CatalogStubs {
                 .trim_matches('"');
             self.get_view(view_name)?;
             return Some(self.backfill_status_response(view_name));
+        }
+        if ql.trim_end_matches(';') == "show view status" {
+            return Some(self.view_status_response(None, None));
+        }
+        if ql.starts_with("show view status for namespace ") {
+            let namespace = q["show view status for namespace ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            return Some(self.view_status_response(None, Some(namespace)));
+        }
+        if ql.starts_with("show view status for ") {
+            let view_name = q["show view status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_view(view_name)?;
+            return Some(self.view_status_response(Some(view_name), None));
         }
 
         // S7: SHOW client_encoding / SHOW server_encoding
@@ -1633,6 +1880,14 @@ impl CatalogStubs {
             progress.rows_remaining = rows_remaining;
             progress.estimated_rows = estimated_rows;
         }
+    }
+
+    pub fn backfill_has_cursor(&self, view_name: &str) -> bool {
+        self.backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .is_some_and(|progress| progress.cursor_position.is_some())
     }
 
     /// Publish only after the snapshot/output commit reaches its frontier.
@@ -2696,6 +2951,41 @@ pub(crate) fn show_sources_columns() -> Vec<String> {
         "status".to_string(),
         "offset".to_string(),
         "lag".to_string(),
+        "remediation".to_string(),
+    ]
+}
+
+pub(crate) fn show_sinks_columns() -> Vec<String> {
+    vec!["name", "format", "path", "catalog", "state", "remediation"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+pub(crate) fn view_status_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "view_name".to_string(),
+        "state".to_string(),
+        "workload_name".to_string(),
+        "freshness_slo_ms".to_string(),
+        "memory_limit_bytes".to_string(),
+        "depends_on".to_string(),
+        "source_lag_ms".to_string(),
+        "decode_lag_ms".to_string(),
+        "compute_lag_ms".to_string(),
+        "alignment_lag_ms".to_string(),
+        "sink_lag_ms".to_string(),
+        "spill_lag_ms".to_string(),
+        "storage_pressure_ms".to_string(),
+        "total_lag_ms".to_string(),
+        "degradation_reason".to_string(),
+        "reason_code".to_string(),
+        "dominant_contributor".to_string(),
+        "progress_phase".to_string(),
+        "bytes_remaining".to_string(),
+        "rows_remaining".to_string(),
+        "estimated_remaining_ms".to_string(),
     ]
 }
 
@@ -2712,6 +3002,16 @@ pub(crate) fn show_source_status_columns() -> Vec<String> {
         "buffer_fill".to_string(),
         "blocked_reason".to_string(),
         "options".to_string(),
+        "source_identity_hash".to_string(),
+        "slot".to_string(),
+        "publication".to_string(),
+        "active_xid".to_string(),
+        "envelope_bytes".to_string(),
+        "in_memory_bytes".to_string(),
+        "spill_bytes".to_string(),
+        "attached_view_count".to_string(),
+        "affected_view_count".to_string(),
+        "relation_schema_version".to_string(),
     ]
 }
 

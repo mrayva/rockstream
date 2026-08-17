@@ -25,11 +25,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
-use rockstream_types::error_code::{RS_3604, RS_3610, RS_3611, RS_3612};
+use rockstream_types::error_code::{RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612};
+use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
@@ -41,6 +42,7 @@ use crate::audit::{AuditEvent, FileAuditLog};
 use crate::frontier::FrontierAggregator;
 use crate::migration::{MigrationCoordinator, MigrationPersistentStore};
 use crate::raft::{RaftHandle, RaftRole};
+use crate::secret_store::{SecretStore, SecretStoreError};
 use crate::shard::{ShardManager, ShardPersistentStore};
 use crate::topology::{TopologyCatalog, TopologyPersistentStore};
 
@@ -53,6 +55,28 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn secret_error_code(error: &SecretStoreError) -> rockstream_types::error_code::ErrorCode {
+    match error {
+        SecretStoreError::NotFound { code, .. }
+        | SecretStoreError::AlreadyExists { code, .. }
+        | SecretStoreError::EncryptionFailed { code, .. }
+        | SecretStoreError::TokenInvalid { code, .. }
+        | SecretStoreError::DdlInvalid { code, .. }
+        | SecretStoreError::RotationFailed { code, .. }
+        | SecretStoreError::InUse { code, .. }
+        | SecretStoreError::CapacityExceeded { code, .. }
+        | SecretStoreError::Storage { code, .. } => *code,
+    }
+}
+
+fn error_code_for_secret_error(error: &SecretStoreError) -> String {
+    secret_error_code(error).to_string()
+}
+
+fn secret_error_next_steps(error: &SecretStoreError) -> String {
+    rockstream_types::error_code::next_steps(secret_error_code(error)).to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -149,12 +173,23 @@ pub struct ControlServiceHandle {
     pub addr: SocketAddr,
     /// Shutdown sender; drop or send to stop the service.
     shutdown_tx: broadcast::Sender<()>,
+    /// TLS certificate reloader (if internal mTLS is enabled).
+    pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
 
 impl ControlServiceHandle {
     /// Signal the service to shut down.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Reload the server certificate, private key, and/or CA certificate without restarting.
+    pub fn reload_tls(&self, new_config: InternalTlsConfig) -> Result<(), String> {
+        if let Some(ref r) = self.reloader {
+            r.reload(new_config)
+        } else {
+            Err("RS-2410: internal TLS is not enabled on this control service".to_string())
+        }
     }
 }
 
@@ -190,6 +225,9 @@ pub struct ControlService {
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Automatically process queued drain migrations in the background.
     auto_drain: bool,
+    /// Optional internal TLS configuration for control plane mTLS.
+    internal_tls: Option<InternalTlsConfig>,
+    secret_store: Arc<SecretStore>,
 }
 
 impl ControlService {
@@ -206,6 +244,13 @@ impl ControlService {
             migration_store: None,
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             auto_drain: false,
+            internal_tls: None,
+            secret_store: Arc::new(SecretStore::new(
+                None,
+                Arc::new(crate::kek::EnvKekProvider::from_env_or_default(
+                    "rockstream-default-kek",
+                )),
+            )),
         }
     }
 
@@ -262,6 +307,18 @@ impl ControlService {
         self
     }
 
+    /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
+    pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
+        self.internal_tls = Some(config);
+        self
+    }
+
+    /// Attach the catalog secret store used by worker token requests.
+    pub fn with_secret_store(mut self, secret_store: Arc<SecretStore>) -> Self {
+        self.secret_store = secret_store;
+        self
+    }
+
     /// Start the service on `bind_addr`.
     ///
     /// Returns a [`ControlServiceHandle`] which can be used to query the
@@ -295,7 +352,27 @@ impl ControlService {
             migration_store: self.migration_store.clone(),
             drain_state: self.drain_state.clone(),
             auto_drain: self.auto_drain,
+            secret_store: self.secret_store.clone(),
         };
+
+        let reloader = if let Some(tls_cfg) = &self.internal_tls {
+            if tls_cfg.is_enabled() {
+                match crate::tls::TlsCertificateReloader::new(tls_cfg.clone()) {
+                    Ok(r) => Some(Arc::new(r)),
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize internal TLS: {e}"),
+                        ));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let reloader_for_handle = reloader.clone();
 
         tokio::spawn(async move {
             let mut shutdown_rx = shutdown_tx2.subscribe();
@@ -307,9 +384,10 @@ impl ControlService {
                                 tracing::debug!(%peer, "control: new connection");
                                 let conn_ctx = ctx.clone();
                                 let mut sd = shutdown_tx2.subscribe();
+                                let acceptor = reloader.as_ref().map(|r| r.current_acceptor());
                                 tokio::spawn(async move {
                                     tokio::select! {
-                                        _ = handle_connection(stream, peer, conn_ctx) => {}
+                                        _ = accept_and_handle(stream, peer, conn_ctx, acceptor) => {}
                                         _ = sd.recv() => {}
                                     }
                                 });
@@ -327,7 +405,11 @@ impl ControlService {
             }
         });
 
-        Ok(ControlServiceHandle { addr, shutdown_tx })
+        Ok(ControlServiceHandle {
+            addr,
+            shutdown_tx,
+            reloader: reloader_for_handle,
+        })
     }
 
     /// Collect live operator statistics for a pipeline.
@@ -378,6 +460,7 @@ struct ConnectionContext {
     migration_store: Option<Arc<MigrationPersistentStore>>,
     drain_state: Arc<AsyncMutex<DrainState>>,
     auto_drain: bool,
+    secret_store: Arc<SecretStore>,
 }
 
 async fn persist_worker_if_needed(
@@ -482,10 +565,7 @@ async fn request_worker_drain(
     }
 
     let started_at_ms = now_ms();
-    let lifecycle = WorkerLifecycleState::Draining {
-        shards_remaining: shards.len() as u32,
-        started_at_ms,
-    };
+    let lifecycle = WorkerLifecycleState::draining(shards.len() as u32, started_at_ms);
     let updated = catalog
         .set_lifecycle(worker_id, lifecycle.clone())
         .expect("worker existence checked above");
@@ -609,18 +689,9 @@ async fn process_drain_queue(
                     completed_at_ms: now_ms(),
                 }
             } else {
-                match worker.lifecycle {
-                    WorkerLifecycleState::Draining { started_at_ms, .. } => {
-                        WorkerLifecycleState::Draining {
-                            shards_remaining: remaining,
-                            started_at_ms,
-                        }
-                    }
-                    _ => WorkerLifecycleState::Draining {
-                        shards_remaining: remaining,
-                        started_at_ms: now_ms(),
-                    },
-                }
+                let mut state = worker.lifecycle.clone();
+                state.advance_drain_progress(remaining, None, None);
+                state
             };
             if let Some(updated) = catalog.set_lifecycle(task.donor_worker_id, next_state.clone()) {
                 persist_worker_if_needed(topology_store, &updated).await;
@@ -650,8 +721,91 @@ async fn cleanup_decommissioned_workers(
     }
 }
 
-/// Handle a single worker connection.
+/// Accept a connection and perform TLS handshake if configured.
+async fn accept_and_handle(
+    stream: TcpStream,
+    peer: SocketAddr,
+    ctx: ConnectionContext,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
+    if let Some(tls_acceptor) = acceptor {
+        match tls_acceptor.accept(stream).await {
+            Ok(tls_stream) => {
+                let identity = match crate::tls::extract_peer_identity(&tls_stream) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "control: mTLS identity extraction failed");
+                        if let Some(aud) = &ctx.audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "security.internal_mtls_denied",
+                                format!("peer={peer}"),
+                            )
+                            .with_detail(format!(
+                                "identity extraction failed: {e}, error_code=RS-2411"
+                            ));
+                            let _ = aud.append(&event);
+                        }
+                        return;
+                    }
+                };
+                if let Some(ref id) = identity {
+                    if id.role == NodeRole::Cli {
+                        if let Some(aud) = &ctx.audit {
+                            let event = AuditEvent::now(
+                                id.to_cn(),
+                                "cli.authenticated",
+                                format!("peer={peer}"),
+                            );
+                            let _ = aud.append(&event);
+                        }
+                    }
+                }
+                let (reader, writer) = tokio::io::split(tls_stream);
+                handle_connection_stream(reader, writer, peer, ctx, identity).await;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let code = if err_str.contains("NoCertificate") || err_str.contains("missing") {
+                    RS_2410
+                } else {
+                    RS_2411
+                };
+                tracing::warn!(%peer, error = %e, %code, "control: mTLS handshake rejected");
+                if let Some(aud) = &ctx.audit {
+                    let event = AuditEvent::now(
+                        "control",
+                        "security.internal_mtls_denied",
+                        format!("peer={peer}"),
+                    )
+                    .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
+                    let _ = aud.append(&event);
+                }
+            }
+        }
+    } else {
+        let (reader, writer) = stream.into_split();
+        handle_connection_stream(reader, writer, peer, ctx, None).await;
+    }
+}
+
+/// Handle a single worker connection over plaintext.
+#[allow(dead_code)]
 async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionContext) {
+    accept_and_handle(stream, peer, ctx, None).await;
+}
+
+/// Handle a single worker connection over an arbitrary stream.
+async fn handle_connection_stream<R, W>(
+    reader: R,
+    mut writer: W,
+    peer: SocketAddr,
+    ctx: ConnectionContext,
+    peer_identity: Option<NodeIdentity>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let ConnectionContext {
         catalog,
         shard_manager,
@@ -664,10 +818,11 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
         migration_store,
         drain_state,
         auto_drain,
+        secret_store,
     } = ctx;
-    let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
+    let mut rotation_rx = secret_store.subscribe_rotation();
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -683,6 +838,44 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
 
         match msg {
             WorkerMessage::Register(reg) => {
+                if let Some(id) = &peer_identity {
+                    if id.role != NodeRole::Worker
+                        || (!id.matches_worker_id(reg.worker_id.0)
+                            && !id.matches_worker_str(&reg.address))
+                    {
+                        tracing::warn!(
+                            %peer,
+                            cert_identity = %id.to_cn(),
+                            registered_id = %reg.worker_id,
+                            "control: worker mTLS identity mismatch rejected"
+                        );
+                        if let Some(aud) = &audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "security.internal_mtls_denied",
+                                format!("worker_id={}, peer={peer}", reg.worker_id),
+                            )
+                            .with_detail(format!(
+                                "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
+                                id.to_cn(),
+                                reg.worker_id
+                            ));
+                            let _ = aud.append(&event);
+                        }
+                        let reply = ControlMessage::OperationFailed {
+                            code: RS_2412.to_string(),
+                            message: format!(
+                                "certificate identity {} does not match requested worker_id {}",
+                                id.to_cn(),
+                                reg.worker_id
+                            ),
+                            next_steps: rockstream_types::error_code::next_steps(RS_2412)
+                                .to_string(),
+                        };
+                        send_message(&mut writer, &reply).await;
+                        return;
+                    }
+                }
                 let worker_id = catalog.register(&reg);
                 connected_worker_id = Some(worker_id);
                 tracing::info!(
@@ -697,14 +890,16 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     let event =
                         AuditEvent::now("control", "worker.registered", worker_id.to_string())
                             .with_detail(format!(
-                                "address={}, host_id={}, availability_zone={}, headroom={}, same_host_arrow_shm_v1={}, shuffle_codec_v1={}, checkpoint_manifest_codec_v1={}",
+                                "address={}, host_id={}, availability_zone={}, headroom={}, same_host_arrow_shm_v1={}, shuffle_codec_v1={}, checkpoint_manifest_codec_v1={}, protocol_range={:?}, storage_format_range={:?}",
                                 reg.address,
                                 reg.location.host_id,
                                 reg.location.availability_zone,
                                 reg.capacity_headroom,
                                 reg.capabilities.same_host_arrow_shm_v1,
                                 reg.capabilities.shuffle_codec_v1,
-                                reg.capabilities.checkpoint_manifest_codec_v1
+                                reg.capabilities.checkpoint_manifest_codec_v1,
+                                reg.protocol_range,
+                                reg.storage_format_range
                             ));
                     let _ = aud.append(&event);
                 }
@@ -797,6 +992,49 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                         ),
                         next_steps: "Wait for the drain to complete or target an active worker instead."
                             .to_string(),
+                    };
+                    send_message(&mut writer, &reply).await;
+                    continue;
+                }
+                let requested_worker = catalog.get(worker_id).expect("worker was checked above");
+                let healthy_workers = catalog.healthy_workers();
+                if !rockstream_types::topology::assignment_compatible(
+                    &healthy_workers,
+                    requested_worker.protocol_range.max,
+                    requested_worker.storage_format_range.max,
+                ) {
+                    tracing::warn!(
+                        %worker_id,
+                        %shard_id,
+                        protocol = %requested_worker.protocol_range.max,
+                        storage_format = %requested_worker.storage_format_range.max,
+                        "control: assignment withheld by compatibility floor"
+                    );
+                    if let Some(aud) = &audit {
+                        let event = AuditEvent::now(
+                            "control",
+                            "assignment.compatibility_withheld",
+                            shard_id.to_string(),
+                        )
+                        .with_detail(format!(
+                            "worker={}, protocol={}, storage_format={}",
+                            worker_id,
+                            requested_worker.protocol_range.max,
+                            requested_worker.storage_format_range.max
+                        ));
+                        let _ = aud.append(&event);
+                    }
+                    let reply = ControlMessage::OperationFailed {
+                        code: rockstream_types::error_code::RS_5021.to_string(),
+                        message: format!(
+                            "assignment withheld: worker {worker_id} requires protocol {} and storage format {}, but the affected workers do not meet that compatibility floor",
+                            requested_worker.protocol_range.max,
+                            requested_worker.storage_format_range.max
+                        ),
+                        next_steps: rockstream_types::error_code::next_steps(
+                            rockstream_types::error_code::RS_5021,
+                        )
+                        .to_string(),
                     };
                     send_message(&mut writer, &reply).await;
                     continue;
@@ -914,10 +1152,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                         completed_at_ms: now_ms(),
                     }
                 } else {
-                    WorkerLifecycleState::Draining {
-                        shards_remaining,
-                        started_at_ms: now_ms(),
-                    }
+                    WorkerLifecycleState::draining(shards_remaining, now_ms())
                 };
                 if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
@@ -951,6 +1186,39 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     sample_count = samples.len(),
                     "control: shard load report received"
                 );
+            }
+            WorkerMessage::ResolveSecretToken { secret_name } => {
+                let Some(identity) = peer_identity
+                    .as_ref()
+                    .filter(|id| id.role == NodeRole::Worker)
+                else {
+                    let reply = ControlMessage::OperationFailed {
+                        code: RS_2410.to_string(),
+                        message:
+                            "secret token requests require an authenticated worker certificate"
+                                .to_string(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2410).to_string(),
+                    };
+                    send_message(&mut writer, &reply).await;
+                    continue;
+                };
+                match secret_store
+                    .issue_worker_token(0, &secret_name, &identity.node_id, 300, &identity.to_cn())
+                    .await
+                {
+                    Ok(token) => {
+                        send_message(&mut writer, &ControlMessage::SecretTokenIssued { token })
+                            .await
+                    }
+                    Err(error) => {
+                        let reply = ControlMessage::OperationFailed {
+                            code: error_code_for_secret_error(&error),
+                            message: error.to_string(),
+                            next_steps: secret_error_next_steps(&error),
+                        };
+                        send_message(&mut writer, &reply).await;
+                    }
+                }
             }
             WorkerMessage::ClusterStatusQuery => {
                 let reply = if let Some(rft) = &raft {
@@ -1041,6 +1309,16 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
             }
         }
 
+        if rotation_rx.has_changed().unwrap_or(false) {
+            let rotation = {
+                let current = rotation_rx.borrow_and_update();
+                current.clone()
+            };
+            if let Some(rotation) = rotation {
+                send_message(&mut writer, &ControlMessage::SecretRotated { rotation }).await;
+            }
+        }
+
         if auto_drain {
             process_drain_queue(
                 &catalog,
@@ -1084,7 +1362,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
     tracing::debug!(%peer, "control: connection closed");
 }
 
-async fn send_message(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &ControlMessage) {
+async fn send_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &ControlMessage) {
     match serde_json::to_string(msg) {
         Ok(mut line) => {
             line.push('\n');
