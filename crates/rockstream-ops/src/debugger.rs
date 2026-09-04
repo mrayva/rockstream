@@ -126,7 +126,11 @@ fn explain_plan_op_ids_scoped(
         .cloned()
         .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
 
-    if let Some(shape) = crate::compile::try_compile_join_shape(child, table_schemas)? {
+    if let Some(shape) = crate::compile::try_compile_join_shape(
+        child,
+        table_schemas,
+        rockstream_types::config::JoinStrategy::Auto,
+    )? {
         let sink_op_id = crate::live_exec::next_stateful_op_id();
         match shape.join {
             crate::live_exec::JoinKind::Inner(join_op) => {
@@ -145,6 +149,17 @@ fn explain_plan_op_ids_scoped(
                     op_id: outer_op.op_id().to_string(),
                     kind: "OuterJoin".to_string(),
                     details: "OUTER/SEMI/ANTI JOIN".to_string(),
+                    schema: Some(format!(
+                        "left_source: {}, right_source: {}",
+                        shape.left_source, shape.right_source
+                    )),
+                });
+            }
+            crate::live_exec::JoinKind::Factorized(factorized_op) => {
+                out.push(OperatorNodeInfo {
+                    op_id: factorized_op.op_id().to_string(),
+                    kind: "FactorizedJoinAggregate".to_string(),
+                    details: "BOUNDED FACTORIZED INNER JOIN AGGREGATE".to_string(),
                     schema: Some(format!(
                         "left_source: {}, right_source: {}",
                         shape.left_source, shape.right_source

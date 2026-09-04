@@ -41,7 +41,8 @@ pub fn is_allow_law_operand_fallback() -> bool {
 
 use crate::error::StorageError;
 use crate::format_migration::{
-    format_v2_key, format_v2_prefix, logical_key_from_format_v2, migration_progress_key,
+    format_v2_key, format_v2_prefix, format_v3_key, format_v3_prefix, logical_key_from_format_v2,
+    logical_key_from_format_v3, migration_progress_key,
 };
 use crate::keys::ShardKeyEncoder;
 use crate::merge_registry::SumCountMergeOperator;
@@ -121,7 +122,7 @@ impl ShardDbBuilder {
             settings: Settings::default(),
             metrics_shard_id: None,
             worker_id: None,
-            supported_format_range: SupportedStorageFormatRange::v1_through_v2(),
+            supported_format_range: SupportedStorageFormatRange::v1_through_v3(),
         }
     }
 
@@ -166,20 +167,15 @@ impl ShardDbBuilder {
         let format_key = ShardKeyEncoder::format_version_key();
         let format_version = match db.get(&format_key).await? {
             None => {
-                if !range.contains(rockstream_types::compatibility::StorageFormatVersion::V1) {
-                    return Err(StorageError::IncompatibleFormat {
-                        stored: rockstream_types::compatibility::StorageFormatVersion::V1.0,
-                        min: range.min.0,
-                        max: range.max.0,
-                    });
-                }
-                db.put(
-                    &format_key,
-                    [rockstream_types::compatibility::StorageFormatVersion::V1.0],
-                )
-                .await?;
+                let init_version =
+                    if range.contains(rockstream_types::compatibility::StorageFormatVersion::V1) {
+                        rockstream_types::compatibility::StorageFormatVersion::V1
+                    } else {
+                        range.max
+                    };
+                db.put(&format_key, [init_version.0]).await?;
                 db.flush().await?;
-                rockstream_types::compatibility::StorageFormatVersion::V1.0
+                init_version.0
             }
             Some(bytes) if bytes.len() == 1 => {
                 let stored = rockstream_types::compatibility::StorageFormatVersion(bytes[0]);
@@ -250,7 +246,9 @@ impl ShardDb {
     }
 
     fn physical_key(&self, key: &[u8]) -> Vec<u8> {
-        if self.format_version == 2 && key.first().copied() != Some(0x06) {
+        if self.format_version == 3 && key.first().copied() != Some(0x06) {
+            format_v3_key(key)
+        } else if self.format_version == 2 && key.first().copied() != Some(0x06) {
             format_v2_key(key)
         } else {
             key.to_vec()
@@ -260,19 +258,28 @@ impl ShardDb {
     async fn scan_physical_prefix(
         &self,
         prefix: &[u8],
-        strip_v2_prefix: bool,
+        strip_version_prefix: bool,
     ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();
-        let physical_prefix = if strip_v2_prefix {
-            format_v2_prefix(prefix)
+        let physical_prefix = if strip_version_prefix {
+            if self.format_version == 3 {
+                format_v3_prefix(prefix)
+            } else {
+                format_v2_prefix(prefix)
+            }
         } else {
             prefix.to_vec()
         };
         let mut iter = self.db.scan_prefix(&physical_prefix).await?;
         while let Some(entry) = iter.next().await? {
-            let key = if strip_v2_prefix {
-                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
-                    StorageError::Unsupported("invalid v2 storage key".to_string())
+            let key = if strip_version_prefix {
+                let logical = if self.format_version == 3 {
+                    logical_key_from_format_v3(&entry.key)
+                } else {
+                    logical_key_from_format_v2(&entry.key)
+                };
+                Bytes::copy_from_slice(logical.ok_or_else(|| {
+                    StorageError::Unsupported("invalid versioned storage key".to_string())
                 })?)
             } else {
                 entry.key
@@ -285,21 +292,30 @@ impl ShardDb {
     async fn scan_physical_prefix_bounded(
         &self,
         prefix: &[u8],
-        strip_v2_prefix: bool,
+        strip_version_prefix: bool,
         max_bytes: usize,
     ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
         let mut results = Vec::new();
         let mut total_bytes = 0usize;
-        let physical_prefix = if strip_v2_prefix {
-            format_v2_prefix(prefix)
+        let physical_prefix = if strip_version_prefix {
+            if self.format_version == 3 {
+                format_v3_prefix(prefix)
+            } else {
+                format_v2_prefix(prefix)
+            }
         } else {
             prefix.to_vec()
         };
         let mut iter = self.db.scan_prefix(physical_prefix).await?;
         while let Some(entry) = iter.next().await? {
-            let key = if strip_v2_prefix {
-                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
-                    StorageError::Unsupported("invalid v2 storage key".to_string())
+            let key = if strip_version_prefix {
+                let logical = if self.format_version == 3 {
+                    logical_key_from_format_v3(&entry.key)
+                } else {
+                    logical_key_from_format_v2(&entry.key)
+                };
+                Bytes::copy_from_slice(logical.ok_or_else(|| {
+                    StorageError::Unsupported("invalid versioned storage key".to_string())
                 })?)
             } else {
                 entry.key
@@ -346,10 +362,18 @@ impl ShardDb {
     /// Get the value for a key, if it exists.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
         let val = if self.migration_pending && key.first().copied() != Some(0x06) {
-            self.db
-                .get(&format_v2_key(key))
-                .await?
-                .or(self.db.get(key).await?)
+            if self.format_version == 3 {
+                self.db
+                    .get(&format_v3_key(key))
+                    .await?
+                    .or(self.db.get(&format_v2_key(key)).await?)
+                    .or(self.db.get(key).await?)
+            } else {
+                self.db
+                    .get(&format_v2_key(key))
+                    .await?
+                    .or(self.db.get(key).await?)
+            }
         } else {
             self.db.get(self.physical_key(key)).await?
         };
@@ -420,6 +444,9 @@ impl ShardDb {
     /// only some ops are visible to a reader: a torn write is structurally
     /// unobservable, not merely untested. No redundant runtime `assert!` is
     /// needed (same escape hatch used for M2-S1/S2's meet-correctness).
+    ///
+    /// INVARIANT-BY-CONSTRUCTION: M1-S6 — point deletes and tombstones in atomic
+    /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         if self.migration_pending {
             return Err(StorageError::MigrationInProgress);
@@ -457,7 +484,9 @@ impl ShardDb {
     /// **Warning:** This materializes the entire result into memory. For large
     /// arrangements, prefer `scan_prefix_bounded` with an explicit byte budget.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
-        if self.format_version == 2 && prefix.first().copied() != Some(0x06) {
+        if (self.format_version == 2 || self.format_version == 3)
+            && prefix.first().copied() != Some(0x06)
+        {
             return self.scan_physical_prefix(prefix, true).await;
         }
         if self.migration_pending && prefix.first().copied() != Some(0x06) {
@@ -976,6 +1005,7 @@ pub enum BatchOp {
 /// Internally stores operations as a `Vec<BatchOp>` so that multiple batches
 /// can be coalesced (via [`merge_from`]) into a single atomic commit — the
 /// basis of group-commit (v0.5).
+#[derive(Debug, Clone)]
 pub struct WriteBatch {
     ops: Vec<BatchOp>,
 }

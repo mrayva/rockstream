@@ -10,6 +10,7 @@
 use rockstream_cli::{start_gateway, StartOptions};
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
+use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -30,9 +31,11 @@ fn gateway_opts(dir: &tempfile::TempDir) -> StartOptions {
         raft_bind: None,
         raft_bootstrap: false,
         daemon: false,
+        worker_id: None,
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     }
 }
 
@@ -316,18 +319,17 @@ async fn gateway_subscribe_returns_without_error() {
         .await
         .expect("CREATE VIEW failed");
 
-    let rows = client
-        .simple_query("SUBSCRIBE live_feed")
-        .await
-        .expect("SUBSCRIBE failed");
-
-    let completed = rows
-        .iter()
-        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
-    assert!(
-        completed,
-        "SUBSCRIBE did not return CommandComplete; got: {rows:?}"
-    );
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.query_raw(
+            "SUBSCRIBE live_feed",
+            std::iter::empty::<&(dyn ToSql + Sync)>(),
+        ),
+    )
+    .await
+    .expect("SUBSCRIBE did not start streaming within 5 seconds")
+    .expect("SUBSCRIBE failed");
+    drop(stream);
 }
 
 // ── G8: error cases ───────────────────────────────────────────────────────────
@@ -351,9 +353,11 @@ async fn gateway_invalid_listen_address_returns_rs_0002() {
         raft_bind: None,
         raft_bootstrap: false,
         daemon: false,
+        worker_id: None,
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     };
 
     let err = start_gateway(&opts).await.unwrap_err();
@@ -387,9 +391,11 @@ async fn gateway_port_in_use_returns_rs_0003() {
         raft_bind: None,
         raft_bootstrap: false,
         daemon: false,
+        worker_id: None,
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     };
 
     let err = start_gateway(&opts).await.unwrap_err();

@@ -336,6 +336,98 @@ impl ExplainRow {
     }
 }
 
+/// Arrangement sharing facts for EXPLAIN INCREMENTAL and SHOW VIEW STATUS (v0.59.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArrangementSharingInfo {
+    pub arrangement_id: Option<crate::ids::ArrangementId>,
+    pub consumer_count: usize,
+    pub shared_state_bytes: u64,
+    pub bytes_saved_by_sharing: u64,
+    pub compaction_frontier: u64,
+}
+
+impl ArrangementSharingInfo {
+    pub fn new(
+        arrangement_id: Option<crate::ids::ArrangementId>,
+        consumer_count: usize,
+        shared_state_bytes: u64,
+        bytes_saved_by_sharing: u64,
+        compaction_frontier: u64,
+    ) -> Self {
+        Self {
+            arrangement_id,
+            consumer_count,
+            shared_state_bytes,
+            bytes_saved_by_sharing,
+            compaction_frontier,
+        }
+    }
+}
+
+/// Structured raw facts from the final engine for SHOW VIEW STATUS and EXPLAIN INCREMENTAL (OBS-03).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewEngineFacts {
+    pub arrangement_id: Option<crate::ids::ArrangementId>,
+    pub consumer_count: usize,
+    pub shared_state_bytes: u64,
+    pub bytes_saved_by_sharing: u64,
+    pub delta_amplification: f64,
+    pub join_amplification: f64,
+    pub merge_operand_count: u64,
+    pub dirty_key_count: u64,
+    pub logical_write_bytes: u64,
+    pub physical_write_amplification: f64,
+    pub hot_key_bucket_count: usize,
+    pub factorization_strategy: String,
+    pub predicate_filter_selectivity: f64,
+    pub cache_hit_rate: f64,
+    pub epoch_group_size: usize,
+    pub checkpoint_mode: String,
+    pub compaction_debt: u64,
+    pub degradation_reason: String,
+    pub reason_code: String,
+    pub dominant_contributor: String,
+    pub source_lag_ms: u64,
+    pub compute_lag_ms: u64,
+    pub spill_bytes: u64,
+    pub checkpoint_id: u64,
+    pub frontier: String,
+    pub recommended_action_key: String,
+}
+
+impl Default for ViewEngineFacts {
+    fn default() -> Self {
+        Self {
+            arrangement_id: None,
+            consumer_count: 1,
+            shared_state_bytes: 0,
+            bytes_saved_by_sharing: 0,
+            delta_amplification: 1.0,
+            join_amplification: 1.0,
+            merge_operand_count: 0,
+            dirty_key_count: 0,
+            logical_write_bytes: 0,
+            physical_write_amplification: 1.0,
+            hot_key_bucket_count: 0,
+            factorization_strategy: "Classic".to_string(),
+            predicate_filter_selectivity: 1.0,
+            cache_hit_rate: 1.0,
+            epoch_group_size: 1,
+            checkpoint_mode: "Changelog".to_string(),
+            compaction_debt: 0,
+            degradation_reason: "None".to_string(),
+            reason_code: "OK".to_string(),
+            dominant_contributor: "none".to_string(),
+            source_lag_ms: 0,
+            compute_lag_ms: 0,
+            spill_bytes: 0,
+            checkpoint_id: 0,
+            frontier: "0".to_string(),
+            recommended_action_key: "none".to_string(),
+        }
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

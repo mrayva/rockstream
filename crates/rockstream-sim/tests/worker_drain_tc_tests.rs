@@ -45,6 +45,12 @@ impl TcCluster {
     async fn boot(test_id: &str) -> Self {
         let network = format!("rs-m46-drain-net-{test_id}");
         let shared_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(shared_dir.path(), std::fs::Permissions::from_mode(0o777));
+        }
         let control_name = format!("rs-m46-drain-control-{test_id}");
         let control = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
             .with_wait_for(WaitFor::message_on_stdout("control service listening"))
@@ -187,7 +193,15 @@ async fn drain_completes_zero_downtime_tc() {
         );
         return;
     }
-    let cluster = TcCluster::boot("drain").await;
+    let run_id = format!(
+        "drain-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let cluster = TcCluster::boot(&run_id).await;
     for worker_id in [1u64, 2u64] {
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
@@ -209,6 +223,8 @@ async fn drain_completes_zero_downtime_tc() {
         .join("target/debug/rockstream");
     let status = std::process::Command::new(binary)
         .args([
+            "--identity-role",
+            "admin",
             "cluster",
             "workers",
             "drain",

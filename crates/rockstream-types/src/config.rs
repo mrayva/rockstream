@@ -6,6 +6,7 @@ use crate::cost::PricingConfig;
 use crate::tiering::StorageTieringConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AutotunerConfig {
     pub enabled: bool,
     pub hysteresis_scale_up_windows: usize,
@@ -35,6 +36,7 @@ impl Default for AutotunerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SkewSplitConfig {
     pub enabled: bool,
     pub hot_key_factor: f64,
@@ -52,6 +54,7 @@ impl Default for SkewSplitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ScatterPruningConfig {
     pub shard_bloom_budget_bytes: usize,
     pub shard_stats_max_age_checkpoints: u64,
@@ -82,6 +85,10 @@ fn default_max_lag_ms() -> u64 {
     1000
 }
 
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ClusterConfig {
@@ -98,6 +105,8 @@ pub struct ClusterConfig {
     pub index_prefer_selectivity_threshold: f64,
     #[serde(default = "default_max_lag_ms")]
     pub index_max_lag_ms: u64,
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
 }
 
 impl Default for ClusterConfig {
@@ -111,6 +120,7 @@ impl Default for ClusterConfig {
             scatter_pruning: ScatterPruningConfig::default(),
             index_prefer_selectivity_threshold: 0.01,
             index_max_lag_ms: 1000,
+            shutdown_timeout_secs: 30,
         }
     }
 }
@@ -120,6 +130,7 @@ impl Default for ClusterConfig {
 pub struct WorkerConfig {
     pub segment_cache_bytes: usize,
     pub max_rows_per_quantum: usize,
+    pub execution_threads: usize,
 }
 
 impl Default for WorkerConfig {
@@ -127,6 +138,7 @@ impl Default for WorkerConfig {
         Self {
             segment_cache_bytes: 64 * 1024 * 1024,
             max_rows_per_quantum: 8192,
+            execution_threads: 1,
         }
     }
 }
@@ -214,6 +226,22 @@ pub struct StorageConfig {
     pub tiering: StorageTieringConfig,
 }
 
+/// Join implementation selected when a view is compiled.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinStrategy {
+    #[default]
+    Auto,
+    Classic,
+    Factorized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExecutionConfig {
+    pub join_strategy: JoinStrategy,
+}
+
 /// v0.51.5: gateway-facing (client SQL-port) TLS termination configuration.
 /// Distinct from any *internal* control<->worker/worker<->worker mTLS.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -253,6 +281,8 @@ pub struct RockstreamConfig {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
+    pub execution: ExecutionConfig,
+    #[serde(default)]
     pub pricing: Option<PricingConfig>,
     #[serde(default)]
     pub gateway: GatewayConfig,
@@ -272,6 +302,15 @@ impl RockstreamConfig {
     pub fn to_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    pub fn validate(&self, check_files: bool) -> crate::config_validation::ConfigValidationReport {
+        let mut diagnostics = Vec::new();
+        crate::config_validation::validate_semantic_bounds(self, check_files, &mut diagnostics);
+        let valid = diagnostics
+            .iter()
+            .all(|d| d.severity != crate::config_validation::ConfigDiagnosticSeverity::Error);
+        crate::config_validation::ConfigValidationReport { valid, diagnostics }
+    }
 }
 
 impl Default for RockstreamConfig {
@@ -287,10 +326,12 @@ impl Default for RockstreamConfig {
                 scatter_pruning: ScatterPruningConfig::default(),
                 index_prefer_selectivity_threshold: 0.01,
                 index_max_lag_ms: 1000,
+                shutdown_timeout_secs: 30,
             },
             worker: WorkerConfig {
                 segment_cache_bytes: 536870912, // 512 MB
                 max_rows_per_quantum: 1000,
+                execution_threads: 1,
             },
             connector: ConnectorConfig {
                 dlq_warn_threshold: 100,
@@ -298,6 +339,7 @@ impl Default for RockstreamConfig {
             },
             exchange: ExchangeConfig::default(),
             storage: StorageConfig::default(),
+            execution: ExecutionConfig::default(),
             pricing: None,
             gateway: GatewayConfig::default(),
             internal_tls: crate::identity::InternalTlsConfig::default(),

@@ -634,6 +634,12 @@ header comments and in `formal/findings.md`.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
+`formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
+published physical frontier advances only after a complete group is durable.
+The v0.59.18 lifecycle, client, documentation & backend test closure (TST-007)
+validates real backend restart/recovery against the verified M1-M7 state machine.
+
 To guard against vacuously-passing models (a model that never reaches the
 interesting state trivially satisfies every `always`), each spec includes
 `exists` coverage assertions
@@ -655,6 +661,12 @@ interesting state trivially satisfies every `always`), each spec includes
   mid-term, a new leader is elected at a higher term, and the stale leader's
   in-flight write (both the plain and shard-fence write families) is rejected
   (see §3.8 above).
+
+Postgres CDC polling consumes one credit for every queued change in a complete
+transaction, including changes at or before the caller's offset that are
+filtered from the returned batch. The exact boundary is covered by
+`cdc_poll_credits_count_filtered_records_exactly` in
+`crates/rockstream-connectors/tests/cdc_transaction_atomicity_tests.rs`.
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.

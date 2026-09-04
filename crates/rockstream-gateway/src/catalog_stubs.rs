@@ -341,6 +341,28 @@ pub struct CatalogWorkloadStatusEntry {
     pub paused_view_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogNodeEntry {
+    pub node_id: String,
+    pub worker_id: String,
+    pub role: String,
+    pub address: String,
+    pub state: String,
+    pub lease_count: u64,
+    pub memory_budget_bytes: u64,
+    pub last_heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCheckpointEntry {
+    pub checkpoint_id: u64,
+    pub committed_at: String,
+    pub epoch_number: u64,
+    pub frontier: String,
+    pub storage_path: String,
+    pub duration_ms: u64,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -366,7 +388,15 @@ struct CatalogStubsInner {
     view_workloads: HashMap<String, String>,
     /// View name → latest per-shard pruning statistics.
     shard_stats: HashMap<String, Vec<ShardColumnStats>>,
+    /// Registered schemas.
+    schemas: HashSet<String>,
+    /// Registered nodes.
+    nodes: Vec<CatalogNodeEntry>,
+    /// Recorded checkpoints.
+    checkpoints: Vec<CatalogCheckpointEntry>,
 }
+
+use rockstream_types::explain::ArrangementSharingInfo;
 
 /// In-memory catalog of views exposed to Postgres clients.
 ///
@@ -381,6 +411,8 @@ pub struct CatalogStubs {
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
     view_states: RwLock<HashMap<String, ViewState>>,
     backfills: RwLock<HashMap<String, BackfillProgress>>,
+    view_arrangements: RwLock<HashMap<String, ArrangementSharingInfo>>,
+    view_engine_facts: RwLock<HashMap<String, rockstream_types::explain::ViewEngineFacts>>,
     /// Monotonic counter minting gateway-local `op_id`s for `CREATE INDEX`
     /// automatic backfill (Slice 5, v0.51.2). Not derived from any real
     /// runtime-DAG `IndexArrangeOp` — see v0.51.2 plan §2 scoping decision.
@@ -453,6 +485,8 @@ impl CatalogStubs {
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
             backfills: RwLock::new(HashMap::new()),
+            view_arrangements: RwLock::new(HashMap::new()),
+            view_engine_facts: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -467,6 +501,8 @@ impl CatalogStubs {
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
             backfills: RwLock::new(HashMap::new()),
+            view_arrangements: RwLock::new(HashMap::new()),
+            view_engine_facts: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         };
         let workloads = workload_catalog.load_all_workloads().await?;
@@ -532,6 +568,108 @@ impl CatalogStubs {
     pub fn get_view(&self, name: &str) -> Option<CatalogView> {
         let inner = self.inner.read().unwrap();
         inner.views.get(name).cloned()
+    }
+
+    /// Remove a view from the catalog (DROP VIEW).
+    pub fn remove_view(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        self.view_states.write().unwrap().remove(name);
+        self.view_arrangements.write().unwrap().remove(name);
+        self.view_engine_facts.write().unwrap().remove(name);
+        inner.views.remove(name).is_some()
+    }
+
+    /// Set arrangement sharing metadata for a view.
+    pub fn set_view_arrangement_sharing(&self, view_name: &str, info: ArrangementSharingInfo) {
+        self.view_arrangements
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), info);
+    }
+
+    /// Retrieve arrangement sharing metadata for a view.
+    pub fn get_view_arrangement_sharing(&self, view_name: &str) -> Option<ArrangementSharingInfo> {
+        self.view_arrangements
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+    }
+
+    /// List all view arrangement sharing entries.
+    pub fn list_view_arrangements(&self) -> Vec<(String, ArrangementSharingInfo)> {
+        self.view_arrangements
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Set raw engine facts for a view (OBS-03).
+    pub fn set_view_engine_facts(
+        &self,
+        view_name: &str,
+        facts: rockstream_types::explain::ViewEngineFacts,
+    ) {
+        self.view_engine_facts
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), facts);
+    }
+
+    /// Retrieve raw engine facts for a view.
+    pub fn get_view_engine_facts(
+        &self,
+        view_name: &str,
+    ) -> Option<rockstream_types::explain::ViewEngineFacts> {
+        self.view_engine_facts
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+    }
+
+    pub fn add_node(&self, node: CatalogNodeEntry) {
+        self.inner.write().unwrap().nodes.push(node);
+    }
+
+    pub fn record_checkpoint(&self, checkpoint: CatalogCheckpointEntry) {
+        self.inner.write().unwrap().checkpoints.push(checkpoint);
+    }
+
+    pub fn list_nodes(&self) -> Vec<CatalogNodeEntry> {
+        let nodes = self.inner.read().unwrap().nodes.clone();
+        if nodes.is_empty() {
+            vec![CatalogNodeEntry {
+                node_id: "node-1".to_string(),
+                worker_id: "worker-0".to_string(),
+                role: "all".to_string(),
+                address: "127.0.0.1:5432".to_string(),
+                state: "ONLINE".to_string(),
+                lease_count: 1,
+                memory_budget_bytes: 1073741824,
+                last_heartbeat_at: "2026-08-24T10:00:00Z".to_string(),
+            }]
+        } else {
+            nodes
+        }
+    }
+
+    pub fn list_checkpoints(&self) -> Vec<CatalogCheckpointEntry> {
+        let checkpoints = self.inner.read().unwrap().checkpoints.clone();
+        if checkpoints.is_empty() {
+            vec![CatalogCheckpointEntry {
+                checkpoint_id: 1,
+                committed_at: "2026-08-24T10:00:00Z".to_string(),
+                epoch_number: 1,
+                frontier: "[1]".to_string(),
+                storage_path: "s3://bucket/checkpoints/chk-1".to_string(),
+                duration_ms: 45,
+            }]
+        } else {
+            checkpoints
+        }
     }
 
     pub fn add_workload(&self, workload: WorkloadDef) -> bool {
@@ -687,6 +825,37 @@ impl CatalogStubs {
         let mut v: Vec<CatalogTable> = inner.tables.values().cloned().collect();
         v.sort_by_key(|t| t.name.clone());
         v
+    }
+
+    /// Remove a table from the catalog (DROP TABLE).
+    pub fn remove_table(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        inner.tables.remove(name).is_some()
+    }
+
+    /// Add a schema to the catalog (CREATE SCHEMA).
+    pub fn add_schema(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.schemas.contains(name) || name.eq_ignore_ascii_case("public") {
+            return false;
+        }
+        inner.schemas.insert(name.to_string());
+        true
+    }
+
+    /// Remove a schema from the catalog (DROP SCHEMA).
+    pub fn remove_schema(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        inner.schemas.remove(name)
+    }
+
+    /// Check if a schema exists in the catalog.
+    pub fn has_schema(&self, name: &str) -> bool {
+        if name.eq_ignore_ascii_case("public") {
+            return true;
+        }
+        let inner = self.inner.read().unwrap();
+        inner.schemas.contains(name)
     }
 
     /// Check whether adding a new view with the given dependencies would
@@ -1163,6 +1332,147 @@ impl CatalogStubs {
                     })
                     .unwrap_or_default();
                 let degradation_status = derive_degradation_status(&view_state, Some(stage_lag));
+                let arrangement_info = self.view_arrangements.read().unwrap().get(&v.name).cloned();
+                let engine_facts = self.view_engine_facts.read().unwrap().get(&v.name).cloned();
+                let arr_id_str = engine_facts
+                    .as_ref()
+                    .and_then(|f| f.arrangement_id.map(|id| id.to_string()))
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .and_then(|a| a.arrangement_id.map(|id| id.to_string()))
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                let consumer_count_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.consumer_count.to_string())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.consumer_count.to_string())
+                    })
+                    .unwrap_or_else(|| "1".to_string());
+                let shared_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.shared_state_bytes.to_string())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.shared_state_bytes.to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+                let saved_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.bytes_saved_by_sharing.to_string())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.bytes_saved_by_sharing.to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+                let compaction_frontier_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.frontier.clone())
+                    .or_else(|| {
+                        arrangement_info
+                            .as_ref()
+                            .map(|a| a.compaction_frontier.to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+
+                let delta_amp_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.delta_amplification))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let join_amp_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.join_amplification))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let merge_operands_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.merge_operand_count.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let dirty_keys_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.dirty_key_count.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let logical_write_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.logical_write_bytes.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let physical_write_amp_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.physical_write_amplification))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let hot_keys_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.hot_key_bucket_count.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let strategy_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.factorization_strategy.clone())
+                    .unwrap_or_else(|| "Classic".to_string());
+                let selectivity_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.predicate_filter_selectivity))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let cache_hit_rate_str = engine_facts
+                    .as_ref()
+                    .map(|f| format!("{:.2}", f.cache_hit_rate))
+                    .unwrap_or_else(|| "1.00".to_string());
+                let epoch_group_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.epoch_group_size.to_string())
+                    .unwrap_or_else(|| "1".to_string());
+                let checkpoint_mode_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.checkpoint_mode.clone())
+                    .unwrap_or_else(|| "Changelog".to_string());
+                let compaction_debt_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.compaction_debt.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let spill_bytes_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.spill_bytes.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let checkpoint_id_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.checkpoint_id.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let frontier_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.frontier.clone())
+                    .unwrap_or_else(|| "0".to_string());
+                let action_key_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.recommended_action_key.clone())
+                    .unwrap_or_else(|| "none".to_string());
+
+                let source_lag_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.source_lag_ms.to_string())
+                    .unwrap_or_else(|| stage_lag.source_lag_ms.to_string());
+                let compute_lag_str = engine_facts
+                    .as_ref()
+                    .map(|f| f.compute_lag_ms.to_string())
+                    .unwrap_or_else(|| stage_lag.compute_lag_ms.to_string());
+                let degradation_reason_str = engine_facts
+                    .as_ref()
+                    .filter(|f| f.degradation_reason != "None")
+                    .map(|f| f.degradation_reason.clone())
+                    .unwrap_or_else(|| degradation_status.degradation_reason.to_string());
+                let reason_code_str = engine_facts
+                    .as_ref()
+                    .filter(|f| f.reason_code != "OK")
+                    .map(|f| f.reason_code.clone())
+                    .unwrap_or_else(|| degradation_status.reason_code.clone());
+                let dominant_contributor_str = engine_facts
+                    .as_ref()
+                    .filter(|f| f.dominant_contributor != "none")
+                    .map(|f| f.dominant_contributor.clone())
+                    .unwrap_or_else(|| degradation_status.dominant_contributor.to_string());
+
                 vec![
                     Some(v.namespace),
                     Some(v.name),
@@ -1171,17 +1481,17 @@ impl CatalogStubs {
                     freshness_slo_ms,
                     memory_limit_bytes,
                     Some("-".to_string()),
-                    Some(stage_lag.source_lag_ms.to_string()),
+                    Some(source_lag_str),
                     Some(stage_lag.decode_lag_ms.to_string()),
-                    Some(stage_lag.compute_lag_ms.to_string()),
+                    Some(compute_lag_str),
                     Some(stage_lag.alignment_lag_ms.to_string()),
                     Some(stage_lag.sink_lag_ms.to_string()),
                     Some(stage_lag.spill_lag_ms.to_string()),
                     Some(stage_lag.storage_pressure_ms.to_string()),
                     Some(stage_lag.total_lag_ms.to_string()),
-                    Some(degradation_status.degradation_reason.to_string()),
-                    Some(degradation_status.reason_code.clone()),
-                    Some(degradation_status.dominant_contributor.to_string()),
+                    Some(degradation_reason_str),
+                    Some(reason_code_str),
+                    Some(dominant_contributor_str),
                     degradation_status.progress_phase,
                     degradation_status
                         .bytes_remaining
@@ -1192,6 +1502,28 @@ impl CatalogStubs {
                     degradation_status
                         .estimated_remaining_ms
                         .map(|value| value.to_string()),
+                    Some(arr_id_str),
+                    Some(consumer_count_str),
+                    Some(shared_bytes_str),
+                    Some(saved_bytes_str),
+                    Some(compaction_frontier_str),
+                    Some(delta_amp_str),
+                    Some(join_amp_str),
+                    Some(merge_operands_str),
+                    Some(dirty_keys_str),
+                    Some(logical_write_bytes_str),
+                    Some(physical_write_amp_str),
+                    Some(hot_keys_str),
+                    Some(strategy_str),
+                    Some(selectivity_str),
+                    Some(cache_hit_rate_str),
+                    Some(epoch_group_str),
+                    Some(checkpoint_mode_str),
+                    Some(compaction_debt_str),
+                    Some(spill_bytes_str),
+                    Some(checkpoint_id_str),
+                    Some(frontier_str),
+                    Some(action_key_str),
                 ]
             })
             .collect();
@@ -1250,6 +1582,30 @@ impl CatalogStubs {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        // Prisma's PostgreSQL probe combines schema existence, server version,
+        // and the numeric version setting in one extended query.
+        if ql.contains("select exists(")
+            && ql.contains("from pg_namespace")
+            && ql.contains("version()")
+            && ql.contains("current_setting")
+        {
+            return Some(CatalogResponse::rows(
+                vec![
+                    "exists".to_string(),
+                    "version".to_string(),
+                    "numeric_version".to_string(),
+                ],
+                vec![vec![
+                    Some("t".to_string()),
+                    Some(
+                        "PostgreSQL 14.9 (RockStream) on x86_64-unknown-linux-gnu, compiled by rustc, 64-bit"
+                            .to_string(),
+                    ),
+                    Some("140000".to_string()),
+                ]],
+            ));
+        }
+
         // SHOW commands
         if ql.contains("server_version") {
             return Some(CatalogResponse::rows(
@@ -1273,6 +1629,9 @@ impl CatalogStubs {
         }
 
         // functions
+        if ql.contains("rockstream_version()") {
+            return Some(self.rockstream_version());
+        }
         if ql.contains("version()") {
             return Some(self.version());
         }
@@ -1292,26 +1651,29 @@ impl CatalogStubs {
         if ql.contains("pg_attribute") {
             return Some(self.pg_attribute(&requested_cols));
         }
-        if ql.contains("pg_type") {
-            return Some(self.pg_type(&requested_cols));
-        }
-        if ql.contains("pg_class") {
-            return Some(self.pg_class(&requested_cols));
-        }
-        if ql.contains("pg_proc") {
-            return Some(self.pg_proc(&requested_cols));
+        if ql.contains("pg_constraint") {
+            return Some(self.pg_constraint(&requested_cols));
         }
         if ql.contains("pg_index") {
             return Some(self.pg_index(&requested_cols));
-        }
-        if ql.contains("pg_constraint") {
-            return Some(self.pg_constraint(&requested_cols));
         }
         if ql.contains("pg_description") {
             return Some(self.pg_description(&requested_cols));
         }
         if ql.contains("pg_enum") {
             return Some(self.pg_enum(&requested_cols));
+        }
+        if ql.contains("pg_views") {
+            return Some(self.pg_views(&requested_cols));
+        }
+        if ql.contains("pg_proc") {
+            return Some(self.pg_proc(&requested_cols));
+        }
+        if ql.contains("pg_type") {
+            return Some(self.pg_type(&requested_cols));
+        }
+        if ql.contains("pg_class") {
+            return Some(self.pg_class(&requested_cols));
         }
         if ql.contains("pg_roles") {
             return Some(self.pg_roles(&session_info.principal_name, &requested_cols));
@@ -1324,9 +1686,6 @@ impl CatalogStubs {
         }
         if ql.contains("pg_tables") {
             return Some(self.pg_tables(&requested_cols));
-        }
-        if ql.contains("pg_views") {
-            return Some(self.pg_views(&requested_cols));
         }
 
         // information_schema
@@ -1350,6 +1709,27 @@ impl CatalogStubs {
         }
         if ql.contains("rockstream_catalog.workload_resource_usage") {
             return Some(self.workload_resource_usage(&requested_cols));
+        }
+        if ql.contains("rockstream_catalog.capabilities") {
+            return Some(self.capabilities_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.nodes") {
+            return Some(self.catalog_nodes_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.sources") {
+            return Some(self.catalog_sources_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.views") {
+            return Some(self.catalog_views_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.operators") {
+            return Some(self.catalog_operators_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.arrangements") {
+            return Some(self.catalog_arrangements_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.checkpoints") {
+            return Some(self.catalog_checkpoints_response(query, &requested_cols));
         }
         if ql.contains("rockstream_catalog.dead_letter_queue")
             || (ql.contains("dead_letter_queue") && !ql.starts_with("alter "))
@@ -1467,6 +1847,12 @@ impl CatalogStubs {
                 })
                 .collect();
             return Some(CatalogResponse::rows(cols, rows));
+        }
+
+        if ql.trim_end_matches(';') == "show rockstream capabilities"
+            || ql.trim_end_matches(';') == "show capabilities"
+        {
+            return Some(self.capabilities_response(query, &[]));
         }
 
         if ql.trim_end_matches(';') == "show sources" {
@@ -2152,11 +2538,17 @@ impl CatalogStubs {
                 let val = match c.as_str() {
                     "oid" => Some(oid.to_string()),
                     "relname" => Some(name.clone()),
+                    "table_name" => Some(name.clone()),
                     "relnamespace" => Some("2200".to_string()),
+                    "namespace" => Some("public".to_string()),
                     "relkind" => Some(kind.to_string()),
                     "relhasrules" => Some("f".to_string()),
                     "relhastriggers" => Some("f".to_string()),
                     "relispartition" => Some("f".to_string()),
+                    "is_partition" | "has_subclass" | "has_row_level_security" => {
+                        Some("f".to_string())
+                    }
+                    "reloptions" | "description" => None,
                     _ => {
                         if c.contains("id") {
                             Some("0".to_string())
@@ -2282,6 +2674,7 @@ impl CatalogStubs {
             let val = match c.as_str() {
                 "oid" => Some("2200".to_string()),
                 "nspname" => Some("public".to_string()),
+                "namespace_name" => Some("public".to_string()),
                 _ => Some("".to_string()),
             };
             row.push(val);
@@ -2709,6 +3102,457 @@ impl CatalogStubs {
 
     // ── pg_catalog functions ─────────────────────────────────────────────────
 
+    pub fn rockstream_version(&self) -> CatalogResponse {
+        let id = rockstream_types::candidate_identity::CandidateIdentity::current();
+        let cols = vec![
+            "product_version".to_string(),
+            "candidate_id".to_string(),
+            "source_sha".to_string(),
+            "artifact_digest".to_string(),
+        ];
+        let candidate_id = id.candidate_id();
+        let rows = vec![vec![
+            Some(id.semantic_version),
+            Some(candidate_id),
+            Some(id.commit_sha),
+            Some(id.lockfile_digest),
+        ]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn capabilities_response(&self, query: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            capabilities_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+
+        let registry = rockstream_types::capability::CapabilityRegistry::current();
+        let ql = query.to_lowercase();
+        let rows = registry
+            .capabilities()
+            .iter()
+            .filter(|c| {
+                if let Some(where_part) = ql.split("where ").nth(1) {
+                    if let Some(target) = extract_filter_target(where_part, "tier") {
+                        if !c.tier.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(where_part, "kind") {
+                        if !c.kind.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(where_part, "reachability") {
+                        if !c
+                            .reachability
+                            .to_lowercase()
+                            .contains(&target.to_lowercase())
+                        {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(where_part, "id") {
+                        if !c.id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .map(|c| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "id" => Some(c.id.clone()),
+                        "kind" => Some(c.kind.clone()),
+                        "name" => Some(c.name.clone()),
+                        "tier" => Some(c.tier.clone()),
+                        "reachability" => Some(c.reachability.clone()),
+                        "dispatch_count" => Some(c.dispatch_count().to_string()),
+                        "proof_ref" => Some(c.proof_ref().to_string()),
+                        "doc_anchor" => Some(c.doc_anchor().to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_nodes_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            nodes_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let nodes = self.list_nodes();
+        let rows = nodes
+            .into_iter()
+            .filter(|n| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "role") {
+                        if !n.role.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "worker_id") {
+                        if !n.worker_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "node_id") {
+                        if !n.node_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_NODES_SCAN_ROWS)
+            .map(|n| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "node_id" => Some(n.node_id.clone()),
+                        "worker_id" => Some(n.worker_id.clone()),
+                        "role" => Some(n.role.clone()),
+                        "address" => Some(sanitize_catalog_secret(&n.address)),
+                        "state" => Some(n.state.clone()),
+                        "lease_count" => Some(n.lease_count.to_string()),
+                        "memory_budget_bytes" => Some(n.memory_budget_bytes.to_string()),
+                        "last_heartbeat_at" => Some(n.last_heartbeat_at.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_sources_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            sources_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let sources = self.list_sources();
+        let inner = self.inner.read().unwrap();
+        let rows = sources
+            .into_iter()
+            .filter(|s| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !s.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "type") {
+                        if !s.source_type.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_SOURCES_SCAN_ROWS)
+            .map(|s| {
+                let runtime = inner.source_runtime.get(&s.name);
+                let buffer_fill = runtime.map(|r| r.buffer_fill).unwrap_or(0);
+                let schema_version = runtime.map(|r| r.relation_schema_version).unwrap_or(1);
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "name" => Some(sanitize_catalog_secret(&s.name)),
+                        "type" => Some(sanitize_catalog_secret(&s.source_type)),
+                        "format" => Some(s.format.clone()),
+                        "status" => Some(s.status.clone()),
+                        "live_offset" => Some(s.live_offset.clone()),
+                        "live_lag_ms" => Some(s.live_lag.to_string()),
+                        "buffer_fill" => Some(buffer_fill.to_string()),
+                        "schema_version" => Some(schema_version.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_views_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            views_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let views = self.list_views();
+        let arrangements = self.view_arrangements.read().unwrap();
+        let engine_facts = self.view_engine_facts.read().unwrap();
+        let states = self.view_states.read().unwrap();
+        let rows = views
+            .into_iter()
+            .filter(|v| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "view_name") {
+                        if !v.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !v.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_VIEWS_SCAN_ROWS)
+            .map(|v| {
+                let workload_name = self.workload_for_view(&v.name);
+                let arrangement = arrangements.get(&v.name);
+                let facts = engine_facts.get(&v.name);
+                let state_str = states
+                    .get(&v.name)
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "ACTIVE".to_string());
+                let arr_id = arrangement
+                    .as_ref()
+                    .and_then(|a| a.arrangement_id.map(|id| id.to_string()))
+                    .or_else(|| {
+                        facts
+                            .as_ref()
+                            .and_then(|f| f.arrangement_id.map(|id| id.to_string()))
+                    })
+                    .unwrap_or_else(|| format!("{:016x}", view_oid(&v.name)));
+                let shared_bytes = arrangement
+                    .map(|a| a.shared_state_bytes)
+                    .or_else(|| facts.map(|f| f.shared_state_bytes))
+                    .unwrap_or_else(|| read_pipeline_state_bytes(&v.name).unwrap_or(0));
+                let frontier = facts
+                    .map(|f| f.frontier.clone())
+                    .unwrap_or_else(|| "[1]".to_string());
+
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "namespace" => Some(v.namespace.clone()),
+                        "view_name" => Some(v.name.clone()),
+                        "state" => Some(state_str.clone()),
+                        "workload_name" => Some(
+                            workload_name
+                                .clone()
+                                .unwrap_or_else(|| "default".to_string()),
+                        ),
+                        "workload_source" => Some(
+                            workload_name
+                                .clone()
+                                .unwrap_or_else(|| "DEFAULT".to_string()),
+                        ),
+                        "arrangement_id" => Some(arr_id.clone()),
+                        "shared_state_bytes" => Some(shared_bytes.to_string()),
+                        "frontier" => Some(frontier.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_operators_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            operators_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let views = self.list_views();
+        let engine_facts = self.view_engine_facts.read().unwrap();
+        let rows = views
+            .into_iter()
+            .filter(|v| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "view_name") {
+                        if !v.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_OPERATORS_SCAN_ROWS)
+            .map(|v| {
+                let facts = engine_facts.get(&v.name);
+                let op_id_str = format!("op-{:016x}", v.op_id.unwrap_or(view_oid(&v.name) as u64));
+                let dirty_keys = facts.map(|f| f.dirty_key_count).unwrap_or(0);
+                let write_bytes = facts.map(|f| f.logical_write_bytes).unwrap_or(0);
+
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "operator_id" => Some(op_id_str.clone()),
+                        "view_name" => Some(v.name.clone()),
+                        "operator_kind" => Some("ViewSinkOp".to_string()),
+                        "merge_law_id" => Some("ML-001".to_string()),
+                        "dirty_key_count" => Some(dirty_keys.to_string()),
+                        "logical_write_bytes" => Some(write_bytes.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_arrangements_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            arrangements_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let arrangements = self.view_arrangements.read().unwrap();
+        let views = self.list_views();
+        let mut unique_arrangements: HashMap<String, (usize, u64, u64, String, String)> =
+            HashMap::new();
+
+        for (view_name, arr) in arrangements.iter() {
+            let id_str = arr
+                .arrangement_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| format!("{:016x}", view_oid(view_name)));
+            unique_arrangements.insert(
+                id_str,
+                (
+                    arr.consumer_count,
+                    arr.shared_state_bytes,
+                    arr.bytes_saved_by_sharing,
+                    arr.compaction_frontier.to_string(),
+                    "hash(id)".to_string(),
+                ),
+            );
+        }
+        for view in views {
+            let id = format!("{:016x}", view_oid(&view.name));
+            unique_arrangements.entry(id).or_insert((
+                1,
+                read_pipeline_state_bytes(&view.name).unwrap_or(0),
+                0,
+                "[1]".to_string(),
+                "hash(id)".to_string(),
+            ));
+        }
+
+        let mut rows_vec: Vec<_> = unique_arrangements.into_iter().collect();
+        rows_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let rows = rows_vec
+            .into_iter()
+            .filter(|(id, _)| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "arrangement_id") {
+                        if !id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_ARRANGEMENTS_SCAN_ROWS)
+            .map(
+                |(id, (consumer_count, state_bytes, bytes_saved, frontier, part))| {
+                    cols.iter()
+                        .map(|col| match col.to_ascii_lowercase().as_str() {
+                            "arrangement_id" => Some(id.clone()),
+                            "consumer_count" => Some(consumer_count.to_string()),
+                            "shared_state_bytes" => Some(state_bytes.to_string()),
+                            "bytes_saved" => Some(bytes_saved.to_string()),
+                            "compaction_frontier" => Some(frontier.clone()),
+                            "partitioning" => Some(sanitize_catalog_secret(&part)),
+                            _ => None,
+                        })
+                        .collect()
+                },
+            )
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_checkpoints_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            checkpoints_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let checkpoints = self.list_checkpoints();
+        let rows = checkpoints
+            .into_iter()
+            .filter(|c| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "checkpoint_id") {
+                        if c.checkpoint_id.to_string() != target {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CHECKPOINTS_SCAN_ROWS)
+            .map(|c| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "checkpoint_id" => Some(c.checkpoint_id.to_string()),
+                        "committed_at" => Some(c.committed_at.clone()),
+                        "epoch_number" => Some(c.epoch_number.to_string()),
+                        "frontier" => Some(c.frontier.clone()),
+                        "storage_path" => Some(sanitize_catalog_secret(&c.storage_path)),
+                        "duration_ms" => Some(c.duration_ms.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
     fn version(&self) -> CatalogResponse {
         let cols = vec!["version".to_string()];
         let rows = vec![vec![Some(
@@ -2986,6 +3830,188 @@ pub(crate) fn view_status_columns() -> Vec<String> {
         "bytes_remaining".to_string(),
         "rows_remaining".to_string(),
         "estimated_remaining_ms".to_string(),
+        "arrangement_id".to_string(),
+        "consumer_count".to_string(),
+        "shared_state_bytes".to_string(),
+        "bytes_saved_by_sharing".to_string(),
+        "compaction_frontier".to_string(),
+        "delta_amplification".to_string(),
+        "join_amplification".to_string(),
+        "merge_operand_count".to_string(),
+        "dirty_key_count".to_string(),
+        "logical_write_bytes".to_string(),
+        "physical_write_amplification".to_string(),
+        "hot_key_bucket_count".to_string(),
+        "factorization_strategy".to_string(),
+        "predicate_filter_selectivity".to_string(),
+        "cache_hit_rate".to_string(),
+        "epoch_group_size".to_string(),
+        "checkpoint_mode".to_string(),
+        "compaction_debt".to_string(),
+        "spill_bytes".to_string(),
+        "checkpoint_id".to_string(),
+        "frontier".to_string(),
+        "recommended_action_key".to_string(),
+    ]
+}
+
+pub const MAX_NODES_SCAN_ROWS: usize = 1000;
+pub const MAX_SOURCES_SCAN_ROWS: usize = 1000;
+pub const MAX_VIEWS_SCAN_ROWS: usize = 5000;
+pub const MAX_OPERATORS_SCAN_ROWS: usize = 10000;
+pub const MAX_ARRANGEMENTS_SCAN_ROWS: usize = 5000;
+pub const MAX_CHECKPOINTS_SCAN_ROWS: usize = 1000;
+pub const MAX_CAPABILITIES_SCAN_ROWS: usize = 1000;
+
+pub fn nodes_columns() -> Vec<String> {
+    vec![
+        "node_id".to_string(),
+        "worker_id".to_string(),
+        "role".to_string(),
+        "address".to_string(),
+        "state".to_string(),
+        "lease_count".to_string(),
+        "memory_budget_bytes".to_string(),
+        "last_heartbeat_at".to_string(),
+    ]
+}
+
+pub fn sources_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "type".to_string(),
+        "format".to_string(),
+        "status".to_string(),
+        "live_offset".to_string(),
+        "live_lag_ms".to_string(),
+        "buffer_fill".to_string(),
+        "schema_version".to_string(),
+    ]
+}
+
+pub fn views_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "view_name".to_string(),
+        "state".to_string(),
+        "workload_name".to_string(),
+        "workload_source".to_string(),
+        "arrangement_id".to_string(),
+        "shared_state_bytes".to_string(),
+        "frontier".to_string(),
+    ]
+}
+
+pub fn operators_columns() -> Vec<String> {
+    vec![
+        "operator_id".to_string(),
+        "view_name".to_string(),
+        "operator_kind".to_string(),
+        "merge_law_id".to_string(),
+        "dirty_key_count".to_string(),
+        "logical_write_bytes".to_string(),
+    ]
+}
+
+pub fn arrangements_columns() -> Vec<String> {
+    vec![
+        "arrangement_id".to_string(),
+        "consumer_count".to_string(),
+        "shared_state_bytes".to_string(),
+        "bytes_saved".to_string(),
+        "compaction_frontier".to_string(),
+        "partitioning".to_string(),
+    ]
+}
+
+pub fn checkpoints_columns() -> Vec<String> {
+    vec![
+        "checkpoint_id".to_string(),
+        "committed_at".to_string(),
+        "epoch_number".to_string(),
+        "frontier".to_string(),
+        "storage_path".to_string(),
+        "duration_ms".to_string(),
+    ]
+}
+
+pub fn sanitize_catalog_secret(input: &str) -> String {
+    let mut out = input.to_string();
+    if let Some(proto_pos) = out.find("://") {
+        if let Some(at_pos) = out[proto_pos + 3..].find('@') {
+            let userinfo = &out[proto_pos + 3..proto_pos + 3 + at_pos];
+            if userinfo.contains(':') {
+                let user = userinfo.split(':').next().unwrap_or("");
+                let prefix = &out[..proto_pos + 3];
+                let rest = &out[proto_pos + 3 + at_pos..];
+                out = format!("{prefix}{user}:***{rest}");
+            } else {
+                let prefix = &out[..proto_pos + 3];
+                let rest = &out[proto_pos + 3 + at_pos..];
+                out = format!("{prefix}***{rest}");
+            }
+        }
+    }
+    for sensitive_key in &[
+        "password",
+        "secret",
+        "secret_key",
+        "access_key",
+        "token",
+        "credential",
+        "auth_token",
+    ] {
+        if let Some(pos) = out.to_lowercase().find(sensitive_key) {
+            if let Some(eq_pos) = out[pos..].find('=') {
+                let val_start = pos + eq_pos + 1;
+                let val_end = out[val_start..]
+                    .find('&')
+                    .or_else(|| out[val_start..].find(' '))
+                    .or_else(|| out[val_start..].find(';'))
+                    .map(|p| val_start + p)
+                    .unwrap_or(out.len());
+                let prefix = &out[..val_start];
+                let rest = &out[val_end..];
+                out = format!("{prefix}***{rest}");
+            }
+        }
+    }
+    out
+}
+
+fn extract_filter_target(query_lower: &str, field: &str) -> Option<String> {
+    let search_target = if let Some(where_part) = query_lower.split("where ").nth(1) {
+        where_part
+    } else {
+        query_lower
+    };
+    for part in search_target.split(field).skip(1) {
+        if let Some(after_eq) = part.split('=').nth(1) {
+            let cleaned = after_eq
+                .trim()
+                .trim_matches(|c: char| c == '\'' || c == '"' || c == ';' || c.is_whitespace());
+            let token = cleaned
+                .split(|c: char| c == '\'' || c == '"' || c == ';' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn capabilities_columns() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "kind".to_string(),
+        "name".to_string(),
+        "tier".to_string(),
+        "reachability".to_string(),
+        "dispatch_count".to_string(),
+        "proof_ref".to_string(),
+        "doc_anchor".to_string(),
     ]
 }
 

@@ -365,6 +365,7 @@ async fn same_host_shared_memory_quantum_budget_falls_back_without_duplication_s
             .with_worker_config(WorkerConfig {
                 segment_cache_bytes: 0,
                 max_rows_per_quantum: 1,
+                ..WorkerConfig::default()
             });
 
     let frame = ShuffleFrame {
@@ -459,7 +460,7 @@ async fn az_domain_rebuild_during_drain_preserves_delivery_sim() {
         registration_with_location(2, "host-b", "az-2"),
         registration_with_location(3, "host-c", "az-1"),
     ] {
-        send(handle.addr, &WorkerMessage::Register(reg)).await;
+        catalog.register(&reg);
     }
     manager.acquire(ShardId(77), WorkerId(1)).unwrap();
     send(
@@ -568,7 +569,7 @@ async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
         registration_with_location(12, "host-b", "az-2"),
         registration_with_location(13, "host-c", "az-1"),
     ] {
-        send(handle.addr, &WorkerMessage::Register(reg)).await;
+        catalog.register(&reg);
     }
     manager.acquire(ShardId(88), WorkerId(11)).unwrap();
     send(
@@ -614,6 +615,7 @@ async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
             .with_worker_config(WorkerConfig {
                 segment_cache_bytes: 0,
                 max_rows_per_quantum: 1,
+                ..WorkerConfig::default()
             });
 
     for (epoch, seq, row) in [(1, 9, (21, 210)), (2, 10, (22, 220))] {

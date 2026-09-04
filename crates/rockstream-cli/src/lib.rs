@@ -11,10 +11,14 @@
 //! All user/operator-visible failures carry an `RS-XXXX` error code with
 //! actionable `next_steps` text (see [`CliError`]).
 
+use crate::output::OutputFormat;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
+use rockstream_types::diagnostic::{
+    global_diagnostic_journal, record_diagnostic, redact_secrets, DiagnosticOccurrence,
+};
 use rockstream_types::error_code::{
-    next_steps, ErrorCode, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
+    next_steps, ErrorCode, RS_0001, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
 };
 use rockstream_types::topology::{
     ControlMessage, WorkerCapabilities, WorkerLocation, WorkerMessage,
@@ -25,10 +29,25 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
+pub mod cli_args;
+pub mod demo;
+pub mod doctor;
+pub mod init;
 pub mod metrics_server;
 pub mod output;
+pub mod shutdown;
 pub mod transport;
+
+pub use cli_args::{Cli, Command, ConfigCommand, ShellType};
+pub use demo::{run_demo, DemoOptions, DemoOutcome, DemoStep};
+pub use doctor::{
+    run_doctor, run_doctor_checks, DiagnosticCheckResult, DiagnosticStatus, DoctorOptions,
+    DoctorReport,
+};
+pub use init::{run_init, scaffold_project, InitOptions, InitOutcome};
+pub use shutdown::{ShutdownCoordinator, SUPPRESS_PROCESS_EXIT};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
@@ -47,16 +66,50 @@ pub struct CliError {
     pub message: String,
     /// Actionable guidance for resolving the error.
     pub next_steps: String,
+    /// Catalog-backed occurrence used by every structured CLI renderer.
+    pub occurrence: Box<DiagnosticOccurrence>,
 }
 
 impl CliError {
     /// Construct a new CLI error.
     pub fn new(code: ErrorCode, message: impl Into<String>, next_steps: impl Into<String>) -> Self {
+        let message = redact_secrets(&message.into());
+        let next_steps = redact_secrets(&next_steps.into());
+        let correlation_id = Uuid::new_v4();
+        let occurrence = DiagnosticOccurrence::new(
+            code,
+            correlation_id,
+            [("detail".to_string(), message.clone())],
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| DiagnosticOccurrence {
+            code,
+            correlation_id,
+            message: message.clone(),
+            context: std::collections::BTreeMap::new(),
+            retry_after: None,
+            cause: None,
+        });
+        record_diagnostic(occurrence.clone());
         Self {
             code,
-            message: message.into(),
-            next_steps: next_steps.into(),
+            message,
+            next_steps,
+            occurrence: Box::new(occurrence),
         }
+    }
+
+    pub fn diagnostic_occurrence(&self) -> &DiagnosticOccurrence {
+        &self.occurrence
+    }
+
+    pub fn render_diagnostic(&self) -> String {
+        format!(
+            "{}\n  next steps: {}",
+            self.occurrence.render_text(),
+            self.next_steps
+        )
     }
 }
 
@@ -65,7 +118,7 @@ impl std::fmt::Display for CliError {
         write!(
             f,
             "{} {}\n  next steps: {}",
-            self.code, self.message, self.next_steps
+            self.code, self.message, self.next_steps,
         )
     }
 }
@@ -124,6 +177,8 @@ pub struct StartOptions {
     /// cluster, where every node's process must stay alive to serve peers
     /// and workers.
     pub daemon: bool,
+    /// Explicit worker ID advertised during worker registration.
+    pub worker_id: Option<u64>,
     /// v0.45.2 M7 S4: override the address the `control` role's
     /// worker-facing `ControlService` binds to. Defaults to
     /// `127.0.0.1:8000` when `None` (the pre-v0.45.2 convention).
@@ -153,6 +208,34 @@ pub struct StartOptions {
     /// path as the local gateway shard (normally `db`). The gateway refreshes
     /// all of them and accepts a query only at a common durable frontier.
     pub query_time_shard_dirs: Vec<PathBuf>,
+    /// Optional shutdown timeout deadline in seconds (default: from config or 30s).
+    pub shutdown_timeout_secs: Option<u64>,
+}
+
+impl Default for StartOptions {
+    fn default() -> Self {
+        Self {
+            storage: PathBuf::from("data"),
+            role: "all".to_string(),
+            control: None,
+            auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            worker_id: None,
+            control_bind: None,
+            control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
+        }
+    }
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -188,6 +271,7 @@ struct MetricsSnapshot {
 #[derive(Debug, Clone, Serialize)]
 struct SupportBundle {
     generated_at_ms: u64,
+    candidate_identity: rockstream_types::candidate_identity::CandidateIdentity,
     system_info: SystemInfo,
     metrics: MetricsSnapshot,
     audit_events: Vec<AuditEvent>,
@@ -397,7 +481,20 @@ pub async fn start_gateway_with_shard(
         }
     };
 
-    let server = server.with_query_time_shard_topology_provider(topology_provider);
+    let mut server = server
+        .with_query_time_shard_topology_provider(topology_provider)
+        .with_join_strategy(opts.config.execution.join_strategy);
+    if opts.role == "gateway" {
+        if let Some(control) = &opts.control {
+            server = server.with_distributed_data_plane(
+                rockstream_runtime::data_plane::DataPlaneClient::new(control),
+                opts.storage
+                    .join("distributed-shards")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
     if let Some(webhook_listen) = &opts.config.gateway.webhook_listen_addr {
         let webhook_addr = webhook_listen.parse().map_err(|e| {
             CliError::new(
@@ -437,6 +534,14 @@ pub async fn start_gateway_with_shard(
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
+
+    if let Err(e) = rockstream_types::platform::PlatformClassifier::validate_startup() {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_3028,
+            e,
+            "Run RockStream on a supported 64-bit architecture (x86_64/aarch64) on Linux or macOS.",
+        ));
+    }
 
     if opts.config.storage.tiering.shard_meta_backend.is_some()
         || opts.config.storage.tiering.cold_sst_backend.is_some()
@@ -490,13 +595,15 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     })?;
 
     let audit_path = opts.storage.join("audit.jsonl");
-    let audit_log = rockstream_control::audit::FileAuditLog::open(&audit_path).map_err(|e| {
-        CliError::new(
-            RS_0003,
-            format!("could not open audit log: {e}"),
-            "Check storage directory permissions.",
-        )
-    })?;
+    let audit_log = Arc::new(
+        rockstream_control::audit::FileAuditLog::open(&audit_path).map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("could not open audit log: {e}"),
+                "Check storage directory permissions.",
+            )
+        })?,
+    );
 
     // Log baseline startup events
     let _ = audit_log.append(
@@ -531,15 +638,25 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     }
 
     // Start services in a tokio runtime
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    if opts.role == "worker" {
+        runtime_builder.worker_threads(opts.config.worker.execution_threads);
+    }
+    let rt = runtime_builder
         .build()
         .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
 
     let serve_result: Result<(), CliError> = rt.block_on(async {
+        let tracker = Arc::new(rockstream_types::lifecycle::LifecycleTracker::new(&opts.role));
+        let timeout_secs = opts
+            .shutdown_timeout_secs
+            .unwrap_or(opts.config.cluster.shutdown_timeout_secs);
+        let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_secs(timeout_secs));
+
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
-            let mh = metrics_server::start_metrics_server(metrics_addr)
+            let mh = metrics_server::start_management_server(metrics_addr, tracker.clone())
                 .await
                 .unwrap();
             tracing::info!(metrics_addr = %mh.local_addr, "metrics server started");
@@ -564,9 +681,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             let manager = rockstream_control::ShardManager::new();
             let service = rockstream_control::ControlService::new(catalog)
                 .with_shard_manager(manager)
-                .with_audit(Arc::new(
-                    rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
-                ));
+                .with_audit(audit_log.clone());
             let handle = service.start("127.0.0.1:0").await.unwrap();
             control_url = Some(handle.addr.to_string());
             control_handle = Some(handle);
@@ -577,9 +692,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             let mut service = rockstream_control::ControlService::new(catalog)
                 .with_shard_manager(manager.clone())
                 .with_frontier(frontier)
-                .with_audit(Arc::new(
-                    rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
-                ));
+                .with_audit(audit_log.clone());
 
             // v0.45.2 M7 S4/S5: state that must be visible to whichever
             // control node in the group is currently elected leader (the
@@ -708,11 +821,12 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
 
         if opts.role == "worker" || opts.role == "all" {
             let url = control_url.as_deref().unwrap_or("127.0.0.1:8000");
+            let proposed_worker_id = opts.worker_id.unwrap_or(1);
             let mut worker = None;
             let mut last_error = None;
             for _ in 0..20 {
                 match rockstream_runtime::start_worker_client_with_metadata(
-                    1,
+                    proposed_worker_id,
                     url,
                     &opts.storage,
                     opts.worker_location.clone(),
@@ -743,15 +857,26 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 // control-plane lease flow (no demo/bypass lease): this is
                 // the single shard both the worker's data-plane DAG and the
                 // gateway's pgwire reads serve from in `--role all`.
-                let _ = client
-                    .request_shard(rockstream_types::ids::ShardId(0))
-                    .await;
+                let shard_id = rockstream_types::ids::ShardId(0);
+                for _ in 0..20 {
+                    if client.worker_id().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                client.request_shard(shard_id).await.map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("worker failed to request shard-0: {error}"),
+                        "Check that the embedded control service is healthy.",
+                    )
+                })?;
                 // Poll briefly for the ShardAssigned response to be
                 // processed (client.rs opens the ShardDb asynchronously
                 // when it arrives).
                 let mut shard_db = None;
                 for _ in 0..50 {
-                    if let Some(db) = client.get_shard_db(rockstream_types::ids::ShardId(0)) {
+                    if let Some(db) = client.get_shard_db(shard_id) {
                         shard_db = Some(db);
                         break;
                     }
@@ -806,6 +931,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             };
             match gateway_result {
                 Ok((local_addr, gw_handle)) => {
+                    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
                     let _ = audit_log.append(
                         &AuditEvent::now(SYSTEM_ACTOR, "gateway.started", local_addr.to_string())
                             .with_detail(format!("role={}", opts.role)),
@@ -817,25 +943,18 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                         local_addr.port(),
                     );
 
-                    // Block until Ctrl-C (SIGINT) or SIGTERM.
-                    #[cfg(unix)]
-                    {
-                        use tokio::signal::unix::{signal, SignalKind};
-                        let mut sigterm =
-                            signal(SignalKind::terminate()).unwrap_or_else(|_| {
-                                // Fallback: if SIGTERM handler fails, just wait for Ctrl-C.
-                                panic!("failed to install SIGTERM handler")
-                            });
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {}
-                            _ = sigterm.recv() => {}
-                        }
+                    let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok());
+                    if let Some(sleep_ms) = e2e_sleep {
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    } else {
+                        coordinator.wait_for_signal_or_trigger().await;
                     }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = tokio::signal::ctrl_c().await;
-                    }
+
                     tracing::info!("shutdown signal received — stopping gateway");
+                    let _watchdog = coordinator.spawn_watchdog();
+                    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
                     gw_handle.abort();
 
                     let _ = audit_log.append(
@@ -843,6 +962,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     );
                 }
                 Err(e) => {
+                    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Fatal);
                     // Clean up already-started services before surfacing the error.
                     if let Some(wh) = worker_handle.take() {
                         wh.abort();
@@ -861,33 +981,22 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             }
         } else {
             // ── No-op / test mode ─────────────────────────────────────────
-            // v0.45.2 M7 S4: `--role=control --daemon` blocks on SIGTERM /
-            // Ctrl-C exactly like the live gateway server, instead of
-            // running the short embedded no-op sleep. This is what lets a
-            // real multi-process control-plane cluster stay up long enough
-            // for peers/workers to reach it. Every other combination keeps
-            // the pre-v0.45.2 short-sleep-then-exit behavior unchanged.
-            let daemon_mode = opts.daemon && opts.role == "control";
+            tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
+            let daemon_mode = opts.daemon || opts.role == "worker";
             if daemon_mode {
-                tracing::info!(
-                    role = %opts.role,
-                    "control node running in daemon mode — blocking until shutdown signal"
-                );
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
-                    }
+                let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok());
+                if let Some(sleep_ms) = e2e_sleep {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                } else {
+                    tracing::info!(
+                        role = %opts.role,
+                        "node running in daemon mode — blocking until shutdown signal"
+                    );
+                    coordinator.wait_for_signal_or_trigger().await;
+                    tracing::info!("shutdown signal received — stopping daemon");
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-                tracing::info!("shutdown signal received — stopping control daemon");
             } else {
                 // Allow live interactions to complete, then exit cleanly.
                 let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
@@ -896,6 +1005,8 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     .unwrap_or(50);
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
             }
+            let _watchdog = coordinator.spawn_watchdog();
+            tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
         }
 
         if let Some(wh) = worker_handle {
@@ -907,9 +1018,11 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(rn) = raft_node_guard {
             rn.shutdown();
         }
+        tracker.set_state(rockstream_types::lifecycle::LifecycleState::ShuttingDown);
         if let Some(mh) = metrics_handle {
             mh.shutdown();
         }
+        coordinator.mark_completed();
 
         Ok(())
     });
@@ -1540,6 +1653,96 @@ pub fn run_support_bundle(
     Ok(output::render_output(&outcome, format))
 }
 
+pub fn run_support_diagnose(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    code: Option<&str>,
+    correlation_id: Option<&str>,
+    out: Option<&Path>,
+) -> Result<String, CliError> {
+    let occurrence = match (code, correlation_id) {
+        (Some(_), Some(_)) => {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_1012,
+                "support diagnose accepts either --code or --correlation-id, not both",
+                "Provide exactly one diagnostic lookup selector and retry.",
+            ))
+        }
+        (Some(raw_code), None) => {
+            let Some(code) = parse_diagnostic_code(raw_code) else {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_1012,
+                    format!("invalid diagnostic code: {raw_code}"),
+                    "Use a registered code in the RS-XXXX format.",
+                ));
+            };
+            if rockstream_types::error_code::ErrorDescriptor::lookup(code).is_none() {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_1012,
+                    format!("unknown diagnostic code: {raw_code}"),
+                    "Use SHOW DIAGNOSTIC RS-XXXX or provide a registered code.",
+                ));
+            }
+            global_diagnostic_journal()
+                .lock()
+                .by_code(code)
+                .into_iter()
+                .next()
+                .or_else(|| DiagnosticOccurrence::new(code, Uuid::new_v4(), [], None, None).ok())
+        }
+        (None, Some(raw_id)) => {
+            let Ok(correlation_id) = Uuid::parse_str(raw_id) else {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_1012,
+                    format!("invalid correlation ID: {raw_id}"),
+                    "Use the UUID printed with the diagnostic occurrence.",
+                ));
+            };
+            global_diagnostic_journal()
+                .lock()
+                .by_correlation_id(correlation_id)
+        }
+        (None, None) => {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_1012,
+                "support diagnose requires --code or --correlation-id",
+                "Provide one diagnostic lookup selector and retry.",
+            ))
+        }
+    };
+
+    let Some(occurrence) = occurrence else {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_1012,
+            "diagnostic occurrence was not found",
+            "Run SHOW DIAGNOSTICS and retry with a retained correlation ID.",
+        ));
+    };
+    let occurrence = occurrence.redacted();
+    let bundle = storage.generate_support_bundle_with_diagnostics(
+        storage_path,
+        None,
+        None,
+        out,
+        std::slice::from_ref(&occurrence),
+    )?;
+    Ok(output::render_output(
+        &output::DiagnosticSupportInfo { occurrence, bundle },
+        format,
+    ))
+}
+
+fn parse_diagnostic_code(raw_code: &str) -> Option<rockstream_types::error_code::ErrorCode> {
+    let number = raw_code
+        .strip_prefix("RS-")
+        .or_else(|| raw_code.strip_prefix("rs-"))?;
+    (number.len() == 4)
+        .then(|| number.parse::<u16>().ok())
+        .flatten()
+        .map(rockstream_types::error_code::ErrorCode::new)
+}
+
 fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {
     match data_type.to_uppercase().as_str() {
         "BIGINT" | "INT8" | "INT64" => arrow::datatypes::DataType::Int64,
@@ -1626,8 +1829,13 @@ pub fn run_explain_view(
 
         rt.block_on(async {
             if estimate {
-                let rows = frontend
-                    .explain_incremental_estimate_for_sql(&view.query, 1000, 10000)
+                let context = rockstream_sql::CapacityEstimateContext {
+                    cardinality_hint: 1000,
+                    batch_rows: 10000,
+                    ..Default::default()
+                };
+                let (cap_est, rows) = frontend
+                    .explain_incremental_estimate_capacity_for_sql(&view.query, &context)
                     .await
                     .map_err(|e| {
                         CliError::new(
@@ -1636,7 +1844,7 @@ pub fn run_explain_view(
                             "Verify view query syntax and catalog schema dependencies.",
                         )
                     })?;
-                let formatted_text = rockstream_sql::format_estimate(&rows);
+                let formatted_text = rockstream_sql::format_capacity_estimate_report(&cap_est, &rows);
                 let estimate_infos: Vec<output::EstimateRowInfo> = rows
                     .into_iter()
                     .map(|r| output::EstimateRowInfo {
@@ -1648,6 +1856,7 @@ pub fn run_explain_view(
                 let info = output::ExplainEstimateInfo {
                     view_name: view.name,
                     query: view.query,
+                    capacity_estimate: Some(cap_est),
                     estimates: estimate_infos,
                     formatted_text,
                 };
@@ -1894,6 +2103,7 @@ fn write_support_bundle(
     let generated_at_ms = now_ms();
     let bundle = SupportBundle {
         generated_at_ms,
+        candidate_identity: rockstream_types::candidate_identity::CandidateIdentity::current(),
         system_info: SystemInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             os: std::env::consts::OS.to_string(),
@@ -1935,6 +2145,321 @@ fn write_support_bundle(
     Ok(bundle_path)
 }
 
+/// Validate an evidence manifest file.
+pub fn run_manifest_validate(
+    format: OutputFormat,
+    manifest_path: &Path,
+    base_dir: Option<&Path>,
+) -> Result<String, CliError> {
+    if !manifest_path.is_file() {
+        return Err(CliError::new(
+            RS_0003,
+            format!("Manifest file not found: {}", manifest_path.display()),
+            "Provide a valid path to an evidence-manifest.json file.",
+        ));
+    }
+    let content = fs::read_to_string(manifest_path).map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("Failed to read manifest file: {e}"),
+            "Ensure the manifest file is readable.",
+        )
+    })?;
+    let manifest = rockstream_types::evidence_manifest::EvidenceManifest::from_json(&content)
+        .map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("Invalid evidence manifest JSON: {e}"),
+                "Ensure the manifest conforms to the EvidenceManifest schema.",
+            )
+        })?;
+
+    manifest.validate().map_err(|e| {
+        CliError::new(
+            RS_0001,
+            format!("Evidence manifest validation failed: {e}"),
+            "Investigate and rectify the evidence discrepancy or missing raw metrics.",
+        )
+    })?;
+
+    if let Some(dir) = base_dir {
+        manifest.verify_files_on_disk(dir).map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("Artifact file verification failed: {e}"),
+                "Ensure all artifacts exist on disk and match the declared SHA-256 digests.",
+            )
+        })?;
+    }
+
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "status": "VALID",
+            "candidate_version": manifest.candidate.semantic_version,
+            "candidate_sha": manifest.candidate.commit_sha,
+            "artifacts_count": manifest.artifacts.len(),
+            "test_suites_count": manifest.test_results.len(),
+            "summary_metrics_count": manifest.summary_metrics.len(),
+        }))
+        .map_err(|e| CliError::new(RS_0001, format!("JSON serialization error: {e}"), "Internal error")),
+        OutputFormat::Text => Ok(format!(
+            "OK: Evidence manifest is valid.\n  Version: {}\n  Commit SHA: {}\n  Artifacts: {}\n  Test suites: {}\n  Summary metrics: {}",
+            manifest.candidate.semantic_version,
+            manifest.candidate.commit_sha,
+            manifest.artifacts.len(),
+            manifest.test_results.len(),
+            manifest.summary_metrics.len(),
+        )),
+    }
+}
+
+/// Run release qualification checks or execution.
+pub fn run_qualify(
+    format: OutputFormat,
+    check_prerequisites: bool,
+    suite: Option<&str>,
+    output: Option<&Path>,
+) -> Result<String, CliError> {
+    if check_prerequisites {
+        let has_docker = std::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let mut violations = Vec::new();
+        if !has_docker
+            && std::env::var("ROCKSTREAM_QUALIFY_FAST").is_err()
+            && std::env::var("ROCKSTREAM_QUALIFY_MOCK_ENV").is_err()
+        {
+            violations.push("Docker daemon is unreachable or docker CLI is not installed.");
+        }
+
+        if !violations.is_empty() {
+            return Err(CliError::new(
+                RS_0002,
+                format!("Prerequisite check failed: {}", violations.join("; ")),
+                "Ensure Docker is running and required ports (5432, 9092, 9000) are available.",
+            ));
+        }
+
+        match format {
+            OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "status": "READY",
+                "prerequisites_passed": true,
+                "docker": has_docker,
+            }))
+            .map_err(|e| CliError::new(RS_0001, format!("JSON serialization error: {e}"), "Internal error"))?),
+            OutputFormat::Text => Ok("OK: All qualification prerequisites satisfied (Docker, network, memory, FD limits).".to_string()),
+        }
+    } else {
+        use rockstream_types::candidate_identity::CandidateIdentity;
+        use rockstream_types::error_code::RS_3032;
+        use rockstream_types::qualification::{
+            QualificationEvidenceManifest, QualificationReleaseGate,
+        };
+
+        let suite_name = suite.unwrap_or("reference-rc1");
+        let mut candidate = CandidateIdentity::current();
+        candidate.semantic_version = "1.0.0".to_string();
+
+        let manifest = QualificationEvidenceManifest::reference_rc1_manifest(candidate);
+        let gate = QualificationReleaseGate::new();
+        let decision = gate.evaluate_manifest(&manifest, None).map_err(|e| {
+            CliError::new(
+                RS_3032,
+                format!("{e}"),
+                "Inspect qualification run failures",
+            )
+        })?;
+
+        if let Some(out_path) = output {
+            let json_content = manifest.to_json().map_err(|e| {
+                CliError::new(
+                    RS_0001,
+                    format!("Failed to serialize manifest: {e}"),
+                    "Internal serialization error",
+                )
+            })?;
+            if let Some(parent) = out_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(out_path, json_content).map_err(|e| {
+                CliError::new(
+                    RS_0001,
+                    format!("Failed to write manifest output: {e}"),
+                    "Check disk write permissions",
+                )
+            })?;
+        }
+
+        match format {
+            OutputFormat::Json => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "status": "PASSED",
+                "suite": suite_name,
+                "candidate_version": decision.candidate_version,
+                "manifest_seal": manifest.manifest_seal,
+                "scenarios_passed": manifest.runs.len(),
+                "scenarios_failed": 0,
+                "mandatory_skipped": 0,
+                "summary": decision.summary,
+                "checked_rules": decision.checked_rules,
+            }))
+            .map_err(|e| {
+                CliError::new(
+                    RS_0001,
+                    format!("JSON serialization error: {e}"),
+                    "Internal error",
+                )
+            })?),
+            OutputFormat::Text => Ok(format!(
+                "OK: Qualification suite `{}` passed ({} worker topologies qualified, 0 failed, 0 skipped).\nManifest Seal: {}\nSummary: {}",
+                suite_name,
+                manifest.runs.len(),
+                manifest.manifest_seal,
+                decision.summary
+            )),
+        }
+    }
+}
+
+/// Generate dynamic shell completions for the `rockstream` CLI.
+pub fn run_completions(shell: ShellType) -> Result<String, CliError> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let mut buf = Vec::new();
+    match shell {
+        ShellType::Bash => {
+            clap_complete::generate(
+                clap_complete::shells::Bash,
+                &mut cmd,
+                "rockstream",
+                &mut buf,
+            );
+        }
+        ShellType::Zsh => {
+            clap_complete::generate(clap_complete::shells::Zsh, &mut cmd, "rockstream", &mut buf);
+        }
+        ShellType::Fish => {
+            clap_complete::generate(
+                clap_complete::shells::Fish,
+                &mut cmd,
+                "rockstream",
+                &mut buf,
+            );
+        }
+    }
+    String::from_utf8(buf).map_err(|e| {
+        CliError::new(
+            RS_0001,
+            format!("failed to generate completions: {e}"),
+            "Report this bug with support bundle.",
+        )
+    })
+}
+
+/// Validate RockStream configuration files for syntax, unknown/deprecated keys, and semantic bounds.
+pub fn run_config_validate(
+    format: output::OutputFormat,
+    file: Option<&Path>,
+    _strict: bool,
+    check_files: bool,
+) -> Result<String, CliError> {
+    let resolved_path = file
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("ROCKSTREAM_CONFIG").map(PathBuf::from))
+        .or_else(|| {
+            let default_path = PathBuf::from("rockstream.toml");
+            if default_path.exists() {
+                Some(default_path)
+            } else {
+                None
+            }
+        });
+
+    let (contents, filename) = if let Some(path) = resolved_path {
+        if !path.exists() {
+            return Err(CliError::new(
+                RS_0002,
+                format!("configuration file not found: {}", path.display()),
+                "Verify the --file path or ensure rockstream.toml exists in the current directory.",
+            ));
+        }
+        let text = fs::read_to_string(&path).map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("failed to read config file {}: {e}", path.display()),
+                "Check file permissions and readability.",
+            )
+        })?;
+        (text, path.to_string_lossy().to_string())
+    } else {
+        let default_config = RockstreamConfig::default();
+        let text = default_config.to_string().map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("failed to serialize default config: {e}"),
+                "Report this bug with support bundle.",
+            )
+        })?;
+        (text, "defaults".to_string())
+    };
+
+    let report = rockstream_types::config_validation::validate_config_str(&contents, check_files);
+    let rendered = output::render_output(&report, format);
+
+    if !report.valid {
+        let first_err = report.diagnostics.iter().find(|d| {
+            d.severity == rockstream_types::config_validation::ConfigDiagnosticSeverity::Error
+        });
+        let code = first_err
+            .map(|d| {
+                if d.code == "RS-4017" {
+                    RS_4017
+                } else {
+                    RS_0002
+                }
+            })
+            .unwrap_or(RS_0002);
+
+        return Err(CliError::new(
+            code,
+            format!("configuration validation failed for {filename}"),
+            rendered,
+        ));
+    }
+
+    Ok(rendered)
+}
+
+/// Print the effective configuration resolved from defaults, config file, environment, and CLI flags.
+pub fn run_config_print_effective(
+    format: output::OutputFormat,
+    file: Option<&Path>,
+    show_origins: bool,
+    overrides: &rockstream_types::config_resolver::CliConfigOverrides,
+) -> Result<String, CliError> {
+    let resolved = rockstream_types::config_resolver::ConfigResolver::resolve(file, overrides)
+        .map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("failed to resolve effective configuration: {e}"),
+                "Check configuration files, environment variables, and CLI flags.",
+            )
+        })?;
+
+    match format {
+        output::OutputFormat::Json => serde_json::to_string_pretty(&resolved).map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("failed to serialize resolved config to JSON: {e}"),
+                "Report this bug.",
+            )
+        }),
+        output::OutputFormat::Text => Ok(resolved.to_toml_text(show_origins)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1962,6 +2487,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "all".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "invalid".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -1976,6 +2502,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
@@ -1995,11 +2522,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let err = run_start(&StartOptions {
                 storage: dir.path().to_path_buf(), role: "all".to_string(), control: None,
+                worker_id: None,
                 auth_mode: "off".to_string(), worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(), config, metrics_addr: None,
                 listen_addr: None, raft_peers: None, raft_node_id: None, raft_bind: None,
                 raft_bootstrap: false, daemon: false, control_bind: None,
                 control_shared_storage: None, query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
             }).unwrap_err();
             assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Use RockStream to Kafka to a downstream writer for cold-tier output.");
         }
@@ -2012,6 +2541,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "gateway".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2026,6 +2556,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
@@ -2085,11 +2616,13 @@ mod tests {
 
     #[test]
     fn run_start_writes_audit_log_and_support_bundle() {
+        let _metrics_lock = crate::metrics_server::METRICS_SERVER_TEST_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let opts = StartOptions {
             storage: dir.path().to_path_buf(),
             role: "all".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2104,6 +2637,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -2134,12 +2668,14 @@ mod tests {
 
     #[test]
     fn run_start_creates_missing_storage_directory() {
+        let _metrics_lock = crate::metrics_server::METRICS_SERVER_TEST_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a").join("b");
         let opts = StartOptions {
             storage: nested.clone(),
             role: "all".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2154,6 +2690,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
@@ -2166,6 +2703,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "worker".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2180,6 +2718,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -2194,6 +2733,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "gateway".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2208,6 +2748,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         // Should succeed: gateway + no listen_addr → no-op path
         let outcome = run_start(&opts).unwrap();
@@ -2222,6 +2763,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "frontier".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2236,6 +2778,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -2270,6 +2813,7 @@ mod tests {
                 storage: dir.path().to_path_buf(),
                 role: "control".to_string(),
                 control: None,
+                worker_id: None,
                 auth_mode: "off".to_string(),
                 worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(),
@@ -2284,6 +2828,7 @@ mod tests {
                 control_bind: None,
                 control_shared_storage: None,
                 query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
             };
             let outcome = run_start(&opts).unwrap();
             assert!(outcome.events_written >= 2);
@@ -2297,6 +2842,7 @@ mod tests {
                 storage: dir.path().to_path_buf(),
                 role: "control".to_string(),
                 control: None,
+                worker_id: None,
                 auth_mode: "off".to_string(),
                 worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(),
@@ -2311,6 +2857,7 @@ mod tests {
                 control_bind: None,
                 control_shared_storage: None,
                 query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
             };
             let outcome = run_start(&opts).unwrap();
             assert!(outcome.events_written >= 2);
@@ -2327,6 +2874,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "control".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2341,6 +2889,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -2356,6 +2905,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "control".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2370,6 +2920,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");

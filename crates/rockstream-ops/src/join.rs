@@ -46,6 +46,7 @@ use tracing::debug;
 
 use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::KeyCapsule;
 
 use crate::error::OpError;
 use crate::zset::ArrowZSet;
@@ -310,17 +311,18 @@ impl JoinOp {
     }
 
     /// Extract the join key bytes from a row (as big-endian i64 bytes concatenated).
-    fn extract_key(row: &RecordBatch, row_idx: usize, key_cols: &[usize]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(key_cols.len() * 8);
-        for &col in key_cols {
-            let arr = row
-                .column(col)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("join key column must be Int64");
-            key.extend_from_slice(&arr.value(row_idx).to_be_bytes());
-        }
-        key
+    fn extract_key(
+        row: &RecordBatch,
+        row_idx: usize,
+        key_cols: &[usize],
+    ) -> Result<Option<Vec<u8>>, OpError> {
+        let arrays: Vec<&dyn arrow::array::Array> = key_cols
+            .iter()
+            .map(|column| row.column(*column).as_ref())
+            .collect();
+        let capsule = KeyCapsule::from_arrays(&arrays, row_idx)
+            .map_err(|error| OpError::unsupported_plan_node(error.to_string()))?;
+        Ok((!capsule.contains_null()).then(|| capsule.typed_bytes().to_vec()))
     }
 
     /// Serialize all columns of a row (excluding any weight column) as bytes.
@@ -336,9 +338,11 @@ impl JoinOp {
     /// Deserialize a row from bytes into Int64 column values (n_cols columns).
     fn deserialize_row(bytes: &[u8], n_cols: usize) -> Vec<i64> {
         bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .take(n_cols)
-            .map(|c| i64::from_be_bytes(c.try_into().unwrap()))
+            .map(|c| i64::from_be_bytes(*c))
             .collect()
     }
 
@@ -375,7 +379,10 @@ impl JoinOp {
 
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
-            let join_key = Self::extract_key(&delta.data, row_idx, &self.left_key_cols);
+            let Some(join_key) = Self::extract_key(&delta.data, row_idx, &self.left_key_cols)?
+            else {
+                continue;
+            };
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
             let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
 
@@ -422,7 +429,10 @@ impl JoinOp {
 
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
-            let join_key = Self::extract_key(&delta.data, row_idx, &self.right_key_cols);
+            let Some(join_key) = Self::extract_key(&delta.data, row_idx, &self.right_key_cols)?
+            else {
+                continue;
+            };
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
             let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
 
@@ -513,11 +523,45 @@ impl JoinOp {
     ///
     /// Returns the combined `ΔL ⋈ R₀ + L₀ ⋈ ΔR + ΔL ⋈ ΔR` output.
     pub fn process_epoch(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch_with_counters(left, right)
+            .map(|(output, _)| output)
+    }
+
+    pub(crate) fn process_epoch_with_counters(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        let input_deltas = (left.num_rows() + right.num_rows()) as u64;
         let left_out = self.process_left_delta(left)?;
         let right_out = self.process_right_delta(right)?;
+        let (arrangement_probes, state_writes) = {
+            let left_staged = self.left_staged.lock().unwrap();
+            let right_staged = self.right_staged.lock().unwrap();
+            (
+                (left_staged.rows.len() + right_staged.rows.len()) as u64,
+                left_staged
+                    .rows
+                    .iter()
+                    .chain(&right_staged.rows)
+                    .filter(|(_, _, _, weight)| *weight != 0)
+                    .count() as u64,
+            )
+        };
         let correction = self.commit_epoch()?;
         let out_schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        concat_zsets(vec![left_out, right_out, correction], out_schema)
+        let output = concat_zsets(vec![left_out, right_out, correction], out_schema)?;
+        Ok((
+            output,
+            crate::governor::DeltaAmplificationCounters {
+                input_deltas,
+                probes: arrangement_probes,
+                shuffled_bytes: 0,
+                intermediate_tuples: 0,
+                output_deltas: 0,
+                state_writes,
+            },
+        ))
     }
 
     /// Fill-level metric for the left arrangement.

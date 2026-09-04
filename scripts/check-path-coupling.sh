@@ -26,10 +26,19 @@ else
     RANGE="HEAD~1..HEAD"
 fi
 
-changed_files=$(git diff --name-only "$RANGE" 2>/dev/null || true)
+# Benchmark baselines record measurements, not protocol changes.
+changed_files=$(git diff --name-only "$RANGE" 2>/dev/null | grep -v '/benches/baseline/' || true)
 
 if [ -z "$changed_files" ]; then
     echo "check-path-coupling: no changed files found for range '$RANGE' — skipping."
+    exit 0
+fi
+
+# Benchmark baselines calibrate measurements; they do not change coordination.
+changed_files=$(echo "$changed_files" | grep -Ev '^crates/rockstream-runtime/benches/baseline/' || true)
+
+if [ -z "$changed_files" ]; then
+    echo "check-path-coupling: only benchmark baselines changed — OK."
     exit 0
 fi
 

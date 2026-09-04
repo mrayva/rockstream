@@ -26,6 +26,7 @@ use rockstream_types::ids::OperatorId;
 use crate::aggregate::{append_agg_state, persist_agg_state, AggregateOp};
 use crate::distinct::{persist_distinct_state, DistinctOp};
 use crate::error::OpError;
+use crate::factorized::FactorizedJoinAggregateOp;
 use crate::join::JoinOp;
 use crate::op::Operator;
 use crate::outer_join::OuterJoinOp;
@@ -1395,13 +1396,62 @@ impl MultiAggregatePipeline {
 pub enum JoinKind {
     Inner(Arc<JoinOp>),
     Outer(Arc<OuterJoinOp>),
+    Factorized(Arc<FactorizedJoinAggregateOp>),
 }
 
 impl JoinKind {
-    fn process_epoch(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
+    fn process_epoch(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
         match self {
-            JoinKind::Inner(op) => op.process_epoch(left, right),
-            JoinKind::Outer(op) => op.process_epoch(left, right),
+            JoinKind::Inner(op) => op.process_epoch_with_counters(left, right),
+            JoinKind::Outer(op) => {
+                let input_deltas = (left.num_rows() + right.num_rows()) as u64;
+                let state_writes = left
+                    .weights
+                    .iter()
+                    .chain(&right.weights)
+                    .filter(|weight| **weight != 0)
+                    .count() as u64;
+                let output = op.process_epoch(left, right)?;
+                Ok((
+                    output,
+                    crate::governor::DeltaAmplificationCounters {
+                        input_deltas,
+                        probes: state_writes,
+                        state_writes,
+                        ..Default::default()
+                    },
+                ))
+            }
+            JoinKind::Factorized(op) => {
+                let before = op.governor().counters();
+                let output = op.process_epoch(left, right)?;
+                let after = op.governor().counters();
+                Ok((
+                    output,
+                    crate::governor::DeltaAmplificationCounters {
+                        input_deltas: after.input_deltas.saturating_sub(before.input_deltas),
+                        probes: after.probes.saturating_sub(before.probes),
+                        shuffled_bytes: after.shuffled_bytes.saturating_sub(before.shuffled_bytes),
+                        intermediate_tuples: after
+                            .intermediate_tuples
+                            .saturating_sub(before.intermediate_tuples),
+                        output_deltas: after.output_deltas.saturating_sub(before.output_deltas),
+                        state_writes: after.state_writes.saturating_sub(before.state_writes),
+                    },
+                ))
+            }
+        }
+    }
+
+    fn op_id(&self) -> OperatorId {
+        match self {
+            JoinKind::Inner(op) => op.op_id(),
+            JoinKind::Outer(op) => op.op_id(),
+            JoinKind::Factorized(op) => op.op_id(),
         }
     }
 
@@ -1409,13 +1459,15 @@ impl JoinKind {
         match self {
             JoinKind::Inner(op) => op.persist_state(db).await,
             JoinKind::Outer(op) => op.persist_state(db).await,
+            JoinKind::Factorized(op) => op.persist_state(db).await,
         }
     }
 
-    fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
+    async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
         match self {
             JoinKind::Inner(op) => op.append_state(target),
             JoinKind::Outer(op) => op.append_state(target),
+            JoinKind::Factorized(op) => op.append_state_with_db(db, target).await,
         }
     }
 
@@ -1429,6 +1481,7 @@ impl JoinKind {
         match self {
             JoinKind::Inner(op) => op.restore_in_place(db).await,
             JoinKind::Outer(_) => Ok(()),
+            JoinKind::Factorized(op) => op.restore_in_place(db).await,
         }
     }
 }
@@ -1473,6 +1526,21 @@ impl JoinPipeline {
         }
     }
 
+    pub fn strategy(&self) -> &'static str {
+        match &self.join {
+            JoinKind::Factorized(_) => "factorized",
+            JoinKind::Inner(_) | JoinKind::Outer(_) => "classic",
+        }
+    }
+
+    pub fn selection_rule_version(&self) -> u32 {
+        crate::governor::FACTORIZED_SELECTION_RULE_VERSION
+    }
+
+    pub fn predicate_transfer_rule_version(&self) -> u32 {
+        1
+    }
+
     /// Process one commit's left-source delta and right-source delta
     /// (either or both may be empty) through the full join pipeline,
     /// returning the combined output delta.
@@ -1489,10 +1557,49 @@ impl JoinPipeline {
         for stage in &self.right_pre {
             right = stage.process(right, 0)?;
         }
-        let mut out = self.join.process_epoch(left, right)?;
+        let (mut out, work) = self.join.process_epoch(left, right)?;
+        let classic = !matches!(self.join, JoinKind::Factorized(_));
+        let mut flattened_intermediate_tuples = 0;
+        let mut counted_intermediates = false;
         for stage in &self.post {
+            if classic
+                && !counted_intermediates
+                && matches!(
+                    stage,
+                    Stage::Aggregate(_) | Stage::MinMax(_, _) | Stage::MultiAggregate(_)
+                )
+            {
+                flattened_intermediate_tuples = out.num_rows() as u64;
+                counted_intermediates = true;
+            }
             out = stage.process(out, 0)?;
         }
+        let strategy = if classic {
+            rockstream_types::metrics::R1ExecutionStrategy::Classic
+        } else {
+            rockstream_types::metrics::R1ExecutionStrategy::Factorized
+        };
+        let (factor_payload_rows, factor_payload_bytes) = match &self.join {
+            JoinKind::Factorized(op) => (
+                op.factor_payload_rows() as u64,
+                op.factor_payload_bytes() as u64,
+            ),
+            JoinKind::Inner(_) | JoinKind::Outer(_) => (0, 0),
+        };
+        rockstream_types::metrics::record_current_r1_execution(
+            self.join.op_id(),
+            strategy,
+            rockstream_types::metrics::R1ExecutionCounters {
+                input_deltas: work.input_deltas,
+                arrangement_probes: work.probes,
+                flattened_intermediate_tuples,
+                output_deltas: out.num_rows() as u64,
+                changed_state_writes: work.state_writes,
+                factor_payload_rows,
+                factor_payload_bytes,
+                ..Default::default()
+            },
+        );
         Ok(out)
     }
 
@@ -1514,7 +1621,7 @@ impl JoinPipeline {
     }
 
     pub async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
-        self.join.append_state(target)?;
+        self.join.append_state(db, target).await?;
         for stage in self
             .left_pre
             .iter()

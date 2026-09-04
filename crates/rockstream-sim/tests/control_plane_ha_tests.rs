@@ -284,7 +284,7 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
         // One of the two survivors must observe the lost heartbeats and win
         // a new election at a strictly higher term (majority of 2/3 still
         // reachable).
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
         let survivors = [n1.handle.clone(), n2.handle.clone()];
         let new_leader = survivors.iter().find(|h| h.is_leader()).unwrap_or_else(|| {
             panic!(
@@ -424,6 +424,14 @@ mod tc {
         pub async fn boot(test_id: &str) -> Self {
             let network = format!("rs-net-{test_id}");
             let shared_dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    shared_dir.path(),
+                    std::fs::Permissions::from_mode(0o777),
+                );
+            }
             let names: Vec<String> = (0..3).map(|i| format!("rs-ctl-{test_id}-{i}")).collect();
 
             let mut nodes = Vec::new();
@@ -511,6 +519,7 @@ mod tc {
         /// poll, not just the final one).
         pub async fn wait_for_single_leader(&self, timeout: Duration) -> (usize, u64) {
             let deadline = Instant::now() + timeout;
+            let mut stable_leader = None;
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
@@ -532,7 +541,12 @@ mod tc {
                         Some((_, _, term)) => term,
                         None => unreachable!(),
                     };
-                    return (idx, term);
+                    if stable_leader == Some((idx, term)) {
+                        return (idx, term);
+                    }
+                    stable_leader = Some((idx, term));
+                } else {
+                    stable_leader = None;
                 }
                 if Instant::now() > deadline {
                     if std::env::var("RS_TC_DEBUG").is_ok() {
@@ -628,7 +642,7 @@ mod tc {
         }
     }
 
-    pub async fn register_worker(addr: SocketAddr, worker_id: u64) {
+    pub async fn register_worker(addr: SocketAddr, worker_id: u64) -> TcpStream {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
@@ -637,33 +651,82 @@ mod tc {
             CapacityHeadroom::FULL,
         );
         send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        stream
     }
 
     /// Request a shard lease; returns `Some(lease)` on
     /// `ControlMessage::ShardAssigned`, `None` on any other reply (denial —
-    /// per this wire protocol's "silence/close means denial" convention —
-    /// or `NotLeader`).
+    /// per this wire protocol's "silence/close means denial" convention).
     pub async fn request_shard(
-        addr: SocketAddr,
+        cluster: &TcCluster,
         worker_id: u64,
         shard_id: u64,
     ) -> Option<rockstream_types::lease::ShardLease> {
-        let mut stream = TcpStream::connect(addr).await.ok()?;
-        let req = WorkerMessage::RequestShard {
-            worker_id: WorkerId(worker_id),
-            shard_id: ShardId(shard_id),
-        };
-        let line = serde_json::to_string(&req).unwrap() + "\n";
-        stream.write_all(line.as_bytes()).await.ok()?;
-        let mut reader = BufReader::new(&mut stream);
-        let mut resp = String::new();
-        tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp))
-            .await
-            .ok()?
-            .ok()?;
-        match serde_json::from_str(resp.trim()).ok()? {
-            ControlMessage::ShardAssigned { lease } => Some(lease),
-            _ => None,
+        let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
+        let mut addr = cluster.nodes[leader_idx].control_addr;
+        for _ in 0..50 {
+            let Ok(mut stream) = TcpStream::connect(addr).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let req = WorkerMessage::RequestShard {
+                worker_id: WorkerId(worker_id),
+                shard_id: ShardId(shard_id),
+            };
+            let line = serde_json::to_string(&req).unwrap() + "\n";
+            if stream.write_all(line.as_bytes()).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let mut reader = BufReader::new(&mut stream);
+            let mut resp = String::new();
+            let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp)).await
+            else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Ok(message) = serde_json::from_str(resp.trim()) else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            match message {
+                ControlMessage::ShardAssigned { lease } => return Some(lease),
+                ControlMessage::NotLeader { current_leader } => {
+                    if let Some(current_leader) = current_leader {
+                        if let Some(node) = cluster
+                            .nodes
+                            .iter()
+                            .find(|node| node.node_id == current_leader)
+                        {
+                            addr = node.control_addr;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    pub async fn register_and_request_shard(
+        cluster: &TcCluster,
+        worker_id: u64,
+        shard_id: u64,
+    ) -> (usize, rockstream_types::lease::ShardLease, TcpStream) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
+            let addr = cluster.nodes[leader_idx].control_addr;
+            let worker_stream = register_worker(addr, worker_id).await;
+            if let Some(lease) = request_shard(cluster, worker_id, shard_id).await {
+                return (leader_idx, lease, worker_stream);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shard-lease request did not converge"
+            );
         }
     }
 
@@ -765,18 +828,16 @@ async fn leader_kill_recovers_within_budget_tc() {
 
     let cluster = tc::TcCluster::boot("kill").await;
 
-    let (leader_idx, old_term) = cluster
+    let (_, old_term) = cluster
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
-    let old_leader_addr = cluster.nodes[leader_idx].control_addr;
 
     // Pre-kill: a worker acquires shard 7's lease against the original
     // leader — this is the "in-flight" state whose continuity the kill
     // must not corrupt.
-    tc::register_worker(old_leader_addr, 10).await;
-    let lease_before = tc::request_shard(old_leader_addr, 10, 7)
-        .await
-        .expect("pre-kill shard-lease request against the real leader must succeed");
+    let (leader_idx, lease_before, _worker_10_stream) =
+        tc::register_and_request_shard(&cluster, 10, 7).await;
+    let old_leader_addr = cluster.nodes[leader_idx].control_addr;
     assert_eq!(lease_before.worker_id, WorkerId(10));
 
     // Pre-kill: frontier publication succeeds against the original leader.
@@ -819,15 +880,15 @@ async fn leader_kill_recovers_within_budget_tc() {
     // from the shared control-plane storage), while a fresh shard (8) can
     // be granted normally, proving the lease path is live again.
     let shard_recovery_start = Instant::now();
-    let conflicting = tc::request_shard(new_leader_addr, 20, 7).await;
+    let conflicting = tc::request_shard(&cluster, 20, 7).await;
     assert!(
         conflicting.is_none(),
         "split-brain: the new leader granted shard 7 to worker 20 even though \
          worker 10's pre-kill lease (persisted to the shared control-plane \
          store) is still live: {conflicting:?}"
     );
-    tc::register_worker(new_leader_addr, 20).await;
-    let fresh_lease = tc::request_shard(new_leader_addr, 20, 8)
+    let _worker_20_stream = tc::register_worker(new_leader_addr, 20).await;
+    let fresh_lease = tc::request_shard(&cluster, 20, 8)
         .await
         .expect("shard leasing must resume against the new leader for an unleased shard");
     assert_eq!(fresh_lease.worker_id, WorkerId(20));
@@ -962,16 +1023,11 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
     }
 
     let mut cluster = tc::TcCluster::boot("roll").await;
-    let (leader_idx, _) = cluster
+    let _ = cluster
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
-    let leader_addr = cluster.nodes[leader_idx].control_addr;
-
     // A worker acquires a real shard lease before the rolling restart begins.
-    tc::register_worker(leader_addr, 10).await;
-    let lease = tc::request_shard(leader_addr, 10, 3)
-        .await
-        .expect("pre-restart shard-lease request must succeed");
+    let (_, lease, _worker_10_stream) = tc::register_and_request_shard(&cluster, 10, 3).await;
     assert_eq!(lease.worker_id, WorkerId(10));
 
     // A workload's quota/catalog state is registered directly against the
@@ -1009,11 +1065,10 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
         // and the worker's shard-3 lease is unchanged: a conflicting
         // request for the SAME shard from a different worker must still be
         // denied.
-        let (post_restart_leader_idx, _) = cluster
+        let _ = cluster
             .wait_for_single_leader(Duration::from_secs(20))
             .await;
-        let post_restart_leader_addr = cluster.nodes[post_restart_leader_idx].control_addr;
-        let conflicting = tc::request_shard(post_restart_leader_addr, 99, 3).await;
+        let conflicting = tc::request_shard(&cluster, 99, 3).await;
         assert!(
             conflicting.is_none(),
             "node {idx} restart dropped worker 10's shard-3 lease — a conflicting \

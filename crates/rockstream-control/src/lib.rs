@@ -16,16 +16,20 @@
 //! - [`tls`] — mTLS configuration scaffolding
 
 pub mod acl;
+pub mod arrangement;
 pub mod audit;
+pub mod capacity_store;
 pub mod checkpoint;
 pub mod checkpoint_export;
 pub mod checkpoint_store;
 pub mod config_deriver;
+pub mod freshness;
 pub mod frontier;
 pub mod kek;
 pub mod migration;
 pub mod namespace;
 pub mod placement;
+pub mod qualification_store;
 pub mod raft;
 pub mod scheduler;
 pub mod secret_store;
@@ -38,21 +42,31 @@ pub mod topology;
 
 // Re-export commonly used top-level types.
 pub use acl::{AclError, AclStore};
-pub use checkpoint::{CheckpointCoordinator, CoordinatorError, DEFAULT_ALIGNMENT_MAX_CREDITS};
+pub use capacity_store::CapacityThresholdStore;
+pub use checkpoint::{
+    ChangelogCheckpointContribution, CheckpointCoordinator, CoordinatorError,
+    DEFAULT_ALIGNMENT_MAX_CREDITS,
+};
 pub use checkpoint_export::{
     CheckpointExportError, CheckpointExportOutcome, CheckpointExportService,
     CheckpointRestoreOutcome, MAX_CHECKPOINT_EXPORT_OBJECTS_IN_FLIGHT,
     MAX_CHECKPOINT_EXPORT_OBJECT_BYTES, MAX_CHECKPOINT_EXPORT_SCAN_WINDOW,
 };
 pub use checkpoint_store::CheckpointManifestStore;
+pub use freshness::{
+    AdmissionMode, CheckpointMode, FreshnessAction, FreshnessBounds, FreshnessController,
+    FreshnessObservation,
+};
 pub use frontier::{AggregatorError, FrontierAggregator};
 pub use kek::{AwsKmsKekProvider, EnvKekProvider, KekError, KekProvider};
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
-    MigrationError, MigrationFillLevel, MigrationPersistentStore, MigrationShard, PhaseClocks,
+    MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationPersistentStore,
+    MigrationShard, PhaseClocks, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
 };
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
+pub use qualification_store::QualificationEvidenceStore;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
 pub use service::{ControlService, ControlServiceHandle};

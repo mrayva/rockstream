@@ -102,10 +102,15 @@ pub struct WriteBuffer {
 impl WriteBuffer {
     /// Create a new empty write buffer with the default limit.
     pub fn new() -> Self {
+        Self::with_limit_bytes(WRITE_BUFFER_LIMIT_BYTES)
+    }
+
+    /// Create an empty buffer with an explicit limit.
+    pub fn with_limit_bytes(limit_bytes: usize) -> Self {
         WriteBuffer {
             ops: Vec::new(),
             byte_count: 0,
-            limit_bytes: WRITE_BUFFER_LIMIT_BYTES,
+            limit_bytes,
             savepoints: Vec::new(),
         }
     }
@@ -131,6 +136,11 @@ impl WriteBuffer {
     pub fn drain(&mut self) -> Vec<DmlOp> {
         self.byte_count = 0;
         std::mem::take(&mut self.ops)
+    }
+
+    /// Read-only slice of buffered operations.
+    pub fn ops(&self) -> &[DmlOp] {
+        &self.ops
     }
 
     /// Clear without returning the ops.

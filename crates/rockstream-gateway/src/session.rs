@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rockstream_types::diagnostic::DiagnosticOccurrence;
+
 /// Maximum GUC parameters stored per connection.
 /// Fill-level metric: `guc_params.len()`.
 /// Backpressure: excess SET commands are silently accepted but not stored.
@@ -71,7 +73,7 @@ impl FreshnessToken {
 /// Maximum number of cursors open simultaneously per connection.
 /// Fill-level metric: `cursors.len()`.
 /// Backpressure: `RS-2052` / SQLSTATE 42P03.
-pub const MAX_CURSORS_PER_CONNECTION: usize = 100;
+pub const MAX_CURSORS_PER_CONNECTION: usize = rockstream_types::limits::MAX_CURSORS_PER_CONN;
 
 /// Transaction status byte — mirrors the Postgres ReadyForQuery status byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,9 +109,7 @@ pub struct CursorState {
 /// Session-scoped NOTICE queued for the next query response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionNotice {
-    pub severity: String,
-    pub sqlstate: String,
-    pub message: String,
+    pub occurrence: DiagnosticOccurrence,
 }
 
 /// Per-connection session state.

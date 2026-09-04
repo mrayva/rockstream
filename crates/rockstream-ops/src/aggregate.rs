@@ -41,7 +41,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use tracing::debug;
 
-use rockstream_plan::virtual_bucket::route_virtual_bucket;
+use rockstream_plan::virtual_bucket::{
+    normalize_power_of_two_bucket_count, route_power_of_two_bucket,
+};
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::sum_count::avg_from_sum_count;
@@ -272,6 +274,33 @@ impl AggState {
         wb
     }
 
+    /// Encode only the mutations for the dirty keys as a `Vec<StateMutation>`.
+    pub fn encode_mutations_for_keys(
+        &self,
+        op_id: OperatorId,
+        dirty_keys: &[i64],
+    ) -> Vec<rockstream_types::state_mutation::StateMutation> {
+        let mut mutations = Vec::with_capacity(dirty_keys.len());
+        for &k in dirty_keys {
+            let key_bytes =
+                ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
+            if let Some(&(sum, count)) = self.entries.get(&k) {
+                let mut val = [0u8; 16];
+                val[..8].copy_from_slice(&sum.to_be_bytes());
+                val[8..].copy_from_slice(&count.to_be_bytes());
+                mutations.push(rockstream_types::state_mutation::StateMutation::Put {
+                    key: key_bytes,
+                    value: bytes::Bytes::copy_from_slice(&val),
+                });
+            } else {
+                mutations.push(rockstream_types::state_mutation::StateMutation::Delete {
+                    key: key_bytes,
+                });
+            }
+        }
+        mutations
+    }
+
     /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
     ///
     /// `raw_entries` is the result of scanning the `op_state` namespace for
@@ -323,6 +352,7 @@ impl AggState {
 /// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
 pub struct AggregateOp {
     state: Mutex<AggState>,
+    dirty_keys: Mutex<std::collections::HashSet<i64>>,
     pub op_id: OperatorId,
 }
 
@@ -331,6 +361,7 @@ impl AggregateOp {
     pub fn new(op_id: OperatorId) -> Self {
         AggregateOp {
             state: Mutex::new(AggState::new()),
+            dirty_keys: Mutex::new(std::collections::HashSet::new()),
             op_id,
         }
     }
@@ -339,6 +370,7 @@ impl AggregateOp {
     pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
         AggregateOp {
             state: Mutex::new(state),
+            dirty_keys: Mutex::new(std::collections::HashSet::new()),
             op_id,
         }
     }
@@ -394,27 +426,19 @@ impl AggregateOp {
     pub fn state_bytes(&self) -> u64 {
         self.state.lock().unwrap().state_bytes()
     }
-}
 
-impl Operator for AggregateOp {
-    fn name(&self) -> &str {
-        "AggregateOp"
-    }
-
-    fn state_bytes(&self) -> u64 {
-        self.state_bytes()
-    }
-
-    /// Apply one Z-set delta batch through the aggregate arrangement.
-    ///
-    /// For each row `(k, v, weight)`:
-    /// - Compute the state transition.
-    /// - Emit retraction of old aggregate row (if group existed).
-    /// - Emit insertion of new aggregate row (if group still exists).
-    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+    /// Process one Z-set delta batch and return the output delta and delta-native state mutations.
+    pub fn process_delta_with_result(
+        &self,
+        delta: ArrowZSet,
+    ) -> Result<crate::op::OperatorEpochResult, OpError> {
         let started_at = Instant::now();
         if delta.is_empty() {
-            return Ok(ArrowZSet::empty(output_schema()));
+            return Ok(crate::op::OperatorEpochResult::new(
+                ArrowZSet::empty(output_schema()),
+                Vec::new(),
+                rockstream_types::state_mutation::OperatorEpochMetrics::default(),
+            ));
         }
 
         // Validate input schema: need at least 2 Int64 columns (k, v).
@@ -464,16 +488,6 @@ impl Operator for AggregateOp {
 
         let n = delta.num_rows();
 
-        // Consolidate input: sum weights for identical (k, v) pairs before
-        // processing.  Without this, the DBSP bilinear join rule can emit
-        // multiple rows for the same (key, value) with weights that net to
-        // zero or a single unit — e.g. (-1, -1, +1) for a concurrent
-        // retraction from both sides — and processing them individually
-        // causes the group count to transiently hit 0, which deletes the
-        // group entry and corrupts the running sum for that epoch.
-        //
-        // Preserving insertion order for equal net weight ensures deterministic
-        // output ordering across platforms.
         let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
             std::collections::HashMap::new();
         let mut order: Vec<(i64, i64)> = Vec::new();
@@ -488,7 +502,6 @@ impl Operator for AggregateOp {
             *entry += w;
         }
 
-        // Output vecs — pre-allocate for 2 output rows per consolidated input row.
         let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
@@ -496,6 +509,7 @@ impl Operator for AggregateOp {
         let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
 
         let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+        let mut dirty_keys = std::collections::HashSet::new();
 
         for (k, v) in &order {
             let k = *k;
@@ -506,6 +520,7 @@ impl Operator for AggregateOp {
             }
 
             let (old_state, new_state) = state.apply_delta(k, v, w)?;
+            dirty_keys.insert(k);
 
             // Retract old aggregate row.
             if let Some((old_sum, old_count)) = old_state {
@@ -528,11 +543,23 @@ impl Operator for AggregateOp {
             }
         }
 
+        let mut dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        dirty_keys_vec.sort_unstable();
+        let mutations = state.encode_mutations_for_keys(self.op_id, &dirty_keys_vec);
+        let logical_mutation_bytes = mutations.iter().map(|mutation| mutation.size_bytes()).sum();
+        let state_bytes = state.state_bytes() as usize;
+
+        self.dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned")
+            .extend(dirty_keys_vec.iter().copied());
+
         drop(state);
         debug!(
             op_id = self.op_id.0,
             input_rows = n,
             output_rows = out_k.len(),
+            dirty_keys = dirty_keys_vec.len(),
             "AggregateOp: processed delta"
         );
         let metric_key = rockstream_types::metrics::LawMetricKey {
@@ -552,19 +579,73 @@ impl Operator for AggregateOp {
             0,
         );
 
-        if out_k.is_empty() {
-            return Ok(ArrowZSet::empty(output_schema()));
-        }
+        let output_zset = if out_k.is_empty() {
+            ArrowZSet::empty(output_schema())
+        } else {
+            let schema = output_schema();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(out_k)),
+                Arc::new(Int64Array::from(out_sum)),
+                Arc::new(Int64Array::from(out_count)),
+                Arc::new(Float64Array::from(out_avg)),
+            ];
+            let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+            ArrowZSet::new(data, out_weights)
+        };
 
-        let schema = output_schema();
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(out_k)),
-            Arc::new(Int64Array::from(out_sum)),
-            Arc::new(Int64Array::from(out_count)),
-            Arc::new(Float64Array::from(out_avg)),
-        ];
-        let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
-        Ok(ArrowZSet::new(data, out_weights))
+        let metrics = rockstream_types::state_mutation::OperatorEpochMetrics {
+            input_records: n,
+            output_records: output_zset.num_rows(),
+            dirty_keys: dirty_keys_vec.len(),
+            state_mutations: mutations.len(),
+            logical_mutation_bytes,
+            full_state_entries_visited: 0,
+            state_bytes,
+        };
+        rockstream_types::metrics::record_r1_persistence(
+            self.op_id,
+            metrics.state_mutations as u64,
+            metrics.logical_mutation_bytes as u64,
+            metrics.dirty_keys as u64,
+        );
+        rockstream_types::metrics::record_current_r1_execution(
+            self.op_id,
+            rockstream_types::metrics::R1ExecutionStrategy::Classic,
+            rockstream_types::metrics::R1ExecutionCounters {
+                input_deltas: metrics.input_records as u64,
+                arrangement_probes: metrics.dirty_keys as u64,
+                output_deltas: metrics.output_records as u64,
+                changed_state_writes: metrics.state_mutations as u64,
+                ..Default::default()
+            },
+        );
+
+        Ok(crate::op::OperatorEpochResult::new(
+            output_zset,
+            mutations,
+            metrics,
+        ))
+    }
+
+    /// Process delta and return only the output ZSet.
+    pub fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_delta_with_result(delta)
+            .map(|res| res.output_delta)
+    }
+}
+
+impl Operator for AggregateOp {
+    fn name(&self) -> &str {
+        "AggregateOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
+    }
+
+    /// Apply one Z-set delta batch through the aggregate arrangement.
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_delta(delta)
     }
 }
 
@@ -585,7 +666,7 @@ impl BucketedAggregateOp {
             partials: Mutex::new(HashMap::new()),
             op_id,
             hot_key,
-            bucket_count,
+            bucket_count: normalize_power_of_two_bucket_count(bucket_count),
         }
     }
 
@@ -593,7 +674,7 @@ impl BucketedAggregateOp {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&k.to_be_bytes());
         key[8..].copy_from_slice(&v.to_be_bytes());
-        route_virtual_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
+        route_power_of_two_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
     }
 
     pub fn live_partials(&self) -> usize {
@@ -859,48 +940,35 @@ pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
 ///
 /// Call this after each epoch commit to ensure storage reflects current state.
 pub async fn append_agg_state(
-    db: &ShardDb,
+    _db: &ShardDb,
     op: &AggregateOp,
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
-    let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
-
-    // Scan all existing state entries (64 MB cap — a bound on the scan).
-    let (existing, _truncated) = db
-        .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
-        .await
-        .map_err(OpError::storage)?;
-
-    // Build a write batch: delete all stale entries, write all live entries.
-    // Drop the mutex guard BEFORE the .await call to avoid holding a lock
-    // across an await point (clippy::await_holding_lock).
-    let wb = {
+    let mutations = {
         let state = op.state.lock().expect("AggregateOp mutex poisoned");
-        let mut wb = WriteBatch::new();
-
-        // Deletions: existing entries whose group key is not in current state.
-        for (key, _) in &existing {
-            if key.len() < prefix.len() + 8 {
-                continue;
+        let dirty_keys = op
+            .dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned");
+        let mut keys = dirty_keys.iter().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        state.encode_mutations_for_keys(op.op_id, &keys)
+    };
+    for mutation in mutations {
+        match mutation {
+            rockstream_types::state_mutation::StateMutation::Put { key, value } => {
+                target.put(&key, &value)
             }
-            let k_bytes: [u8; 8] = match key[prefix.len()..prefix.len() + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let k = i64::from_be_bytes(k_bytes);
-            if !state.entries.contains_key(&k) {
-                wb.delete(key);
+            rockstream_types::state_mutation::StateMutation::Delete { key } => target.delete(&key),
+            rockstream_types::state_mutation::StateMutation::Merge { key, operand, .. } => {
+                target.merge(&key, &operand)
             }
         }
-
-        // Insertions: current live entries.
-        let new_wb = state.encode_as_write_batch(op.op_id);
-        wb.merge_from(new_wb);
-        wb
-        // `state` (MutexGuard) is dropped here — before any await
-    };
-
-    target.merge_from(wb);
+    }
+    op.dirty_keys
+        .lock()
+        .expect("AggregateOp dirty-key mutex poisoned")
+        .clear();
     Ok(())
 }
 

@@ -27,7 +27,7 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::SinkExt;
-use futures::{stream, Sink, StreamExt};
+use futures::{stream, Sink, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider,
@@ -68,11 +68,20 @@ use rockstream_connectors::{
 };
 use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
+use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_sql::SqlFrontend;
-use rockstream_types::config::ScatterPruningConfig;
+use rockstream_types::config::{JoinStrategy, ScatterPruningConfig};
+use rockstream_types::data_plane::{
+    DeploymentColumn, DeploymentRequest, DeploymentSchema, RuntimeRow, SourceDeltaRequest,
+    WorkloadSnapshot, DEPLOYMENT_DESCRIPTOR_VERSION,
+};
+use rockstream_types::diagnostic::{
+    global_diagnostic_journal, record_diagnostic, DiagnosticOccurrence, MAX_DIAGNOSTIC_OCCURRENCES,
+};
+use rockstream_types::error_code::{ErrorCode, ErrorDescriptor, RS_1012};
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
-use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId};
+use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId, WorkloadId};
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
@@ -96,6 +105,10 @@ use crate::pgoutput_coordinator::{
 };
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
+use crate::subscribe_handler::{
+    deliver_snapshot, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+};
+use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
@@ -237,10 +250,48 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
     if let Ok(statements) = sqlparser::parser::Parser::parse_sql(&dialect, sql) {
         for stmt in &statements {
             struct AstVisitor<'a> {
+                catalog: &'a CatalogStubs,
                 casts: &'a mut std::collections::HashMap<usize, Type>,
-                in_any: bool,
+                current_any_type: Option<Type>,
             }
             impl<'a> AstVisitor<'a> {
+                fn array_type_for_col(&self, col_name: &str) -> Type {
+                    let lower = col_name.to_ascii_lowercase();
+                    for table in self.catalog.list_tables() {
+                        for col in &table.columns {
+                            if col.name.eq_ignore_ascii_case(&lower) {
+                                return match col.data_type.to_ascii_lowercase().as_str() {
+                                    "int64" | "bigint" | "int8" => Type::INT8_ARRAY,
+                                    "int32" | "integer" | "int4" | "int" => Type::INT4_ARRAY,
+                                    "int16" | "smallint" | "int2" => Type::INT2_ARRAY,
+                                    "float64" | "double" | "float8" => Type::FLOAT8_ARRAY,
+                                    "float32" | "real" | "float4" => Type::FLOAT4_ARRAY,
+                                    "bool" | "boolean" => Type::BOOL_ARRAY,
+                                    "uuid" => Type::UUID_ARRAY,
+                                    _ => Type::TEXT_ARRAY,
+                                };
+                            }
+                        }
+                    }
+                    for view in self.catalog.list_views() {
+                        for col in &view.columns {
+                            if col.name.eq_ignore_ascii_case(&lower) {
+                                return match col.data_type.to_ascii_lowercase().as_str() {
+                                    "int64" | "bigint" | "int8" => Type::INT8_ARRAY,
+                                    "int32" | "integer" | "int4" | "int" => Type::INT4_ARRAY,
+                                    "int16" | "smallint" | "int2" => Type::INT2_ARRAY,
+                                    "float64" | "double" | "float8" => Type::FLOAT8_ARRAY,
+                                    "float32" | "real" | "float4" => Type::FLOAT4_ARRAY,
+                                    "bool" | "boolean" => Type::BOOL_ARRAY,
+                                    "uuid" => Type::UUID_ARRAY,
+                                    _ => Type::TEXT_ARRAY,
+                                };
+                            }
+                        }
+                    }
+                    Type::TEXT_ARRAY
+                }
+
                 fn visit_expr(&mut self, expr: &sqlparser::ast::Expr) {
                     use sqlparser::ast::{Expr, Value};
                     match expr {
@@ -266,8 +317,8 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                             if let Value::Placeholder(name) = &v.value {
                                 if let Some(rest) = name.strip_prefix('$') {
                                     if let Ok(idx) = rest.parse::<usize>() {
-                                        if self.in_any {
-                                            self.casts.insert(idx, Type::TEXT_ARRAY);
+                                        if let Some(any_ty) = &self.current_any_type {
+                                            self.casts.insert(idx, any_ty.clone());
                                         }
                                     }
                                 }
@@ -275,17 +326,39 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                         }
                         Expr::AnyOp { left, right, .. } => {
                             self.visit_expr(left);
-                            let old_any = self.in_any;
-                            self.in_any = true;
+                            let target_arr_ty = match &**left {
+                                Expr::Identifier(ident) => self.array_type_for_col(&ident.value),
+                                Expr::CompoundIdentifier(idents) => {
+                                    if let Some(last) = idents.last() {
+                                        self.array_type_for_col(&last.value)
+                                    } else {
+                                        Type::TEXT_ARRAY
+                                    }
+                                }
+                                _ => Type::TEXT_ARRAY,
+                            };
+                            let old_any = self.current_any_type.take();
+                            self.current_any_type = Some(target_arr_ty);
                             self.visit_expr(right);
-                            self.in_any = old_any;
+                            self.current_any_type = old_any;
                         }
                         Expr::AllOp { left, right, .. } => {
                             self.visit_expr(left);
-                            let old_any = self.in_any;
-                            self.in_any = true;
+                            let target_arr_ty = match &**left {
+                                Expr::Identifier(ident) => self.array_type_for_col(&ident.value),
+                                Expr::CompoundIdentifier(idents) => {
+                                    if let Some(last) = idents.last() {
+                                        self.array_type_for_col(&last.value)
+                                    } else {
+                                        Type::TEXT_ARRAY
+                                    }
+                                }
+                                _ => Type::TEXT_ARRAY,
+                            };
+                            let old_any = self.current_any_type.take();
+                            self.current_any_type = Some(target_arr_ty);
                             self.visit_expr(right);
-                            self.in_any = old_any;
+                            self.current_any_type = old_any;
                         }
                         Expr::Nested(inner) => {
                             self.visit_expr(inner);
@@ -357,8 +430,9 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
             }
 
             let mut visitor = AstVisitor {
+                catalog,
                 casts: &mut explicit_casts,
-                in_any: false,
+                current_any_type: None,
             };
             if let sqlparser::ast::Statement::Query(q) = stmt {
                 if let sqlparser::ast::SetExpr::Select(select) = &*q.body {
@@ -459,6 +533,55 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
     for (idx, ty) in df_inferred {
         if idx > 0 && idx <= max_idx && !explicit_casts.contains_key(&idx) {
             inferred_types[idx - 1] = ty;
+        }
+    }
+
+    let ql = sql.to_lowercase();
+    if ql.starts_with("update ") {
+        if let Ok((table_name, _, _, _)) = parse_update(sql) {
+            if let Some(catalog_table) = catalog.get_table(&table_name) {
+                for col in &catalog_table.columns {
+                    let oid = arrow_type_to_pg_oid(&col.data_type);
+                    let pg_type = pg_type_from_oid(oid);
+                    for idx in 1..=max_idx {
+                        let patterns = [
+                            format!("{} = ${}", col.name.to_lowercase(), idx),
+                            format!("{} =${}", col.name.to_lowercase(), idx),
+                            format!("{}= ${}", col.name.to_lowercase(), idx),
+                            format!("{}=${}", col.name.to_lowercase(), idx),
+                        ];
+                        if patterns.iter().any(|p| ql.contains(p))
+                            && idx <= max_idx
+                            && !explicit_casts.contains_key(&idx)
+                        {
+                            inferred_types[idx - 1] = pg_type.clone();
+                        }
+                    }
+                }
+            }
+        }
+    } else if ql.starts_with("delete from ") {
+        if let Ok((table_name, _, _)) = parse_delete(sql) {
+            if let Some(catalog_table) = catalog.get_table(&table_name) {
+                for col in &catalog_table.columns {
+                    let oid = arrow_type_to_pg_oid(&col.data_type);
+                    let pg_type = pg_type_from_oid(oid);
+                    for idx in 1..=max_idx {
+                        let patterns = [
+                            format!("{} = ${}", col.name.to_lowercase(), idx),
+                            format!("{} =${}", col.name.to_lowercase(), idx),
+                            format!("{}= ${}", col.name.to_lowercase(), idx),
+                            format!("{}=${}", col.name.to_lowercase(), idx),
+                        ];
+                        if patterns.iter().any(|p| ql.contains(p))
+                            && idx <= max_idx
+                            && !explicit_casts.contains_key(&idx)
+                        {
+                            inferred_types[idx - 1] = pg_type.clone();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -742,8 +865,9 @@ pub static PORTALS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// v0.51.6 Slice 1: bound on prepared statements/portals per connection.
 /// Exceeding this bound no longer errors (`RS-2600`/`RS-2601`) — the
 /// least-recently-used entry is evicted instead.
-pub const MAX_PREPARED_STATEMENTS_PER_CONN: usize = 1000;
-pub const MAX_PORTALS_PER_CONN: usize = 1000;
+pub const MAX_PREPARED_STATEMENTS_PER_CONN: usize =
+    rockstream_types::limits::MAX_PREPARED_STATEMENTS_PER_CONN;
+pub const MAX_PORTALS_PER_CONN: usize = rockstream_types::limits::MAX_PORTALS_PER_CONN;
 
 /// Cumulative count of prepared statements evicted via LRU (v0.51.6 Slice 1).
 pub static PREPARED_STATEMENTS_EVICTED_COUNT: std::sync::atomic::AtomicU64 =
@@ -862,6 +986,7 @@ pub static QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::n
 pub static QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static QUERY_TIME_SCATTER_BATCH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
+static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn query_time_scatter_fill_levels() -> QueryTimeScatterFillLevels {
     QueryTimeScatterFillLevels {
@@ -1691,6 +1816,8 @@ pub struct GatewayHandler {
     pub notify_registry: Arc<NotifyRegistry>,
     /// Transactional NOTIFYs buffered until COMMIT. Bound: MAX_OUTBOX_PER_CONNECTION.
     pending_notifies: Arc<DashMap<String, Vec<(String, String)>>>,
+    /// Shared historical/streaming subscription change logs.
+    subscribe_registry: Arc<SubscribeRegistry>,
     /// CREATE TABLE-side metadata needed for server-assigned INSERT values.
     table_insert_metadata: Arc<DashMap<String, Arc<TableInsertMetadata>>>,
     /// Wall-clock publish timestamp of the most recently advanced shard frontier.
@@ -1704,6 +1831,8 @@ pub struct GatewayHandler {
     /// outright (`RS-1019`) when compilation fails — there is no
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
+    distributed_data_plane: Option<DataPlaneClient>,
+    distributed_storage_root: Option<String>,
     backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
@@ -1718,9 +1847,24 @@ pub struct GatewayHandler {
     /// by dependency component only after measured contention.
     shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
     pub secret_store: Arc<rockstream_control::SecretStore>,
+    join_strategy: JoinStrategy,
+    pub is_draining: Arc<std::sync::atomic::AtomicBool>,
+    pub in_flight_queries: Arc<AtomicUsize>,
 }
 
 impl GatewayHandler {
+    pub fn mark_draining(&self) {
+        self.is_draining.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.is_draining.load(Ordering::SeqCst)
+    }
+
+    pub fn in_flight_queries(&self) -> usize {
+        self.in_flight_queries.load(Ordering::SeqCst)
+    }
+
     fn bind_server(&self, handler: &Arc<Self>) {
         *self.self_ref.lock() = Arc::downgrade(handler);
     }
@@ -1845,6 +1989,11 @@ impl GatewayHandler {
         }
     }
 
+    /// Shared registry used by `SUBSCRIBE` and commit change publication.
+    pub fn subscribe_registry(&self) -> &Arc<SubscribeRegistry> {
+        &self.subscribe_registry
+    }
+
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
         let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
             "rockstream-default-kek",
@@ -1872,9 +2021,12 @@ impl GatewayHandler {
             cancellation_registry: Arc::new(DashMap::new()),
             notify_registry: Arc::new(NotifyRegistry::new()),
             pending_notifies: Arc::new(DashMap::new()),
+            subscribe_registry: Arc::new(SubscribeRegistry::new()),
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            distributed_data_plane: None,
+            distributed_storage_root: None,
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -1882,6 +2034,9 @@ impl GatewayHandler {
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             secret_store,
+            join_strategy: JoinStrategy::Auto,
+            is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight_queries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1916,9 +2071,12 @@ impl GatewayHandler {
             cancellation_registry: Arc::new(DashMap::new()),
             notify_registry: Arc::new(NotifyRegistry::new()),
             pending_notifies: Arc::new(DashMap::new()),
+            subscribe_registry: Arc::new(SubscribeRegistry::new()),
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            distributed_data_plane: None,
+            distributed_storage_root: None,
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -1926,11 +2084,19 @@ impl GatewayHandler {
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             secret_store,
+            join_strategy: JoinStrategy::Auto,
+            is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight_queries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
         self.secret_store = secret_store;
+        self
+    }
+
+    pub fn with_join_strategy(mut self, join_strategy: JoinStrategy) -> Self {
+        self.join_strategy = join_strategy;
         self
     }
 
@@ -2012,9 +2178,33 @@ impl GatewayHandler {
             ),
         };
 
-        match rockstream_ops::compile_plan(&view_plan, shard_db, table_schemas) {
-            Ok(compiled) => Ok(compiled),
+        match rockstream_ops::compile_plan_with_strategy(
+            &view_plan,
+            shard_db,
+            table_schemas,
+            self.join_strategy,
+        ) {
+            Ok(compiled) => {
+                if let Some(join) = &compiled.join {
+                    rockstream_types::metrics::record_compiled_join_strategy(
+                        if join.pipeline.strategy() == "factorized" {
+                            rockstream_types::metrics::R1ExecutionStrategy::Factorized
+                        } else {
+                            rockstream_types::metrics::R1ExecutionStrategy::Classic
+                        },
+                    );
+                }
+                Ok(compiled)
+            }
             Err(compile_err) => {
+                if compile_err
+                    .to_string()
+                    .contains("execution.join_strategy=factorized")
+                {
+                    return Err(format!(
+                        "[RS-1019] compile_plan: {compile_err}; next_steps: simplify the view query or verify its source schemas"
+                    ));
+                }
                 let mut diff_ctx = rockstream_diff::DiffCtx::new();
                 let _physical_plan = diff_ctx
                     .differentiate(&view_plan)
@@ -2050,14 +2240,23 @@ impl GatewayHandler {
             ),
         };
 
-        match rockstream_ops::compile_plan_with_sink_id(
+        match rockstream_ops::compile_plan_with_sink_id_and_strategy(
             &view_plan,
             shard_db,
             table_schemas,
             sink_op_id,
+            self.join_strategy,
         ) {
             Ok(compiled) => Ok(compiled),
             Err(compile_err) => {
+                if compile_err
+                    .to_string()
+                    .contains("execution.join_strategy=factorized")
+                {
+                    return Err(format!(
+                        "[RS-1019] compile_plan_with_sink_id: {compile_err}; next_steps: simplify the view query or verify its source schemas"
+                    ));
+                }
                 let mut diff_ctx = rockstream_diff::DiffCtx::new();
                 let _physical_plan = diff_ctx
                     .differentiate(&view_plan)
@@ -2325,7 +2524,9 @@ impl GatewayHandler {
 
         let candidates = reachable
             .iter()
-            .filter(|name| self.compiled_views.contains_key(*name))
+            .filter(|name| {
+                self.distributed_data_plane.is_some() || self.compiled_views.contains_key(*name)
+            })
             .cloned()
             .collect::<HashSet<_>>();
         let mut indegree = BTreeMap::new();
@@ -3278,7 +3479,13 @@ impl GatewayHandler {
                     view_name.to_string(),
                     Arc::clone(shard_db),
                 ),
-                _ => unreachable!("source type was checked above"),
+                source_type => {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "unsupported source type '{source_type}' for worker spawning on materialized view '{view_name}'"
+                        ),
+                    });
+                }
             }
         }
         Ok(())
@@ -4490,14 +4697,33 @@ impl GatewayHandler {
             rockstream_types::metrics::set_session_frontier_age_ms("max_staleness", age_ms);
             if age_ms > max_staleness.as_millis() as u64 {
                 rockstream_types::metrics::inc_session_staleness_exceeded("max_staleness");
-                session.pending_notice = Some(SessionNotice {
-                    severity: "NOTICE".to_string(),
-                    sqlstate: "01000".to_string(),
-                    message: format!(
-                        "[RS-2018] session.staleness_exceeded: published frontier age {age_ms}ms exceeded rockstream.max_staleness={}ms. next_steps: Increase rockstream.max_staleness, reduce publish lag, or switch back to session_wait_for mode.",
-                        max_staleness.as_millis()
-                    ),
-                });
+                let occurrence = DiagnosticOccurrence::new(
+                    rockstream_types::error_code::RS_2018,
+                    uuid::Uuid::new_v4(),
+                    [
+                        (
+                            "event".to_string(),
+                            "session.staleness_exceeded".to_string(),
+                        ),
+                        ("frontier_age_ms".to_string(), age_ms.to_string()),
+                        (
+                            "max_staleness_ms".to_string(),
+                            max_staleness.as_millis().to_string(),
+                        ),
+                    ],
+                    None,
+                    None,
+                );
+                if let Ok(occurrence) = occurrence {
+                    record_diagnostic(occurrence.clone());
+                    tracing::warn!(
+                        code = %occurrence.code,
+                        correlation_id = %occurrence.correlation_id,
+                        diagnostic = %occurrence.render_json(),
+                        "session diagnostic"
+                    );
+                    session.pending_notice = Some(SessionNotice { occurrence });
+                }
             }
         } else {
             session.frontier_age_ms = None;
@@ -4517,11 +4743,18 @@ impl GatewayHandler {
             (None, None)
         };
         if let Some(notice) = notice {
-            client
-                .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                    ErrorInfo::new(notice.severity, notice.sqlstate, notice.message),
-                )))
-                .await?;
+            let occurrence = notice.occurrence.redacted();
+            if let Some(descriptor) = occurrence.descriptor() {
+                client
+                    .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                        ErrorInfo::new(
+                            descriptor.severity.to_string(),
+                            descriptor.sqlstate.clone(),
+                            occurrence.render_text(),
+                        ),
+                    )))
+                    .await?;
+            }
         }
         if let Some(age_ms) = frontier_age_ms {
             client
@@ -4682,26 +4915,28 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if let Some(response) = diagnostic_query_response(q) {
+            return Some(Ok(vec![response]));
+        }
+
         if is_removed_connector_ddl(&ql) {
             return Some(Ok(vec![connector_removed_error_response()]));
         }
 
         // SERIALIZABLE → RS-2003
         if ql.contains("serializable") && ql.contains("isolation") {
-            return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "25001".to_owned(),
-                "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED".to_owned(),
-            )))]));
+            return Some(Ok(vec![diagnostic_error_response(
+                rockstream_types::error_code::RS_2003,
+                Vec::<(String, String)>::new(),
+            )]));
         }
 
         // REPEATABLE READ → RS-2004
         if ql.contains("repeatable read") && ql.contains("isolation") {
-            return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "25001".to_owned(),
-                "[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED".to_owned(),
-            )))]));
+            return Some(Ok(vec![diagnostic_error_response(
+                rockstream_types::error_code::RS_2004,
+                Vec::<(String, String)>::new(),
+            )]));
         }
 
         // Catalog stubs
@@ -4799,6 +5034,7 @@ impl GatewayHandler {
         if ql.starts_with("create view ")
             || ql.starts_with("create materialized view ")
             || ql.starts_with("create or replace view ")
+            || ql.starts_with("create or replace materialized view ")
         {
             return Some(self.handle_create_view(q).await);
         }
@@ -4813,9 +5049,30 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
-        // CREATE SINK — v0.44 pgwire DDL wiring
+        // DROP TABLE [IF EXISTS]
+        if ql.starts_with("drop table ") {
+            return Some(self.handle_drop_table(q));
+        }
+
+        // DROP VIEW / DROP MATERIALIZED VIEW [IF EXISTS]
+        if ql.starts_with("drop view ") || ql.starts_with("drop materialized view ") {
+            return Some(self.handle_drop_view(q).await);
+        }
+
+        // CREATE SCHEMA / DROP SCHEMA [IF EXISTS]
+        if ql.starts_with("create schema ") {
+            return Some(self.handle_create_schema(q));
+        }
+        if ql.starts_with("drop schema ") {
+            return Some(self.handle_drop_schema(q));
+        }
+
+        // CREATE SINK / DROP SINK — v0.44 pgwire DDL wiring
         if ql.starts_with("create sink ") {
             return Some(self.handle_create_sink(q));
+        }
+        if ql.starts_with("drop sink ") {
+            return Some(self.handle_drop_sink(q));
         }
 
         // CREATE SOURCE / ALTER SOURCE / DROP SOURCE — v0.51.9 pgwire DDL wiring
@@ -4856,6 +5113,186 @@ impl GatewayHandler {
         None
     }
 
+    async fn handle_subscribe(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let request = match parse_subscribe(query) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-2005] history.subscribe_invalid: {error}. next_steps: Use SUBSCRIBE <view> [AS OF NOW WITH SNAPSHOT | AS OF EPOCH <n>]."
+                        ),
+                    ),
+                )))]);
+            }
+        };
+
+        let catalog_columns = self
+            .catalog
+            .get_view(&request.view_name)
+            .map(|view| view.columns)
+            .or_else(|| {
+                self.catalog
+                    .get_table(&request.view_name)
+                    .map(|table| table.columns)
+            })
+            .unwrap_or_default();
+        if catalog_columns.is_empty()
+            && self
+                .subscribe_registry
+                .latest_epoch(&request.view_name)
+                .is_none()
+        {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P01".to_owned(),
+                    format!(
+                        "[RS-2005] history.subscribe_invalid: subscription target '{}' does not exist. next_steps: Create the view or table before subscribing.",
+                        request.view_name
+                    ),
+                ),
+            )))]);
+        }
+
+        let col_names = request.projection.clone().unwrap_or_else(|| {
+            catalog_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        });
+        let start_epoch = match &request.start {
+            SubscribeStart::NowWithSnapshot => self
+                .shard_db
+                .as_ref()
+                .map(|db| db.last_epoch().load(Ordering::SeqCst))
+                .or_else(|| self.subscribe_registry.latest_epoch(&request.view_name))
+                .unwrap_or(0),
+            SubscribeStart::Epoch(epoch) => *epoch,
+        };
+        let mut pending = std::collections::VecDeque::new();
+        let handle = match &request.start {
+            SubscribeStart::NowWithSnapshot => {
+                let snapshot = self
+                    .view_reader
+                    .read_view(&request.view_name, None, ViewReadStrategy::HotOnly)
+                    .await
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+                let snapshot = snapshot
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, row)| (Bytes::from(index.to_string()), Bytes::from(row)))
+                    .collect();
+                let column_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
+                pending.extend(deliver_snapshot(
+                    snapshot,
+                    start_epoch,
+                    &request,
+                    &column_refs,
+                ));
+                SubscriberHandle::new(
+                    request.view_name.clone(),
+                    start_epoch,
+                    request.clone(),
+                    col_names.clone(),
+                )
+            }
+            SubscribeStart::Epoch(epoch) => {
+                let mut handle = match start_from_epoch(
+                    &self.subscribe_registry,
+                    &request,
+                    *epoch,
+                    col_names.clone(),
+                ) {
+                    Ok(handle) => handle,
+                    Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                };
+                match handle.poll(&self.subscribe_registry) {
+                    Ok(rows) => pending.extend(rows),
+                    Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                }
+                handle
+            }
+        };
+
+        let mut fields: Vec<FieldInfo> = col_names
+            .iter()
+            .map(|name| FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .collect();
+        fields.push(FieldInfo::new(
+            "mz_timestamp".to_owned(),
+            None,
+            None,
+            Type::INT8,
+            FieldFormat::Text,
+        ));
+        fields.push(FieldInfo::new(
+            "mz_diff".to_owned(),
+            None,
+            None,
+            Type::INT2,
+            FieldFormat::Text,
+        ));
+        let schema = Arc::new(fields);
+        let stream_schema = schema.clone();
+        let registry = self.subscribe_registry.clone();
+        let data_stream = Box::pin(stream::unfold(
+            (registry, handle, pending, stream_schema, false),
+            |(registry, mut handle, mut pending, schema, failed)| async move {
+                if failed {
+                    return None;
+                }
+                loop {
+                    if let Some(row) = pending.pop_front() {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        for value in String::from_utf8_lossy(&row.encoded_row).split('\t') {
+                            if let Err(error) = encoder.encode_field(&Some(value)) {
+                                return Some((
+                                    Err(error),
+                                    (registry, handle, pending, schema, true),
+                                ));
+                            }
+                        }
+                        let timestamp = row.mz_timestamp.to_string();
+                        if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
+                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                        }
+                        let diff = row.mz_diff.to_string();
+                        if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
+                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                        }
+                        let encoded = match encoder.finish() {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                return Some((
+                                    Err(error),
+                                    (registry, handle, pending, schema, true),
+                                ));
+                            }
+                        };
+                        return Some((Ok(encoded), (registry, handle, pending, schema, false)));
+                    }
+                    match handle.poll(&registry) {
+                        Ok(rows) if !rows.is_empty() => pending.extend(rows),
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        Err(error) => {
+                            return Some((
+                                Err(PgWireError::ApiError(Box::new(error))),
+                                (registry, handle, pending, schema, true),
+                            ));
+                        }
+                    }
+                }
+            },
+        ));
+        Ok(vec![promote_response(Response::Query(QueryResponse::new(
+            schema,
+            data_stream,
+        )))])
+    }
+
     /// Dispatch with an optional connection ID for write buffer routing.
     pub async fn dispatch_async_with_conn(
         &self,
@@ -4867,6 +5304,10 @@ impl GatewayHandler {
 
         if let Some(response) = self.authorize_mutation(q, conn_id) {
             return Ok(response);
+        }
+
+        if ql == "subscribe" || ql.starts_with("subscribe ") {
+            return self.handle_subscribe(q).await;
         }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
@@ -4903,22 +5344,16 @@ impl GatewayHandler {
             // BEGIN ISOLATION LEVEL SERIALIZABLE / REPEATABLE READ → RS-2003 / RS-2004,
             // the same honest rejection dispatch_sync applies to SET TRANSACTION.
             if ql.contains("isolation") && ql.contains("serializable") {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "25001".to_owned(),
-                        "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED".to_owned(),
-                    ),
-                )))]);
+                return Ok(vec![diagnostic_error_response(
+                    rockstream_types::error_code::RS_2003,
+                    Vec::<(String, String)>::new(),
+                )]);
             }
             if ql.contains("isolation") && ql.contains("repeatable read") {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "25001".to_owned(),
-                        "[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED".to_owned(),
-                    ),
-                )))]);
+                return Ok(vec![diagnostic_error_response(
+                    rockstream_types::error_code::RS_2004,
+                    Vec::<(String, String)>::new(),
+                )]);
             }
             if let Some(id) = conn_id {
                 let tx_status = self
@@ -5183,28 +5618,64 @@ impl GatewayHandler {
             let explain_args = q["explain incremental ".len()..]
                 .trim()
                 .trim_end_matches(';');
-            let (level, target_sql) = if let Some(rest) = explain_args.strip_prefix("VERBOSE ") {
-                (ExplainLevel::Verbose, rest.trim())
-            } else if let Some(rest) = explain_args.strip_prefix("ANALYZE ") {
-                (ExplainLevel::Analyze, rest.trim())
-            } else if let Some(rest) = explain_args.strip_prefix("ESTIMATE ") {
-                (ExplainLevel::Default, rest.trim())
+            let explain_args_lower = explain_args.to_ascii_lowercase();
+            let (level, is_estimate, target_sql) = if explain_args_lower.starts_with("verbose ") {
+                (
+                    ExplainLevel::Verbose,
+                    false,
+                    explain_args["verbose ".len()..].trim(),
+                )
+            } else if explain_args_lower.starts_with("analyze ") {
+                (
+                    ExplainLevel::Analyze,
+                    false,
+                    explain_args["analyze ".len()..].trim(),
+                )
+            } else if explain_args_lower.starts_with("estimate ") {
+                (
+                    ExplainLevel::Default,
+                    true,
+                    explain_args["estimate ".len()..].trim(),
+                )
             } else {
-                (ExplainLevel::Default, explain_args)
+                (ExplainLevel::Default, false, explain_args)
             };
 
             let normalized_sql = if target_sql.to_ascii_lowercase().starts_with("select ")
                 || target_sql.to_ascii_lowercase().starts_with("with ")
             {
                 target_sql.to_string()
+            } else if let Some(view) = self.catalog.get_view(target_sql.trim()) {
+                view.sql
             } else {
                 format!("SELECT * FROM {}", target_sql.trim())
             };
 
             let frontend = self.build_explain_frontend()?;
-            let explain_text = if explain_args.starts_with("ESTIMATE ") {
+            let explain_text = if is_estimate {
+                let mut canonical_arrs = Vec::new();
+                for (view_name, info) in self.catalog.list_view_arrangements() {
+                    let arr_id_str = info
+                        .arrangement_id
+                        .map(|id| format!("{id:?}"))
+                        .unwrap_or_else(|| format!("arr_{view_name}"));
+                    let consumers = (0..info.consumer_count)
+                        .map(|i| format!("{view_name}_{i}"))
+                        .collect();
+                    canonical_arrs.push(rockstream_sql::estimate::CanonicalArrangementEntry {
+                        arrangement_id: arr_id_str,
+                        state_bytes: info.shared_state_bytes,
+                        consumers,
+                    });
+                }
+                let context = rockstream_sql::estimate::CapacityEstimateContext {
+                    cardinality_hint: 1_000,
+                    batch_rows: 10_000,
+                    canonical_arrangements: canonical_arrs,
+                    ..Default::default()
+                };
                 frontend
-                    .explain_incremental_estimate_text(&normalized_sql, 1_000, 10_000)
+                    .explain_incremental_estimate_capacity_text(&normalized_sql, &context)
                     .await
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?
             } else {
@@ -5736,6 +6207,20 @@ impl GatewayHandler {
             return Ok(vec![promote_response(catalog_resp_to_response(
                 self.catalog.view_status_response(Some(view_name), None),
             ))]);
+        }
+        if ql.trim_end_matches(';') == "show rockstream capabilities"
+            || ql.trim_end_matches(';') == "show capabilities"
+        {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.capabilities_response(q, &[]),
+            ))]);
+        }
+        if ql.starts_with("show capabilities ") || ql.starts_with("show rockstream capabilities ") {
+            return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "[RS-1019] syntax.invalid_show_capabilities: invalid syntax for SHOW CAPABILITIES. Next steps: use 'SHOW ROCKSTREAM CAPABILITIES' or 'SHOW CAPABILITIES'.".to_owned(),
+            ))))]);
         }
         if ql.trim_end_matches(';') == "show resource usage" {
             return Ok(vec![catalog_resp_to_response(
@@ -6717,7 +7202,56 @@ impl GatewayHandler {
         // committed writes immediately after the post-COMMIT flush.  The
         // ShardReader (DbReader) polls for a new manifest every 1 s and would
         // return stale results until the next poll fires.
-        let raw_rows: Vec<Vec<u8>> = if let Some(shard_db) = &self.shard_db {
+        let distributed_data_plane = self
+            .distributed_data_plane
+            .as_ref()
+            .filter(|_| self.catalog.get_view(view_name).is_some());
+        let raw_rows: Vec<Vec<u8>> = if let Some(distributed_data_plane) = distributed_data_plane {
+            let snapshot = distributed_data_plane
+                .read_workload(WorkloadId(stable_name_id("workload", view_name)))
+                .await
+                .map_err(|error| {
+                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("read distributed view {view_name}: {error}"),
+                    }))
+                })?;
+            let mut rows = merge_workload_snapshot(&snapshot)
+                .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+            if !order_by.is_empty() {
+                let col_idx: std::collections::HashMap<String, usize> = schema_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.name().to_lowercase(), i))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let a_fields: Vec<&str> =
+                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
+                    let b_fields: Vec<&str> =
+                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
+                    for (col, desc) in &order_by {
+                        let Some(&idx) = col_idx.get(col.as_str()) else {
+                            continue;
+                        };
+                        let av = a_fields.get(idx).copied().unwrap_or("");
+                        let bv = b_fields.get(idx).copied().unwrap_or("");
+                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
+                            an.cmp(&bn)
+                        } else {
+                            av.cmp(bv)
+                        };
+                        let ord = if *desc { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            if let Some(n) = limit {
+                rows.truncate(n);
+            }
+            rows
+        } else if let Some(shard_db) = &self.shard_db {
             let mut rows: Vec<Vec<u8>> = if let Some(view) = self.catalog.get_view(view_name) {
                 if view.op_id.is_some() {
                     self.read_compiled_view_rows(view_name, &view, shard_db)
@@ -6807,6 +7341,8 @@ impl GatewayHandler {
     async fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let is_materialized = ql.contains("materialized view");
+        let if_not_exists = ql.contains("if not exists");
+        let or_replace = ql.contains("or replace");
         let tag = if is_materialized {
             "CREATE MATERIALIZED VIEW"
         } else {
@@ -6815,6 +7351,18 @@ impl GatewayHandler {
 
         // Extract view name and query SQL for cycle detection.
         if let Some(view_name) = parse_create_view_name(q) {
+            if self.catalog.get_view(&view_name).is_some() {
+                if if_not_exists {
+                    return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+                }
+                if !or_replace {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42P07".to_owned(),
+                        format!("[RS-4001] view.already_exists: view '{view_name}' already exists. Next steps: use CREATE OR REPLACE VIEW or drop the existing view first."),
+                    )))]);
+                }
+            }
             let select_sql = parse_create_view_query(q).unwrap_or_default();
             let workload_name = parse_create_view_workload(q);
             let deps = extract_sql_refs(&select_sql);
@@ -6896,7 +7444,95 @@ impl GatewayHandler {
             // registers the view unconditionally — its data is served from
             // elsewhere via `ViewReader` (multi-shard scatter-read), not
             // this process's own compiled pipeline.
-            let compiled_op_id: Option<u64> = if let Some(shard_db) = self.shard_db.clone() {
+            let compiled_op_id: Option<u64> = if let Some(data_plane) = &self.distributed_data_plane
+            {
+                let inlined_sql =
+                    inline_view_dependencies(&select_sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+                let compile_deps = extract_sql_refs(&inlined_sql);
+                if !compile_deps
+                    .iter()
+                    .all(|dep| self.catalog.get_table(dep).is_some())
+                {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-1019] view.compile_failed: distributed view '{view_name}' must depend only on base tables"
+                        ),
+                    )))]);
+                }
+                let frontend = self
+                    .build_explain_frontend()
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+                let plan = rockstream_plan::PlanNode::ViewSink {
+                    view_name: view_name.clone(),
+                    pk: full_row_pk(initial_columns.len()),
+                    child: Box::new(
+                        frontend
+                            .sql_to_plan_node(&inlined_sql)
+                            .await
+                            .map_err(|error| PgWireError::ApiError(Box::new(error)))?,
+                    ),
+                };
+                let Some((routing_columns, merge_key_columns)) = deployment_routing(&plan) else {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-1019] view.compile_failed: distributed view '{view_name}' must be an aggregate or aggregate over an equi-join"
+                        ),
+                    )))]);
+                };
+                let sink_operator_id = OperatorId(stable_name_id("distributed-sink", &view_name));
+                let request = DeploymentRequest {
+                    version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                    workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                    plan_json: serde_json::to_string(&plan).map_err(|error| {
+                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("serialize distributed plan {view_name}: {error}"),
+                        }))
+                    })?,
+                    join_strategy: self.join_strategy,
+                    schemas: compile_deps
+                        .iter()
+                        .filter_map(|relation| {
+                            self.catalog
+                                .get_table(relation)
+                                .map(|table| DeploymentSchema {
+                                    relation: relation.clone(),
+                                    columns: table
+                                        .columns
+                                        .iter()
+                                        .map(|column| DeploymentColumn {
+                                            name: column.name.clone(),
+                                            data_type: column.data_type.clone(),
+                                        })
+                                        .collect(),
+                                })
+                        })
+                        .collect(),
+                    frontier: 0,
+                    storage_root: self.distributed_storage_root.clone().ok_or_else(|| {
+                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                            detail: "distributed storage root is not configured".to_string(),
+                        }))
+                    })?,
+                    sink_operator_id,
+                    output_columns: initial_columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    primary_key: full_row_pk(initial_columns.len()),
+                    merge_key_columns,
+                    routing_columns,
+                };
+                data_plane.deploy(request).await.map_err(|error| {
+                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("deploy distributed view {view_name}: {error}"),
+                    }))
+                })?;
+                Some(sink_operator_id.0)
+            } else if let Some(shard_db) = self.shard_db.clone() {
                 // v0.51.4 Slice 8: a view-of-view (any dep that's itself a
                 // view, not a base table) is inlined as a subquery before
                 // compilation — the *catalog*'s own dependency graph
@@ -7040,7 +7676,7 @@ impl GatewayHandler {
             } else {
                 Vec::new()
             };
-            let mut backfill_ready = !is_materialized;
+            let mut backfill_ready = !is_materialized || self.distributed_data_plane.is_some();
             if let Some(shard_db) = &self.shard_db {
                 if !bound_sources.is_empty() {
                     let result = self
@@ -7098,7 +7734,80 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
     }
 
+    async fn handle_drop_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let is_materialized = ql.contains("materialized view");
+        let if_exists = ql.contains("if exists");
+        let tag = if is_materialized {
+            "DROP MATERIALIZED VIEW"
+        } else {
+            "DROP VIEW"
+        };
+
+        let prefix_len = if is_materialized {
+            if if_exists {
+                ql.find("if exists")
+                    .map(|p| p + "if exists".len())
+                    .unwrap_or("drop materialized view if exists".len())
+            } else {
+                ql.find("drop materialized view")
+                    .map(|p| p + "drop materialized view".len())
+                    .unwrap_or("drop materialized view".len())
+            }
+        } else if if_exists {
+            ql.find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop view if exists".len())
+        } else {
+            ql.find("drop view")
+                .map(|p| p + "drop view".len())
+                .unwrap_or("drop view".len())
+        };
+
+        let rest = q.get(prefix_len..).unwrap_or("").trim();
+        let view_name = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if view_name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                format!("{tag} requires a view name"),
+            )))]);
+        }
+
+        if self.catalog.get_view(&view_name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P01".to_owned(),
+                format!("[RS-4004] view.not_found: view '{view_name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_view(&view_name);
+        self.compiled_views.remove(&view_name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_view",
+                &view_name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
+    }
+
     async fn handle_create_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let ql = q.to_lowercase();
+        let if_not_exists = ql.contains("if not exists");
         let Some(parsed) = parse_create_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -7106,17 +7815,37 @@ impl GatewayHandler {
                 "[RS-1006] workload.invalid_definition: CREATE WORKLOAD requires a name and optional WITH (...) settings. Next steps: use CREATE WORKLOAD fast WITH (MEMORY_LIMIT = 1048576, FRESHNESS_SLO_MS = 500).".to_owned(),
             )))]);
         };
+        if self.catalog.get_workload(&parsed.name).is_some() {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE WORKLOAD").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42710".to_owned(),
+                format!(
+                    "[RS-4001] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
+                    parsed.name
+                ),
+            )))]);
+        }
         let inserted = self
             .catalog
             .add_workload_async(parsed.clone())
             .await
             .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
         if !inserted {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE WORKLOAD").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42710".to_owned(),
                 format!(
-                    "[RS-1006] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
+                    "[RS-4001] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
                     parsed.name
                 ),
             )))]);
@@ -7180,6 +7909,8 @@ impl GatewayHandler {
     }
 
     async fn handle_drop_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
         let Some(workload_name) = parse_drop_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -7188,11 +7919,16 @@ impl GatewayHandler {
             )))]);
         };
         if self.catalog.get_workload(&workload_name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP WORKLOAD").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42704".to_owned(),
                 format!(
-                    "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before dropping it.",
+                    "[RS-4004] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before dropping it.",
                     workload_name, workload_name
                 ),
             )))]);
@@ -7354,12 +8090,219 @@ impl GatewayHandler {
         )])
     }
 
+    fn handle_drop_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = match ql.find("if exists") {
+                Some(p) => p + "if exists".len(),
+                None => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-2000] malformed DROP TABLE DDL".to_owned(),
+                    )))]);
+                }
+            };
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = match ql.find("drop table") {
+                Some(p) => p + "drop table".len(),
+                None => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-2000] malformed DROP TABLE DDL".to_owned(),
+                    )))]);
+                }
+            };
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP TABLE requires a table name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.get_table(&name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP TABLE").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P01".to_owned(),
+                format!("[RS-4004] table.not_found: table '{name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_table(&name);
+        self.table_insert_metadata.remove(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_table",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP TABLE").with_rows(0),
+        )])
+    }
+
+    fn handle_create_schema<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_not_exists = ql.contains("if not exists");
+        let after = if if_not_exists {
+            let pos = ql
+                .find("if not exists")
+                .map(|p| p + "if not exists".len())
+                .unwrap_or("create schema if not exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("create schema")
+                .map(|p| p + "create schema".len())
+                .unwrap_or("create schema".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "CREATE SCHEMA requires a schema name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.has_schema(&name) {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SCHEMA").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P06".to_owned(),
+                format!("[RS-4001] schema.already_exists: schema '{name}' already exists"),
+            )))]);
+        }
+
+        self.catalog.add_schema(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "create_schema",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE SCHEMA").with_rows(0),
+        )])
+    }
+
+    fn handle_drop_schema<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = ql
+                .find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop schema if exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("drop schema")
+                .map(|p| p + "drop schema".len())
+                .unwrap_or("drop schema".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP SCHEMA requires a schema name".to_owned(),
+            )))]);
+        }
+
+        if !self.catalog.has_schema(&name) {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SCHEMA").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "3F000".to_owned(),
+                format!("[RS-4004] schema.not_found: schema '{name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_schema(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_schema",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP SCHEMA").with_rows(0),
+        )])
+    }
+
     /// Handle `CREATE SINK <name> FOR VIEW <view> TO ICEBERG|DELTA '<path>' WITH (...)` — v0.44.
     fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_not_exists = ql.contains("if not exists");
         let parsed = match parse_create_sink_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_sink_error_response(message)]),
         };
+
+        if self.catalog.get_sink(&parsed.name).is_some() {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SINK").with_rows(0),
+                )]);
+            }
+            return Ok(vec![create_sink_error_response(format!(
+                "[RS-4001] sink.already_exists: sink '{}' already exists",
+                parsed.name
+            ))]);
+        }
 
         if self.catalog.get_view(&parsed.view).is_none() {
             return Ok(vec![create_sink_error_response(format!(
@@ -7435,6 +8378,66 @@ impl GatewayHandler {
         )])
     }
 
+    fn handle_drop_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = ql
+                .find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop sink if exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("drop sink")
+                .map(|p| p + "drop sink".len())
+                .unwrap_or("drop sink".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP SINK requires a sink name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.get_sink(&name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SINK").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!("[RS-4004] sink.not_found: sink '{name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_sink(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_sink",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP SINK").with_rows(0),
+        )])
+    }
+
     async fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_source_ddl(q) {
             Ok(parsed) => parsed,
@@ -7442,8 +8445,13 @@ impl GatewayHandler {
         };
 
         if self.catalog.get_source(&parsed.name).is_some() {
+            if parsed.if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SOURCE").with_rows(0),
+                )]);
+            }
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -7511,8 +8519,13 @@ impl GatewayHandler {
         }
 
         if !self.catalog.add_source(entry) {
+            if parsed.if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SOURCE").with_rows(0),
+                )]);
+            }
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -7545,6 +8558,16 @@ impl GatewayHandler {
         };
 
         let ns = 0u128;
+        if parsed.if_not_exists {
+            if let Ok(exists) = self.secret_store.contains_secret(ns, &parsed.name).await {
+                if exists {
+                    return Ok(vec![Response::Execution(
+                        Tag::new("CREATE SECRET").with_rows(0),
+                    )]);
+                }
+            }
+        }
+
         if let Err(err) = self
             .secret_store
             .create_secret(
@@ -7556,6 +8579,16 @@ impl GatewayHandler {
             )
             .await
         {
+            if parsed.if_not_exists
+                && matches!(
+                    err,
+                    rockstream_control::SecretStoreError::AlreadyExists { .. }
+                )
+            {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SECRET").with_rows(0),
+                )]);
+            }
             return Ok(vec![secret_error_response(err.to_string())]);
         }
 
@@ -7651,9 +8684,21 @@ impl GatewayHandler {
             Err(message) => return Ok(vec![create_source_error_response(message)]),
         };
 
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
         if self.catalog.get_source(&parsed.name).is_none() {
+            if if_exists && parsed.action == AlterSourceAction::Drop {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SOURCE").with_rows(0),
+                )]);
+            }
+            let err_code = if parsed.action == AlterSourceAction::Drop {
+                "[RS-4004]"
+            } else {
+                "[RS-4009]"
+            };
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4009] source.not_found: source '{}' does not exist. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
+                "{err_code} source.not_found: source '{}' does not exist. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -7872,8 +8917,14 @@ impl GatewayHandler {
     async fn handle_create_index(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
         use crate::catalog_stubs::{CatalogIndexEntry, CatalogIndexState};
 
-        // Parse: CREATE INDEX <name> ON <table> (<cols>)
-        let after_keyword = q["CREATE INDEX".len()..].trim();
+        // Parse: CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<cols>)
+        let raw_after = q["CREATE INDEX".len()..].trim();
+        let (after_keyword, if_not_exists) =
+            if raw_after.to_lowercase().starts_with("if not exists ") {
+                (raw_after["if not exists ".len()..].trim(), true)
+            } else {
+                (raw_after, false)
+            };
         let upper_after = after_keyword.to_uppercase();
 
         let on_pos = match upper_after.find(" ON ") {
@@ -7917,6 +8968,21 @@ impl GatewayHandler {
             )))]);
         }
 
+        if self.catalog.get_index(&index_name).is_some() {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE INDEX").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42710".to_owned(),
+                format!(
+                    "[RS-2016] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
+                ),
+            )))]);
+        }
+
         let entry = CatalogIndexEntry {
             name: index_name.clone(),
             table: table.clone(),
@@ -7926,12 +8992,16 @@ impl GatewayHandler {
         };
 
         if !self.catalog.add_index(entry) {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE INDEX").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42710".to_owned(),
                 format!(
-                    "[RS-2016] Index name conflict: index '{index_name}' already exists for a \
-                     different table. Choose a unique index name or drop the existing index first."
+                    "[RS-2016] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
                 ),
             )))]);
         }
@@ -8131,14 +9201,29 @@ impl GatewayHandler {
         }
     }
 
-    /// Handle `DROP INDEX <name>` — v0.32.
+    /// Handle `DROP INDEX [IF EXISTS] <name>` — v0.32.
     fn handle_drop_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
-        let rest = q["DROP INDEX".len()..].trim();
-        let name = rest
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = ql
+                .find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop index if exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("drop index")
+                .map(|p| p + "drop index".len())
+                .unwrap_or("drop index".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+        let name = after
             .split_whitespace()
             .next()
             .unwrap_or("")
             .trim_end_matches(';')
+            .trim_matches('"')
             .to_lowercase();
 
         if name.is_empty() {
@@ -8150,10 +9235,15 @@ impl GatewayHandler {
         }
 
         if self.catalog.get_index(&name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP INDEX").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42704".to_owned(),
-                format!("index \"{name}\" does not exist"),
+                format!("[RS-4004] index \"{name}\" does not exist"),
             )))]);
         }
 
@@ -8432,9 +9522,18 @@ impl GatewayHandler {
         }
 
         let ops = entry.drain();
-        let affected = ops.len();
         drop(entry); // release DashMap entry guard before await
         let _commit_guard = self.shard_commit_lock.lock().await;
+        let ops = committed_dml_ops(shard_db, ops)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        let affected = ops.len();
+        if ops.is_empty() {
+            self.flush_pending_notifies(conn_id);
+            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                "COMMIT",
+            )))]);
+        }
 
         // Allocate next epoch
         let epoch = shard_db.try_next_epoch().ok_or_else(|| {
@@ -8483,6 +9582,54 @@ impl GatewayHandler {
             }
         }
 
+        for op in &ops {
+            let (table, row_key, mz_diff, encoded_row) = match op {
+                DmlOp::Insert {
+                    table,
+                    row_key,
+                    values_tsv,
+                    ..
+                } => (table.clone(), row_key.clone(), 1, values_tsv.clone()),
+                DmlOp::Delete {
+                    table,
+                    row_key,
+                    returning_tsv,
+                } => (
+                    table.clone(),
+                    row_key.clone(),
+                    -1,
+                    returning_tsv.clone().unwrap_or_default(),
+                ),
+                DmlOp::Update {
+                    table,
+                    old_row_key,
+                    old_tsv,
+                    new_row_key,
+                    new_tsv,
+                } => {
+                    self.subscribe_registry.push(
+                        table,
+                        crate::change_log::ChangeEntry {
+                            epoch,
+                            row_key: Bytes::from(old_row_key.clone()),
+                            mz_diff: -1,
+                            encoded_row: Bytes::from(old_tsv.clone()),
+                        },
+                    );
+                    (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
+                }
+            };
+            self.subscribe_registry.push(
+                &table,
+                crate::change_log::ChangeEntry {
+                    epoch,
+                    row_key: Bytes::from(row_key),
+                    mz_diff,
+                    encoded_row: Bytes::from(encoded_row),
+                },
+            );
+        }
+
         // ── Last hop: materialise dependent views ─────────────────────────────
         // Collect the unique tables touched by this commit, then re-evaluate
         // every view that transitively depends on them.  This converts the
@@ -8496,16 +9643,57 @@ impl GatewayHandler {
                     DmlOp::Delete { table, .. } => table.clone(),
                 })
                 .collect();
-            for view_name in self.reachable_compiled_views(&changed_tables) {
-                if let Err(error) = self
-                    .recompute_compiled_view(&view_name, &ops, shard_db)
-                    .await
-                {
-                    tracing::warn!(
-                        view = %view_name,
-                        error = %error,
-                        "compiled view refresh failed after commit"
-                    );
+            if let Some(data_plane) = &self.distributed_data_plane {
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    for source in self.catalog.get_view_deps(&view_name) {
+                        if !changed_tables
+                            .iter()
+                            .any(|table| table.eq_ignore_ascii_case(&source))
+                        {
+                            continue;
+                        }
+                        let rows = runtime_rows_for_table(&source, &ops);
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let request_id = format!(
+                            "{}-{epoch}-{}",
+                            std::process::id(),
+                            NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                        );
+                        data_plane
+                            .submit_delta(SourceDeltaRequest {
+                                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                                request_id,
+                                workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                                epoch,
+                                source,
+                                rows,
+                            })
+                            .await
+                            .map_err(|error| {
+                                PgWireError::ApiError(Box::new(
+                                    GatewayError::QueryTimeExecutionFailed {
+                                        detail: format!(
+                                            "distributed view refresh {view_name}: {error}"
+                                        ),
+                                    },
+                                ))
+                            })?;
+                    }
+                }
+            } else {
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    if let Err(error) = self
+                        .recompute_compiled_view(&view_name, &ops, shard_db)
+                        .await
+                    {
+                        tracing::warn!(
+                            view = %view_name,
+                            error = %error,
+                            "compiled view refresh failed after commit"
+                        );
+                    }
                 }
             }
             // Flush the WAL so that materialised view output is immediately
@@ -8995,14 +10183,12 @@ impl GatewayHandler {
             if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
                 session.cursors.clear();
             }
-        } else {
-            if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
-                if session.cursors.remove(&name).is_none() {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
+        } else if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
+            if session.cursors.remove(&name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
                             format!("[RS-2051] cursor.not_found: cursor '{name}' does not exist. next_steps: Use DECLARE to open a cursor before FETCH/MOVE/CLOSE.")),
                     )))]);
-                }
             }
         }
 
@@ -9200,15 +10386,13 @@ impl GatewayHandler {
             let schema_fields = if let Some(ct) = self.catalog.get_table(&table) {
                 ct.columns
                     .iter()
-                    .map(|c| {
+                    .enumerate()
+                    .map(|(idx, c)| {
                         let oid = arrow_type_to_pg_oid(&c.data_type);
-                        FieldInfo::new(
-                            c.name.clone(),
-                            None,
-                            None,
-                            pg_type_from_oid(oid),
-                            FieldFormat::Text,
-                        )
+                        let format = PORTAL_FORMAT
+                            .try_with(|f| f.format_for(idx))
+                            .unwrap_or(FieldFormat::Text);
+                        FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), format)
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -9220,9 +10404,12 @@ impl GatewayHandler {
             let schema_ref = schema.clone();
             let data_stream = stream::iter(returning_rows).map(move |values| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                for v in &values {
-                    encoder
-                        .encode_field(&Some(v.clone()))
+                for (i, v) in values.iter().enumerate() {
+                    let dt = schema_ref
+                        .get(i)
+                        .map(|f| f.datatype())
+                        .unwrap_or(&Type::TEXT);
+                    encode_typed_field(&mut encoder, dt, Some(v.as_str()))
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
                 }
                 encoder.finish()
@@ -9257,7 +10444,11 @@ impl GatewayHandler {
         let catalog_table = self.catalog.get_table(table);
         let schema_fields: Vec<FieldInfo> = projected_cols
             .iter()
-            .map(|col| {
+            .enumerate()
+            .map(|(idx, col)| {
+                let format = PORTAL_FORMAT
+                    .try_with(|f| f.format_for(idx))
+                    .unwrap_or(FieldFormat::Text);
                 if let Some(ct) = &catalog_table {
                     if let Some(c) = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
                         let oid = arrow_type_to_pg_oid(&c.data_type);
@@ -9266,11 +10457,11 @@ impl GatewayHandler {
                             None,
                             None,
                             pg_type_from_oid(oid),
-                            FieldFormat::Text,
+                            format,
                         );
                     }
                 }
-                FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
+                FieldInfo::new(col.clone(), None, None, Type::TEXT, format)
             })
             .collect();
         let schema = Arc::new(schema_fields);
@@ -9292,9 +10483,12 @@ impl GatewayHandler {
             .collect();
         let data_stream = stream::iter(projected_rows).map(move |values| {
             let mut encoder = DataRowEncoder::new(schema_ref.clone());
-            for v in &values {
-                encoder
-                    .encode_field(&Some(v.clone()))
+            for (i, v) in values.iter().enumerate() {
+                let dt = schema_ref
+                    .get(i)
+                    .map(|f| f.datatype())
+                    .unwrap_or(&Type::TEXT);
+                encode_typed_field(&mut encoder, dt, Some(v.as_str()))
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
@@ -9303,13 +10497,112 @@ impl GatewayHandler {
         promote_response(Response::Query(QueryResponse::new(schema, stream)))
     }
 
-    /// UPDATE handler: true read-modify-write (v0.48 Slice A2/A3).
-    ///
-    /// Reads the existing row via `shard_db.get()` *before* buffering the
-    /// write, so the complete new row (untouched columns preserved, per
-    /// DESIGN.md §12.8.2) can be built and — when `RETURNING` was requested —
-    /// projected back to the client. A nonexistent row is a zero-row no-op:
-    /// no `DmlOp` is buffered.
+    /// Scan and overlay write buffers to find all live rows matching the WHERE predicates.
+    async fn find_matching_rows_for_table(
+        &self,
+        table: &str,
+        table_columns: &[String],
+        where_pairs: &[(String, String)],
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<(String, Vec<String>)>> {
+        let mut live_rows: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if let Some(shard_db) = &self.shard_db {
+            let prefix = format!("view_output/{table}/");
+            let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
+            for (k, v) in kvs {
+                if let Ok(key_str) = std::str::from_utf8(&k) {
+                    if let Some(row_key) = key_str.strip_prefix(&prefix) {
+                        if let Ok(val_str) = std::str::from_utf8(&v) {
+                            live_rows.insert(row_key.to_string(), val_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(id) = conn_id {
+            if let Some(buffer) = self.write_buffers.get(id) {
+                for op in buffer.ops() {
+                    match op {
+                        DmlOp::Insert {
+                            table: op_table,
+                            row_key,
+                            values_tsv,
+                            ..
+                        } if op_table.eq_ignore_ascii_case(table) => {
+                            live_rows.insert(row_key.clone(), values_tsv.clone());
+                        }
+                        DmlOp::Update {
+                            table: op_table,
+                            old_row_key,
+                            new_row_key,
+                            new_tsv,
+                            ..
+                        } if op_table.eq_ignore_ascii_case(table) => {
+                            live_rows.remove(old_row_key.as_str());
+                            live_rows.insert(new_row_key.clone(), new_tsv.clone());
+                        }
+                        DmlOp::Delete {
+                            table: op_table,
+                            row_key,
+                            ..
+                        } if op_table.eq_ignore_ascii_case(table) => {
+                            live_rows.remove(row_key.as_str());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut matched = Vec::new();
+        for (row_key, tsv) in live_rows {
+            let mut fields: Vec<String> = tsv.split('\t').map(|s| s.to_string()).collect();
+            if fields.len() < table_columns.len() {
+                fields.resize(table_columns.len(), String::new());
+            }
+
+            let mut all_match = true;
+            for (where_col, where_val) in where_pairs {
+                let col_pos = table_columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(where_col));
+                let expected = where_val.trim_matches('\'');
+                if let Some(pos) = col_pos {
+                    let actual = fields.get(pos).map(|s| s.as_str()).unwrap_or("");
+                    if actual != expected {
+                        all_match = false;
+                        break;
+                    }
+                } else {
+                    let key_pairs = parse_kv_list(&row_key);
+                    if let Some((_, actual)) = key_pairs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(where_col))
+                    {
+                        if actual != expected {
+                            all_match = false;
+                            break;
+                        }
+                    } else {
+                        all_match = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_match {
+                matched.push((row_key, fields));
+            }
+        }
+
+        Ok(matched)
+    }
+
+    /// UPDATE handler: hardened multi-row read-modify-write (v0.59.11 SQL-01).
     async fn handle_update(
         &self,
         q: &str,
@@ -9324,16 +10617,11 @@ impl GatewayHandler {
             }
         };
 
-        // Build old row key from WHERE clause (unchanged from prior versions).
-        let (old_cols, old_vals): (Vec<_>, Vec<_>) = where_pairs
+        let (old_cols, _old_vals): (Vec<_>, Vec<_>) = where_pairs
             .iter()
             .map(|(c, v)| (c.clone(), v.clone()))
             .unzip();
-        let old_row_key = build_row_key(&old_cols, &old_vals);
 
-        // Full declared column order — used to build the complete merged
-        // row. Falls back to WHERE ∪ SET columns if the table isn't in the
-        // catalog (defensive; CREATE TABLE always registers it in practice).
         let table_columns: Vec<String> = self
             .catalog
             .get_table(&table)
@@ -9348,35 +10636,11 @@ impl GatewayHandler {
                 cols
             });
 
-        let Some(shard_db) = &self.shard_db else {
-            // No shard attached: nothing to read or write.
-            return Ok(vec![promote_response(Response::Execution(
-                Tag::new("UPDATE 0").with_rows(0),
-            ))]);
-        };
+        let matched_rows = self
+            .find_matching_rows_for_table(&table, &table_columns, &where_pairs, conn_id)
+            .await?;
 
-        let buffered_existing = conn_id.and_then(|id| {
-            self.write_buffers
-                .get(id)
-                .and_then(|buffer| buffer.current_row_image(&table, &old_row_key))
-        });
-        let existing_str = match buffered_existing {
-            Some(Some(tsv)) => Some(tsv),
-            Some(None) => None,
-            None => {
-                let old_key = format!("view_output/{table}/{old_row_key}");
-                shard_db
-                    .get(old_key.as_bytes())
-                    .await
-                    .map_err(|e| {
-                        PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                    })?
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-            }
-        };
-
-        let Some(existing_str) = existing_str else {
-            // Row does not exist: zero rows affected, no write buffered.
+        if matched_rows.is_empty() {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
@@ -9388,52 +10652,53 @@ impl GatewayHandler {
             return Ok(vec![promote_response(Response::Execution(
                 Tag::new("UPDATE 0").with_rows(0),
             ))]);
-        };
-
-        let existing_fields: Vec<String> =
-            existing_str.split('\t').map(|s| s.to_string()).collect();
-        let mut value_map: HashMap<String, String> = HashMap::new();
-        for (i, col) in table_columns.iter().enumerate() {
-            value_map.insert(
-                col.clone(),
-                existing_fields.get(i).cloned().unwrap_or_default(),
-            );
         }
-        for (c, v) in &set_pairs {
-            value_map.insert(c.clone(), v.clone());
-        }
-        let new_vals: Vec<String> = table_columns
-            .iter()
-            .map(|c| value_map.get(c).cloned().unwrap_or_default())
-            .collect();
-        let new_row_key = build_row_key(&table_columns, &new_vals);
-        let new_tsv = new_vals.join("\t");
 
-        let op = DmlOp::Update {
-            table: table.clone(),
-            old_row_key: old_row_key.clone(),
-            old_tsv: existing_str,
-            new_row_key: new_row_key.clone(),
-            new_tsv: new_tsv.clone(),
-        };
+        let mut result_rows = Vec::with_capacity(matched_rows.len());
 
-        if let Some(id) = conn_id {
-            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
-            if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
-                )))]);
+        for (old_row_key, existing_fields) in matched_rows {
+            let old_tsv = existing_fields.join("\t");
+            let mut value_map: HashMap<String, String> = HashMap::new();
+            for (i, col) in table_columns.iter().enumerate() {
+                value_map.insert(
+                    col.clone(),
+                    existing_fields.get(i).cloned().unwrap_or_default(),
+                );
             }
+            for (c, v) in &set_pairs {
+                value_map.insert(c.clone(), v.trim_matches('\'').to_string());
+            }
+            let new_vals: Vec<String> = table_columns
+                .iter()
+                .map(|c| value_map.get(c).cloned().unwrap_or_default())
+                .collect();
+            let new_row_key = build_row_key(&table_columns, &new_vals);
+            let new_tsv = new_vals.join("\t");
+
+            let op = DmlOp::Update {
+                table: table.clone(),
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            };
+
+            if let Some(id) = conn_id {
+                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+                if let Err(e) = entry.push(op) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                    )))]);
+                }
+            }
+            result_rows.push(new_vals);
         }
 
-        // Standard-PostgreSQL autocommit: any statement outside an explicit
-        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
-        // whether or not it has a `RETURNING` clause.
         let in_explicit_block = conn_id
             .and_then(|id| self.sessions.get(id))
             .map(|s| s.in_explicit_block)
             .unwrap_or(false);
-        let mut result_row = new_vals.clone();
+
         if !in_explicit_block {
             let commit_responses = self.handle_commit(conn_id).await?;
             if commit_responses
@@ -9442,68 +10707,24 @@ impl GatewayHandler {
             {
                 return Ok(commit_responses);
             }
-            if returning_cols.is_some() {
-                if let Some(id) = conn_id {
-                    let timeout_ms = self
-                        .sessions
-                        .get(id)
-                        .map(|s| s.session_wait_for_timeout_ms)
-                        .unwrap_or(5_000);
-                    if let Some(token) = self
-                        .sessions
-                        .get(id)
-                        .and_then(|s| s.last_written_epoch.clone())
-                    {
-                        let _ = self.wait_for_epoch(token.source_epoch, timeout_ms).await;
-                    }
-                }
-                let new_key = format!("view_output/{table}/{new_row_key}");
-                if let Some(raw) = shard_db.get(new_key.as_bytes()).await.map_err(|e| {
-                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                })? {
-                    let mut row: Vec<String> = String::from_utf8_lossy(&raw)
-                        .split('\t')
-                        .map(|s| s.to_string())
-                        .collect();
-                    row.resize(table_columns.len(), String::new());
-                    result_row = row;
-                } else {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
-                        ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "XX000".to_owned(),
-                            "[RS-2013] transaction.returning_key_not_found: UPDATE ... RETURNING committed, but the gateway could not read the expected post-update row at the current frontier. next_steps: Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch.".to_owned(),
-                        ),
-                    )))]);
-                }
-            }
         }
+
         if let Some(returning_cols) = &returning_cols {
-            // Slice A3: reuse the INSERT ... RETURNING read-back pattern —
-            // only performed outside an explicit transaction block; inside
-            // one, RETURNING resolves at the eventual COMMIT using the
-            // already-computed merged row (matches INSERT's literal-echo
-            // behavior when no server-side generated value is involved).
             return Ok(vec![self.build_returning_response(
                 &table,
                 &table_columns,
                 returning_cols,
-                vec![result_row],
+                result_rows,
             )]);
         }
 
+        let count = result_rows.len();
         Ok(vec![promote_response(Response::Execution(
-            Tag::new("UPDATE 1").with_rows(1),
+            Tag::new(&format!("UPDATE {count}")).with_rows(count),
         ))])
     }
 
-    /// DELETE handler: pre-image capture for RETURNING (v0.48 Slice A4/A5).
-    ///
-    /// When a `RETURNING` clause is present, the existing row is read via
-    /// `shard_db.get()` *before* the write is enqueued — the row is gone
-    /// from `view_output` once the `WriteBatch` commits, so this is the only
-    /// point the pre-delete state can be captured (DESIGN.md §13.5.2). Plain
-    /// `DELETE` (no `RETURNING`) skips this extra read entirely.
+    /// DELETE handler: pre-image capture for RETURNING (v0.59.11 SQL-02).
     async fn handle_delete(
         &self,
         q: &str,
@@ -9518,11 +10739,10 @@ impl GatewayHandler {
             }
         };
 
-        let (cols, vals): (Vec<_>, Vec<_>) = where_pairs
+        let (cols, _vals): (Vec<_>, Vec<_>) = where_pairs
             .iter()
             .map(|(c, v)| (c.clone(), v.clone()))
             .unzip();
-        let row_key = build_row_key(&cols, &vals);
 
         let table_columns: Vec<String> = self
             .catalog
@@ -9530,84 +10750,50 @@ impl GatewayHandler {
             .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
             .unwrap_or_else(|| cols.clone());
 
-        // Pre-image capture: v0.51.4 Slice 0 needs this for every DELETE (not
-        // just `RETURNING` ones) so the compiled-view refresh path can build
-        // a true row-level delta (weight -1) instead of a full-table
-        // rescan — see `DmlOp::Delete::returning_tsv` doc comment. This is a
-        // single-row `get()` by key, bounded and proportional to one row,
-        // not a table scan.
-        let mut captured_row: Option<Vec<String>> = None;
-        {
-            let buffered_existing = conn_id.and_then(|id| {
-                self.write_buffers
-                    .get(id)
-                    .and_then(|buffer| buffer.current_row_image(&table, &row_key))
-            });
-            let existing_str = match buffered_existing {
-                Some(Some(tsv)) => Some(tsv),
-                Some(None) => None,
-                None => {
-                    if let Some(shard_db) = &self.shard_db {
-                        let key = format!("view_output/{table}/{row_key}");
-                        shard_db
-                            .get(key.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                PgWireError::ApiError(Box::new(
-                                    crate::error::GatewayError::Storage(e),
-                                ))
-                            })?
-                            .map(|raw| String::from_utf8_lossy(&raw).to_string())
-                    } else {
-                        None
-                    }
-                }
+        let matched_rows = self
+            .find_matching_rows_for_table(&table, &table_columns, &where_pairs, conn_id)
+            .await?;
+
+        if matched_rows.is_empty() {
+            if let Some(returning_cols) = &returning_cols {
+                return Ok(vec![self.build_returning_response(
+                    &table,
+                    &table_columns,
+                    returning_cols,
+                    Vec::new(),
+                )]);
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("DELETE 0").with_rows(0),
+            ))]);
+        }
+
+        let mut captured_rows = Vec::with_capacity(matched_rows.len());
+
+        for (row_key, existing_fields) in matched_rows {
+            let returning_tsv = Some(existing_fields.join("\t"));
+            let op = DmlOp::Delete {
+                table: table.clone(),
+                row_key,
+                returning_tsv,
             };
-            match existing_str {
-                Some(tsv) => {
-                    let mut row: Vec<String> = tsv.split('\t').map(|s| s.to_string()).collect();
-                    row.resize(table_columns.len(), String::new());
-                    captured_row = Some(row);
-                }
-                None if returning_cols.is_some() => {
-                    if let Some(ref rcols) = returning_cols {
-                        return Ok(vec![self.build_returning_response(
-                            &table,
-                            &table_columns,
-                            rcols,
-                            Vec::new(),
-                        )]);
-                    }
-                }
 
-                None => {}
+            if let Some(id) = conn_id {
+                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+                if let Err(e) = entry.push(op) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                    )))]);
+                }
             }
+            captured_rows.push(existing_fields);
         }
 
-        let returning_tsv = captured_row.as_ref().map(|row| row.join("\t"));
-
-        let op = DmlOp::Delete {
-            table: table.clone(),
-            row_key,
-            returning_tsv,
-        };
-
-        if let Some(id) = conn_id {
-            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
-            if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
-                )))]);
-            }
-        }
-
-        // Standard-PostgreSQL autocommit: any statement outside an explicit
-        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
-        // whether or not it has a `RETURNING` clause.
         let in_explicit_block = conn_id
             .and_then(|id| self.sessions.get(id))
             .map(|s| s.in_explicit_block)
             .unwrap_or(false);
+
         if !in_explicit_block {
             let commit_responses = self.handle_commit(conn_id).await?;
             if commit_responses
@@ -9619,23 +10805,17 @@ impl GatewayHandler {
         }
 
         if let Some(returning_cols) = &returning_cols {
-            // Slice A5: project the captured pre-image directly — the row
-            // is gone from view_output once the WriteBatch commits, so
-            // there is no post-commit re-read to perform. ROLLBACK / ROLLBACK
-            // TO SAVEPOINT discard this buffered DmlOp::Delete (and its
-            // captured returning_tsv) via WriteBuffer's existing mechanism;
-            // nothing is ever written to the shard before an actual COMMIT.
-            let row = captured_row.unwrap_or_default();
             return Ok(vec![self.build_returning_response(
                 &table,
                 &table_columns,
                 returning_cols,
-                vec![row],
+                captured_rows,
             )]);
         }
 
+        let count = captured_rows.len();
         Ok(vec![promote_response(Response::Execution(
-            Tag::new("DELETE 1").with_rows(1),
+            Tag::new(&format!("DELETE {count}")).with_rows(count),
         ))])
     }
 
@@ -10375,6 +11555,14 @@ impl SimpleQueryHandler for GatewayHandler {
             }
         }
 
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let is_empty_query = query.chars().all(|c| c.is_whitespace() || c == ';');
         if is_empty_query {
             return Ok(vec![Response::EmptyQuery]);
@@ -10435,6 +11623,14 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -10500,6 +11696,14 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -10612,6 +11816,14 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -11286,6 +12498,26 @@ impl GatewayServer {
         self
     }
 
+    /// Fix the join strategy before the server starts compiling views.
+    pub fn with_join_strategy(mut self, join_strategy: JoinStrategy) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.join_strategy = join_strategy;
+        }
+        self
+    }
+
+    pub fn with_distributed_data_plane(
+        mut self,
+        client: DataPlaneClient,
+        storage_root: impl Into<String>,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.distributed_data_plane = Some(client);
+            handler.distributed_storage_root = Some(storage_root.into());
+        }
+        self
+    }
+
     /// Attach a custom `SecretStore` to the server.
     pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
         if let Some(h) = Arc::get_mut(&mut self.handler) {
@@ -11447,6 +12679,31 @@ impl GatewayServer {
     }
     pub fn catalog(&self) -> &Arc<CatalogStubs> {
         &self.handler.catalog
+    }
+
+    pub fn mark_draining(&self) {
+        self.handler.mark_draining();
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.handler.is_draining()
+    }
+
+    pub fn in_flight_queries(&self) -> usize {
+        self.handler.in_flight_queries()
+    }
+
+    /// Execute graceful drain and stop sequence:
+    /// 1. Mark server as draining so incoming queries receive 57P01 (RS-2056).
+    /// 2. Wait up to `grace_period` for in-flight queries to finish.
+    /// 3. Close notify and subscription listeners.
+    pub async fn drain_and_stop(&self, grace_period: Duration) {
+        self.mark_draining();
+        let deadline = tokio::time::Instant::now() + grace_period;
+        while self.in_flight_queries() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.handler.notify_registry.clear();
     }
 
     /// Bind the independent HTTP webhook listener.  It intentionally does not
@@ -12004,22 +13261,43 @@ fn sha256_16(data: &[u8]) -> [u8; 16] {
 }
 
 /// Convert a `CatalogResponse` to a pgwire `Response`.
+fn catalog_field_type(column: &str) -> Type {
+    match column {
+        "exists"
+        | "is_partition"
+        | "has_subclass"
+        | "has_row_level_security"
+        | "relhasrules"
+        | "relhastriggers"
+        | "relispartition"
+        | "indisunique"
+        | "indisprimary"
+        | "attnotnull" => Type::BOOL,
+        _ => Type::TEXT,
+    }
+}
+
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     match resp {
         CatalogResponse::CommandComplete(tag) => Response::Execution(Tag::new(&tag)),
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                .map(|c| {
+                    let datatype = catalog_field_type(c);
+                    FieldInfo::new(c.clone(), None, None, datatype, FieldFormat::Text)
+                })
                 .collect();
             let schema = Arc::new(fields);
             let schema_ref = schema.clone();
             let stream = stream::iter(rows).map(move |row: Vec<Option<String>>| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                for field in &row {
-                    encoder
-                        .encode_field(&field.as_deref())
-                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                for (index, field) in row.iter().enumerate() {
+                    let datatype = schema_ref
+                        .get(index)
+                        .map(|field| field.datatype())
+                        .unwrap_or(&Type::TEXT);
+                    encode_typed_field(&mut encoder, datatype, field.as_deref())?;
                 }
                 encoder.finish()
             });
@@ -12027,6 +13305,211 @@ fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
             Response::Query(QueryResponse::new(schema, stream))
         }
     }
+}
+
+const DIAGNOSTIC_DESCRIPTOR_COLUMNS: &[&str] = &[
+    "code",
+    "key",
+    "title",
+    "severity",
+    "sqlstate",
+    "retry_class",
+    "next_steps",
+    "doc_anchor",
+];
+
+const DIAGNOSTIC_OCCURRENCE_COLUMNS: &[&str] = &[
+    "code",
+    "key",
+    "title",
+    "severity",
+    "sqlstate",
+    "retry_class",
+    "message",
+    "correlation_id",
+    "context",
+    "retry_after_ms",
+    "causal_code",
+    "causal_correlation_id",
+    "causal_message",
+    "causal_context",
+    "next_steps",
+    "doc_anchor",
+];
+
+fn diagnostic_error_response(
+    code: ErrorCode,
+    context: impl IntoIterator<Item = (String, String)>,
+) -> Response<'static> {
+    let correlation_id = uuid::Uuid::new_v4();
+    let occurrence = match DiagnosticOccurrence::new(code, correlation_id, context, None, None) {
+        Ok(occurrence) => occurrence,
+        Err(_) => DiagnosticOccurrence {
+            code,
+            correlation_id,
+            message: ErrorDescriptor::lookup(code)
+                .map(|descriptor| descriptor.title.clone())
+                .unwrap_or_else(|| "Unknown error".to_string()),
+            context: BTreeMap::new(),
+            retry_after: None,
+            cause: None,
+        },
+    };
+    record_diagnostic(occurrence.clone());
+    let (severity, sqlstate) = ErrorDescriptor::lookup(code)
+        .map(|descriptor| (descriptor.severity.to_string(), descriptor.sqlstate.clone()))
+        .unwrap_or_else(|| ("ERROR".to_string(), "XX000".to_string()));
+    Response::Error(Box::new(ErrorInfo::new(
+        severity,
+        sqlstate,
+        occurrence.render_text(),
+    )))
+}
+
+fn diagnostic_query_response(query: &str) -> Option<Response<'static>> {
+    diagnostic_catalog_response(query).map(|response| match response {
+        Ok(response) => catalog_resp_to_response(response),
+        Err((severity, sqlstate, message)) => {
+            Response::Error(Box::new(ErrorInfo::new(severity, sqlstate, message)))
+        }
+    })
+}
+
+fn diagnostic_catalog_response(
+    query: &str,
+) -> Option<Result<CatalogResponse, (String, String, String)>> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "show diagnostic" || lower.starts_with("show diagnostic ") {
+        let mut parts = trimmed.split_whitespace();
+        let _show = parts.next();
+        let _diagnostic = parts.next();
+        let Some(raw_code) = parts.next() else {
+            return Some(Err(diagnostic_syntax_error(
+                "SHOW DIAGNOSTIC requires an RS-XXXX code",
+            )));
+        };
+        if parts.next().is_some() {
+            return Some(Err(diagnostic_syntax_error(
+                "SHOW DIAGNOSTIC accepts exactly one RS-XXXX code",
+            )));
+        }
+        let Some(code) = parse_diagnostic_code(raw_code) else {
+            return Some(Err(diagnostic_syntax_error(
+                "diagnostic code must use the RS-XXXX format",
+            )));
+        };
+        let Some(descriptor) = ErrorDescriptor::lookup(code) else {
+            return Some(Err(diagnostic_syntax_error("unknown diagnostic code")));
+        };
+        return Some(Ok(CatalogResponse::Rows {
+            columns: DIAGNOSTIC_DESCRIPTOR_COLUMNS
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows: vec![vec![
+                Some(descriptor.code.to_string()),
+                Some(descriptor.key.clone()),
+                Some(descriptor.title.clone()),
+                Some(descriptor.severity.to_string()),
+                Some(descriptor.sqlstate.clone()),
+                Some(descriptor.retry_class.to_string()),
+                Some(descriptor.default_next_steps.clone()),
+                Some(descriptor.doc_anchor.clone()),
+            ]],
+        }));
+    }
+
+    if lower == "show diagnostics" || lower.starts_with("show diagnostics ") {
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        let limit = match parts.as_slice() {
+            [_, _] => MAX_DIAGNOSTIC_OCCURRENCES,
+            [_, _, limit_keyword, raw_limit] if limit_keyword.eq_ignore_ascii_case("limit") => {
+                let Ok(limit) = raw_limit.parse::<usize>() else {
+                    return Some(Err(diagnostic_syntax_error(
+                        "SHOW DIAGNOSTICS LIMIT requires a non-negative integer",
+                    )));
+                };
+                limit.min(MAX_DIAGNOSTIC_OCCURRENCES)
+            }
+            _ => {
+                return Some(Err(diagnostic_syntax_error(
+                    "SHOW DIAGNOSTICS accepts only an optional LIMIT n",
+                )))
+            }
+        };
+        let rows = global_diagnostic_journal()
+            .lock()
+            .recent(limit)
+            .into_iter()
+            .filter_map(diagnostic_occurrence_row)
+            .collect();
+        return Some(Ok(CatalogResponse::Rows {
+            columns: DIAGNOSTIC_OCCURRENCE_COLUMNS
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows,
+        }));
+    }
+
+    None
+}
+
+fn parse_diagnostic_code(raw_code: &str) -> Option<ErrorCode> {
+    let number = raw_code
+        .strip_prefix("RS-")
+        .or_else(|| raw_code.strip_prefix("rs-"))?;
+    (number.len() == 4)
+        .then(|| number.parse::<u16>().ok())
+        .flatten()
+        .map(ErrorCode::new)
+}
+
+fn diagnostic_syntax_error(detail: &str) -> (String, String, String) {
+    let descriptor = ErrorDescriptor::lookup(RS_1012);
+    (
+        descriptor
+            .map(|value| value.severity.to_string())
+            .unwrap_or_else(|| "ERROR".to_string()),
+        descriptor
+            .map(|value| value.sqlstate.clone())
+            .unwrap_or_else(|| "42601".to_string()),
+        format!(
+            "[{}] {}: {}. next_steps: {}",
+            RS_1012,
+            descriptor
+                .map(|value| value.key.as_str())
+                .unwrap_or("sql.parse_failed"),
+            detail,
+            descriptor
+                .map(|value| value.default_next_steps.as_str())
+                .unwrap_or("Check the SQL syntax and retry.")
+        ),
+    )
+}
+
+fn diagnostic_occurrence_row(occurrence: DiagnosticOccurrence) -> Option<Vec<Option<String>>> {
+    let descriptor = occurrence.descriptor()?;
+    let cause = occurrence.cause.as_deref();
+    Some(vec![
+        Some(occurrence.code.to_string()),
+        Some(descriptor.key.clone()),
+        Some(descriptor.title.clone()),
+        Some(descriptor.severity.to_string()),
+        Some(descriptor.sqlstate.clone()),
+        Some(descriptor.retry_class.to_string()),
+        Some(occurrence.message.clone()),
+        Some(occurrence.correlation_id.to_string()),
+        Some(serde_json::to_string(&occurrence.context).ok()?),
+        occurrence.retry_after_ms().map(|value| value.to_string()),
+        cause.map(|value| value.code.to_string()),
+        cause.map(|value| value.correlation_id.to_string()),
+        cause.map(|value| value.message.clone()),
+        cause.and_then(|value| serde_json::to_string(&value.context).ok()),
+        Some(descriptor.default_next_steps.clone()),
+        Some(descriptor.doc_anchor.clone()),
+    ])
 }
 
 /// Promote a `Response<'_>` to `Response<'static>` by ensuring all contained
@@ -12044,6 +13527,14 @@ fn promote_response(r: Response<'_>) -> Response<'static> {
     // This is the standard pattern in pgwire examples that need to escape the
     // `'a` lifetime from `do_query`.
     unsafe { std::mem::transmute(r) }
+}
+
+fn subscribe_error_response(error: SubscribeError) -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "22000".to_owned(),
+        error.to_string(),
+    )))
 }
 
 fn parse_duration_literal(raw: &str) -> Option<Duration> {
@@ -12575,11 +14066,18 @@ fn analyze_select_query(catalog: &CatalogStubs, q: &str) -> Option<AnalyzedSelec
     );
 
     let mut seen = HashSet::new();
-    let referenced_tables = raw_relations
+    let referenced_tables: Vec<String> = raw_relations
         .into_iter()
         .filter_map(|raw_name| resolve_catalog_relation_name(catalog, &raw_name))
         .filter(|name| seen.insert(name.clone()))
         .collect();
+
+    if top_level_relation.is_none() {
+        top_level_relation = referenced_tables.first().cloned();
+    }
+    if top_level_relation_full.is_none() {
+        top_level_relation_full = top_level_relation.clone();
+    }
 
     Some(AnalyzedSelectQuery {
         top_level_relation,
@@ -12601,11 +14099,12 @@ fn backfill_not_published_response(view_name: &str) -> Vec<Response<'static>> {
 }
 
 fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
+    use chrono::TimeZone;
     use datafusion::arrow::array::{
-        Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        StringArray,
+        Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, StringArray, TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::DataType as ArrowDataType;
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 
     if batches.is_empty() {
         let schema = Arc::new(Vec::<FieldInfo>::new());
@@ -12634,6 +14133,11 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                 ArrowDataType::Float32 => Type::FLOAT4,
                 ArrowDataType::Float64 => Type::FLOAT8,
                 ArrowDataType::Boolean => Type::BOOL,
+                ArrowDataType::Date32 | ArrowDataType::Date64 => Type::DATE,
+                ArrowDataType::Timestamp(_, None) => Type::TIMESTAMP,
+                ArrowDataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
+                ArrowDataType::Decimal128(_, _) | ArrowDataType::Decimal256(_, _) => Type::NUMERIC,
+                ArrowDataType::FixedSizeBinary(16) => Type::UUID,
                 ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Type::TEXT,
                 _ => Type::TEXT,
             };
@@ -12685,7 +14189,52 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                             }
                         })
                     }
-                    ArrowDataType::Utf8 => col
+                    ArrowDataType::Date32 => col.as_any().downcast_ref::<Date32Array>().map(|a| {
+                        let days = a.value(row_idx);
+                        let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
+                        let date = epoch + chrono::Duration::days(days as i64);
+                        date.format("%Y-%m-%d").to_string()
+                    }),
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => col
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .map(|a| {
+                            let ts_micros = a.value(row_idx);
+                            let dt = chrono::Utc
+                                .timestamp_micros(ts_micros)
+                                .single()
+                                .unwrap_or_else(|| {
+                                    chrono::DateTime::from_timestamp(
+                                        ts_micros / 1_000_000,
+                                        ((ts_micros % 1_000_000).unsigned_abs() * 1000) as u32,
+                                    )
+                                    .unwrap_or_default()
+                                });
+                            dt.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string()
+                        }),
+                    ArrowDataType::FixedSizeBinary(16) => col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::FixedSizeBinaryArray>()
+                        .map(|a| {
+                            let bytes = a.value(row_idx);
+                            if let Ok(u) = uuid::Uuid::from_slice(bytes) {
+                                u.to_string()
+                            } else {
+                                bytes
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<String>()
+                            }
+                        }),
+                    ArrowDataType::Decimal128(_precision, scale) => col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Decimal128Array>()
+                        .map(|a| {
+                            let val = a.value(row_idx);
+                            rust_decimal::Decimal::from_i128_with_scale(val, *scale as u32)
+                                .to_string()
+                        }),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => col
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .map(|a| a.value(row_idx).to_string()),
@@ -12755,6 +14304,214 @@ fn full_row_pk(column_count: usize) -> Vec<usize> {
     (0..column_count).collect()
 }
 
+fn stable_name_id(namespace: &str, name: &str) -> u64 {
+    namespace
+        .bytes()
+        .chain([0])
+        .chain(name.bytes())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+fn source_routing_column(
+    plan: &rockstream_plan::PlanNode,
+    output_column: usize,
+) -> Option<(String, usize)> {
+    use rockstream_plan::{Expr, PlanNode};
+    match plan {
+        PlanNode::Source { name } => Some((name.clone(), output_column)),
+        PlanNode::Filter { input, .. } | PlanNode::Map { input, .. } => {
+            source_routing_column(input, output_column)
+        }
+        PlanNode::Project { input, columns } => {
+            let Expr::Column(input_column) = columns.get(output_column)? else {
+                return None;
+            };
+            source_routing_column(input, *input_column)
+        }
+        PlanNode::ViewSink { child, .. } => source_routing_column(child, output_column),
+        _ => None,
+    }
+}
+
+fn join_routing_columns(plan: &rockstream_plan::PlanNode) -> Option<BTreeMap<String, usize>> {
+    use rockstream_plan::PlanNode;
+    match plan {
+        PlanNode::InnerJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            let left = source_routing_column(left, *left_keys.first()?)?;
+            let right = source_routing_column(right, *right_keys.first()?)?;
+            Some(BTreeMap::from([left, right]))
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. }
+        | PlanNode::Aggregate { input, .. } => join_routing_columns(input),
+        PlanNode::ViewSink { child, .. } => join_routing_columns(child),
+        _ => None,
+    }
+}
+
+fn aggregate_routing(
+    plan: &rockstream_plan::PlanNode,
+) -> Option<(BTreeMap<String, usize>, Vec<usize>)> {
+    use rockstream_plan::{Expr, PlanNode};
+    match plan {
+        PlanNode::Aggregate {
+            input, group_by, ..
+        } => {
+            let Expr::Column(column) = group_by.first()? else {
+                return None;
+            };
+            let (source, column) = source_routing_column(input, *column)?;
+            Some((
+                BTreeMap::from([(source, column)]),
+                (0..group_by.len()).collect(),
+            ))
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. } => aggregate_routing(input),
+        PlanNode::ViewSink { child, .. } => aggregate_routing(child),
+        _ => None,
+    }
+}
+
+fn aggregate_merge_keys(plan: &rockstream_plan::PlanNode) -> Option<Vec<usize>> {
+    use rockstream_plan::PlanNode;
+    match plan {
+        PlanNode::Aggregate { group_by, .. } => Some((0..group_by.len()).collect()),
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. } => aggregate_merge_keys(input),
+        PlanNode::ViewSink { child, .. } => aggregate_merge_keys(child),
+        _ => None,
+    }
+}
+
+fn deployment_routing(
+    plan: &rockstream_plan::PlanNode,
+) -> Option<(BTreeMap<String, usize>, Vec<usize>)> {
+    if let Some(routing) = join_routing_columns(plan) {
+        Some((routing, aggregate_merge_keys(plan)?))
+    } else {
+        aggregate_routing(plan)
+    }
+}
+
+fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {
+    let mut rows = Vec::new();
+    for op in ops {
+        match op {
+            DmlOp::Insert {
+                table: op_table,
+                values_tsv,
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => rows.push(RuntimeRow {
+                values_tsv: values_tsv.clone(),
+                weight: 1,
+            }),
+            DmlOp::Update {
+                table: op_table,
+                old_tsv,
+                new_tsv,
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => {
+                rows.push(RuntimeRow {
+                    values_tsv: old_tsv.clone(),
+                    weight: -1,
+                });
+                rows.push(RuntimeRow {
+                    values_tsv: new_tsv.clone(),
+                    weight: 1,
+                });
+            }
+            DmlOp::Delete {
+                table: op_table,
+                returning_tsv: Some(values_tsv),
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => rows.push(RuntimeRow {
+                values_tsv: values_tsv.clone(),
+                weight: -1,
+            }),
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, GatewayError> {
+    let mut shard_rows = Vec::new();
+    for shard in &snapshot.shards {
+        let mut state = BTreeMap::<String, i64>::new();
+        for delta in &shard.deltas {
+            for row in &delta.rows {
+                *state.entry(row.values_tsv.clone()).or_default() += row.weight;
+            }
+        }
+        shard_rows.extend(
+            state
+                .into_iter()
+                .filter_map(|(row, weight)| (weight > 0).then_some(row)),
+        );
+    }
+
+    let merge_keys = &snapshot.deployment.merge_key_columns;
+    if merge_keys.is_empty() {
+        return Ok(shard_rows.into_iter().map(|row| row.into_bytes()).collect());
+    }
+
+    let mut merged = BTreeMap::<String, Vec<String>>::new();
+    for row in shard_rows {
+        let fields = row.split('\t').map(str::to_string).collect::<Vec<_>>();
+        let key = merge_keys
+            .iter()
+            .filter_map(|column| fields.get(*column))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        match merged.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(fields);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                for (column, value) in fields.iter().enumerate() {
+                    if merge_keys.contains(&column) {
+                        continue;
+                    }
+                    let current = entry.get()[column].parse::<i64>().map_err(|error| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed merge column {column}: {error}"),
+                        }
+                    })?;
+                    let incoming = value.parse::<i64>().map_err(|error| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed merge column {column}: {error}"),
+                        }
+                    })?;
+                    entry.get_mut()[column] = current
+                        .checked_add(incoming)
+                        .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed merge overflow in column {column}"),
+                        })?
+                        .to_string();
+                }
+            }
+        }
+    }
+
+    Ok(merged
+        .into_values()
+        .map(|fields| fields.join("\t").into_bytes())
+        .collect())
+}
+
 /// v0.51.4 Slice 0: build a signed-weight `ArrowZSet` from the commit's own
 /// row-level `DmlOp`s for a single source table — the true delta fed into a
 /// compiled view's pipeline, replacing the retired full-table rescan.
@@ -12775,9 +14532,10 @@ fn full_row_pk(column_count: usize) -> Vec<usize> {
 /// logic.)
 fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{
-        ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+        ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryBuilder, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
     let n = rows.len();
     let num_cols = schema.fields().len();
@@ -12802,6 +14560,13 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
         .enumerate()
         .map(|(i, field)| {
             Ok(match field.data_type() {
+                DataType::Int16 => {
+                    let vals: Vec<Option<i16>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Int16Array::from(vals)) as ArrayRef
+                }
                 DataType::Int32 => {
                     let vals: Vec<Option<i32>> = col_strs[i]
                         .iter()
@@ -12815,6 +14580,13 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
                         .collect();
                     Arc::new(Int64Array::from(vals)) as ArrayRef
+                }
+                DataType::Float32 => {
+                    let vals: Vec<Option<f32>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Float32Array::from(vals)) as ArrayRef
                 }
                 DataType::Float64 => {
                     let vals: Vec<Option<f64>> = col_strs[i]
@@ -12847,6 +14619,60 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         })
                         .collect();
                     Arc::new(BooleanArray::from(vals)) as ArrayRef
+                }
+                DataType::Date32 => {
+                    let vals: Vec<Option<i32>> = col_strs[i]
+                        .iter()
+                        .map(|s| {
+                            let s = s.as_deref()?;
+                            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
+                                Some((d - epoch).num_days() as i32)
+                            } else {
+                                s.parse().ok()
+                            }
+                        })
+                        .collect();
+                    Arc::new(Date32Array::from(vals)) as ArrayRef
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    let vals: Vec<Option<i64>> = col_strs[i]
+                        .iter()
+                        .map(|s| {
+                            let s = s.as_deref()?;
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                                Some(dt.timestamp_micros())
+                            } else if let Ok(dt) =
+                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                            {
+                                Some(dt.and_utc().timestamp_micros())
+                            } else if let Ok(dt) =
+                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                            {
+                                Some(dt.and_utc().timestamp_micros())
+                            } else {
+                                s.parse().ok()
+                            }
+                        })
+                        .collect();
+                    Arc::new(TimestampMicrosecondArray::from(vals)) as ArrayRef
+                }
+                DataType::FixedSizeBinary(16) => {
+                    let mut builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+                    for opt_s in &col_strs[i] {
+                        if let Some(s) = opt_s {
+                            if let Ok(u) = uuid::Uuid::parse_str(s) {
+                                builder
+                                    .append_value(u.as_bytes())
+                                    .map_err(|e| e.to_string())?;
+                            } else {
+                                builder.append_null();
+                            }
+                        } else {
+                            builder.append_null();
+                        }
+                    }
+                    Arc::new(builder.finish()) as ArrayRef
                 }
                 _ => {
                     let vals: Vec<Option<String>> = col_strs[i]
@@ -12948,6 +14774,160 @@ fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
             }
         }
     }
+}
+
+async fn committed_dml_ops(
+    shard_db: &rockstream_storage::ShardDb,
+    ops: Vec<DmlOp>,
+) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
+    let mut images = stream::iter(dml_image_tables(&ops))
+        .map(|(key, table)| async move {
+            let storage_key = format!("view_output/{table}/{}", key.1);
+            let image = shard_db
+                .get(storage_key.as_bytes())
+                .await?
+                .map(|value| String::from_utf8_lossy(&value).into_owned());
+            Ok::<_, rockstream_storage::StorageError>((key, image))
+        })
+        .buffer_unordered(64)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut committed = Vec::with_capacity(ops.len());
+    for op in ops {
+        let valid = match &op {
+            DmlOp::Insert {
+                table,
+                row_key,
+                values_tsv,
+                ..
+            } => {
+                let image = cached_row_image(shard_db, &mut images, table, row_key).await?;
+                if image.is_none() {
+                    images.insert(
+                        (table.to_ascii_lowercase(), row_key.clone()),
+                        Some(values_tsv.clone()),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            DmlOp::Update {
+                table,
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            } => {
+                let image = cached_row_image(shard_db, &mut images, table, old_row_key).await?;
+                if image.as_deref() == Some(old_tsv) {
+                    images.insert((table.to_ascii_lowercase(), old_row_key.clone()), None);
+                    images.insert(
+                        (table.to_ascii_lowercase(), new_row_key.clone()),
+                        Some(new_tsv.clone()),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            DmlOp::Delete {
+                table,
+                row_key,
+                returning_tsv,
+            } => {
+                let image = cached_row_image(shard_db, &mut images, table, row_key).await?;
+                if returning_tsv.as_deref() == image.as_deref() {
+                    images.insert((table.to_ascii_lowercase(), row_key.clone()), None);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if valid {
+            committed.push(op);
+        }
+    }
+    Ok(committed)
+}
+
+fn dml_image_tables(ops: &[DmlOp]) -> HashMap<(String, String), String> {
+    let mut tables = HashMap::new();
+    for op in ops {
+        let (table, row_key) = match op {
+            DmlOp::Insert { table, row_key, .. } | DmlOp::Delete { table, row_key, .. } => {
+                (table, row_key)
+            }
+            DmlOp::Update {
+                table, old_row_key, ..
+            } => (table, old_row_key),
+        };
+        tables
+            .entry((table.to_ascii_lowercase(), row_key.clone()))
+            .or_insert_with(|| table.clone());
+    }
+    tables
+}
+
+#[cfg(test)]
+#[test]
+fn dml_image_tables_normalizes_and_deduplicates_preimages() {
+    let images = dml_image_tables(&[
+        DmlOp::Insert {
+            table: "Orders".to_string(),
+            cols: vec![],
+            values_tsv: "1".to_string(),
+            row_key: "id=1".to_string(),
+        },
+        DmlOp::Update {
+            table: "orders".to_string(),
+            old_row_key: "id=1".to_string(),
+            old_tsv: "1".to_string(),
+            new_row_key: "id=2".to_string(),
+            new_tsv: "2".to_string(),
+        },
+        DmlOp::Delete {
+            table: "items".to_string(),
+            row_key: "id=3".to_string(),
+            returning_tsv: Some("3".to_string()),
+        },
+    ]);
+
+    assert_eq!(
+        images,
+        HashMap::from([
+            (
+                ("orders".to_string(), "id=1".to_string()),
+                "Orders".to_string()
+            ),
+            (
+                ("items".to_string(), "id=3".to_string()),
+                "items".to_string()
+            ),
+        ])
+    );
+}
+
+async fn cached_row_image(
+    shard_db: &rockstream_storage::ShardDb,
+    images: &mut HashMap<(String, String), Option<String>>,
+    table: &str,
+    row_key: &str,
+) -> Result<Option<String>, rockstream_storage::StorageError> {
+    let key = (table.to_ascii_lowercase(), row_key.to_string());
+    if let Some(image) = images.get(&key) {
+        return Ok(image.clone());
+    }
+    let storage_key = format!("view_output/{table}/{row_key}");
+    let image = shard_db
+        .get(storage_key.as_bytes())
+        .await?
+        .map(|value| String::from_utf8_lossy(&value).into_owned());
+    images.insert(key, image.clone());
+    Ok(image)
 }
 
 fn source_view_connector_id(source_name: &str, view_name: &str) -> ConnectorId {
@@ -13755,14 +15735,79 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
     }
 }
 
+/// Build FieldInfo list for a RETURNING clause.
+fn describe_returning_fields(
+    catalog: &CatalogStubs,
+    table: &str,
+    returning_cols: &[String],
+) -> Vec<FieldInfo> {
+    let catalog_table = catalog.get_table(table);
+    let table_columns: Vec<String> = catalog_table
+        .as_ref()
+        .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    let is_star = returning_cols.len() == 1 && returning_cols[0] == "*";
+    let projected_cols: Vec<String> = if is_star {
+        table_columns
+    } else {
+        returning_cols.to_vec()
+    };
+    projected_cols
+        .iter()
+        .map(|col| {
+            if let Some(ct) = &catalog_table {
+                if let Some(c) = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+                    let oid = arrow_type_to_pg_oid(&c.data_type);
+                    return FieldInfo::new(
+                        c.name.clone(),
+                        None,
+                        None,
+                        pg_type_from_oid(oid),
+                        FieldFormat::Text,
+                    );
+                }
+            }
+            FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
+        })
+        .collect()
+}
+
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
+    let ql = q.trim().to_lowercase();
+    if let Some(Ok(CatalogResponse::Rows { columns, .. })) = diagnostic_catalog_response(q) {
+        return columns
+            .into_iter()
+            .map(|column| FieldInfo::new(column, None, None, Type::TEXT, FieldFormat::Text))
+            .collect();
+    }
+    if ql.starts_with("update ") {
+        if let Ok((table, _, _, Some(ret_cols))) = parse_update(q) {
+            return describe_returning_fields(catalog, &table, &ret_cols);
+        }
+    }
+    if ql.starts_with("delete from ") {
+        if let Ok((table, _, Some(ret_cols))) = parse_delete(q) {
+            return describe_returning_fields(catalog, &table, &ret_cols);
+        }
+    }
+    if ql.starts_with("insert into ") && ql.contains(" returning ") {
+        if let Ok((table, _, _)) = parse_insert(q) {
+            if let Ok((_, Some(ret_cols))) = split_returning_clause(q) {
+                return describe_returning_fields(catalog, &table, &ret_cols);
+            }
+        }
+    }
+
     if let Some(CatalogResponse::Rows { columns, .. }) =
         catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default())
     {
         return columns
             .iter()
-            .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .map(|c| {
+                let datatype = catalog_field_type(c);
+                FieldInfo::new(c.clone(), None, None, datatype, FieldFormat::Text)
+            })
             .collect();
     }
     if let Some(view_name) = extract_view_name_from_select(q) {
@@ -13996,19 +16041,21 @@ fn create_sink_error_response(message: String) -> Response<'static> {
 }
 
 fn connector_removed_error_response() -> Response<'static> {
-    create_sink_error_response(
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "0A000".to_owned(),
         "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.".to_string(),
-    )
+    )))
 }
 
 fn is_removed_connector_ddl(query: &str) -> bool {
     let removed_sink = query.starts_with("create sink ")
         && query.contains(" for view ")
-        && (query.contains(" to iceberg")
-            || query.contains(" to delta")
-            || query.contains(" to parquet")
+        && (query.contains(" to parquet")
             || query.contains(" to s3")
-            || query.contains(" to object_store"));
+            || query.contains(" to object_store")
+            || ((query.contains(" to iceberg") || query.contains(" to delta"))
+                && !(query.contains("catalog") && query.contains("filesystem"))));
     removed_sink
         || (query.starts_with("create source ")
             && (query.contains(" type s3") || query.contains(" type http_webhook")))
@@ -14023,7 +16070,15 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         ));
     }
 
-    let after_create = &trimmed["CREATE SINK".len()..].trim();
+    let raw_after_create = &trimmed["CREATE SINK".len()..].trim();
+    let after_create = if raw_after_create
+        .to_lowercase()
+        .starts_with("if not exists ")
+    {
+        raw_after_create["if not exists ".len()..].trim()
+    } else {
+        raw_after_create
+    };
     let after_create_lower = after_create.to_lowercase();
     let for_view_pos = after_create_lower.find(" for view ").ok_or_else(|| {
         format!(
@@ -14274,6 +16329,7 @@ struct ParsedCreateSecret {
     name: String,
     secret_type: rockstream_types::secret::SecretType,
     payload: std::collections::HashMap<String, String>,
+    if_not_exists: bool,
 }
 
 fn parse_key_value_options(
@@ -14333,7 +16389,15 @@ fn parse_create_secret_ddl(q: &str) -> Result<ParsedCreateSecret, String> {
         ));
     }
 
-    let after_create = trimmed["CREATE SECRET".len()..].trim();
+    let raw_after_create = trimmed["CREATE SECRET".len()..].trim();
+    let (after_create, if_not_exists) = if raw_after_create
+        .to_lowercase()
+        .starts_with("if not exists ")
+    {
+        (raw_after_create["if not exists ".len()..].trim(), true)
+    } else {
+        (raw_after_create, false)
+    };
     let paren_pos = after_create.find('(').ok_or_else(|| {
         format!(
             "[RS-2424] secret.ddl_invalid: CREATE SECRET requires option list in parentheses. Next steps: {CREATE_SECRET_NEXT_STEPS}"
@@ -14378,6 +16442,7 @@ fn parse_create_secret_ddl(q: &str) -> Result<ParsedCreateSecret, String> {
         name,
         secret_type,
         payload: options,
+        if_not_exists,
     })
 }
 
@@ -14509,6 +16574,7 @@ struct ParsedCreateSource {
     source_type: String,
     options: std::collections::HashMap<String, String>,
     format: String,
+    if_not_exists: bool,
 }
 
 fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
@@ -14520,7 +16586,15 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
         ));
     }
 
-    let after_create = trimmed["CREATE SOURCE".len()..].trim();
+    let raw_after_create = trimmed["CREATE SOURCE".len()..].trim();
+    let (after_create, if_not_exists) = if raw_after_create
+        .to_lowercase()
+        .starts_with("if not exists ")
+    {
+        (raw_after_create["if not exists ".len()..].trim(), true)
+    } else {
+        (raw_after_create, false)
+    };
     let after_create_lower = after_create.to_lowercase();
     let type_pos = after_create_lower.find(" type ").ok_or_else(|| {
         format!(
@@ -14610,6 +16684,7 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
         source_type,
         options,
         format: format_str,
+        if_not_exists,
     })
 }
 
@@ -14689,10 +16764,15 @@ fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
     let lower = trimmed.to_lowercase();
 
     if lower.starts_with("drop source ") {
-        let name = trimmed["DROP SOURCE".len()..]
-            .trim()
-            .trim_matches('"')
-            .to_lowercase();
+        let after_drop = trimmed["DROP SOURCE".len()..].trim();
+        let name = if after_drop.to_lowercase().starts_with("if exists ") {
+            after_drop["if exists ".len()..]
+                .trim()
+                .trim_matches('"')
+                .to_lowercase()
+        } else {
+            after_drop.trim_matches('"').to_lowercase()
+        };
         if name.is_empty() {
             return Err(format!(
                 "[RS-4008] DROP SOURCE requires a source name. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
@@ -14957,7 +17037,7 @@ fn find_top_level_equals(input: &str) -> Option<usize> {
 
 fn parse_create_view_name(q: &str) -> Option<String> {
     let ql = q.trim().to_lowercase();
-    let after: &str = if ql.starts_with("create or replace materialized view ") {
+    let mut after: &str = if ql.starts_with("create or replace materialized view ") {
         q[36..].trim()
     } else if ql.starts_with("create materialized view ") {
         q[25..].trim()
@@ -14968,6 +17048,9 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     } else {
         return None;
     };
+    if after.to_lowercase().starts_with("if not exists ") {
+        after = after["if not exists ".len()..].trim();
+    }
     // Take up to " AS" followed by any whitespace (handles AS\n, AS\t, AS )
     let as_pos = find_as_separator(&after.to_lowercase())?;
     let raw = after[..as_pos]
@@ -15108,12 +17191,15 @@ fn apply_workload_settings(workload: &mut WorkloadDef, settings: &WorkloadSettin
 }
 
 fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
-    let after = q
+    let mut after = q
         .trim()
         .strip_prefix("CREATE WORKLOAD ")
         .or_else(|| q.trim().strip_prefix("create workload "))?
         .trim()
         .trim_end_matches(';');
+    if after.to_lowercase().starts_with("if not exists ") {
+        after = after["if not exists ".len()..].trim();
+    }
     let (name_part, options_part) = if let Some((name, rest)) = after.split_once(" WITH ") {
         (name.trim(), Some(rest.trim()))
     } else if let Some((name, rest)) = after.split_once(" with ") {
@@ -15154,12 +17240,15 @@ fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
 }
 
 fn parse_drop_workload(q: &str) -> Option<String> {
-    let after = q
+    let mut after = q
         .trim()
         .strip_prefix("DROP WORKLOAD ")
         .or_else(|| q.trim().strip_prefix("drop workload "))?
         .trim()
         .trim_end_matches(';');
+    if after.to_lowercase().starts_with("if exists ") {
+        after = after["if exists ".len()..].trim();
+    }
     let workload_name = after.trim_matches('"');
     if workload_name.is_empty() {
         None
@@ -15292,18 +17381,121 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
         let placeholder = format!("${}", i + 1);
         let replacement = match param {
             None => "NULL".to_string(),
-            Some(bytes) => match std::str::from_utf8(bytes) {
-                Err(_) => "NULL".to_string(),
-                Ok(s) => {
-                    // If the value is purely numeric (integer or float), use it bare.
-                    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+            Some(bytes) => {
+                if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
+                    // 1D PostgreSQL binary array decoding
+                    let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
+                    let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
+                    let mut offset = 20;
+                    let mut elems = Vec::new();
+                    for _ in 0..dim.max(0) {
+                        if offset + 4 > bytes.len() {
+                            break;
+                        }
+                        let len = i32::from_be_bytes(
+                            bytes[offset..offset + 4].try_into().unwrap_or_default(),
+                        );
+                        offset += 4;
+                        if len < 0 {
+                            elems.push("NULL".to_string());
+                        } else if offset + len as usize <= bytes.len() {
+                            let elem_bytes = &bytes[offset..offset + len as usize];
+                            offset += len as usize;
+                            let formatted = match elem_type {
+                                20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                    .to_string(),
+                                23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                    .to_string(),
+                                21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                    .to_string(),
+                                16 => {
+                                    if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
+                                        "true".to_string()
+                                    } else {
+                                        "false".to_string()
+                                    }
+                                }
+                                700 => {
+                                    f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                        .to_string()
+                                }
+                                701 => {
+                                    f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default())
+                                        .to_string()
+                                }
+                                _ => {
+                                    if let Ok(s) = std::str::from_utf8(elem_bytes) {
+                                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                                            s.to_string()
+                                        } else {
+                                            format!("'{}'", s.replace('\'', "''"))
+                                        }
+                                    } else {
+                                        "NULL".to_string()
+                                    }
+                                }
+                            };
+                            elems.push(formatted);
+                        }
+                    }
+                    format!("ARRAY[{}]", elems.join(", "))
+                } else if bytes
+                    .iter()
+                    .any(|&b| b < 32 && b != b'\t' && b != b'\n' && b != b'\r')
+                {
+                    // Binary parameter decoding (e.g. from tokio-postgres prepared statements)
+                    if bytes.len() == 8 {
+                        let num = bytes[..8].try_into().map(i64::from_be_bytes).unwrap_or(0);
+                        num.to_string()
+                    } else if bytes.len() == 4 {
+                        let num = bytes[..4].try_into().map(i32::from_be_bytes).unwrap_or(0);
+                        num.to_string()
+                    } else if bytes.len() == 2 {
+                        let num = bytes[..2].try_into().map(i16::from_be_bytes).unwrap_or(0);
+                        num.to_string()
+                    } else if bytes.len() == 1 {
+                        if bytes[0] == 0 {
+                            "false".to_string()
+                        } else if bytes[0] == 1 {
+                            "true".to_string()
+                        } else {
+                            bytes[0].to_string()
+                        }
+                    } else {
+                        "NULL".to_string()
+                    }
+                } else if let Ok(s) = std::str::from_utf8(bytes) {
+                    if s.starts_with('{') && s.ends_with('}') {
+                        // Text array parsing e.g. {1,2,3} or {"a","b"}
+                        let inner = &s[1..s.len() - 1].trim();
+                        if inner.is_empty() {
+                            "ARRAY[]".to_string()
+                        } else {
+                            let mut elems = Vec::new();
+                            for item in inner.split(',') {
+                                let item = item.trim();
+                                let unquoted = item.trim_matches('"');
+                                if unquoted.eq_ignore_ascii_case("null") {
+                                    elems.push("NULL".to_string());
+                                } else if unquoted.parse::<i64>().is_ok()
+                                    || unquoted.parse::<f64>().is_ok()
+                                {
+                                    elems.push(unquoted.to_string());
+                                } else {
+                                    elems.push(format!("'{}'", unquoted.replace('\'', "''")));
+                                }
+                            }
+                            format!("ARRAY[{}]", elems.join(", "))
+                        }
+                    } else if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
                         s.to_string()
                     } else {
-                        // Escape single-quotes and wrap in single quotes.
                         format!("'{}'", s.replace('\'', "''"))
                     }
+                } else {
+                    "NULL".to_string()
                 }
-            },
+            }
         };
         // Replace `$N::cast_type` as well as bare `$N`.
         // We do a simple regex-free replacement: find `$N` and strip any
@@ -15327,6 +17519,25 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
         // Now replace bare `$N` placeholders.
         result = result.replace(&placeholder, &replacement);
     }
+
+    // Normalize `= ANY(ARRAY[...])` expressions to `IN (...)`
+    while let Some(pos) = result.find("= ANY(ARRAY[") {
+        if let Some(end_bracket) = result[pos..].find(']') {
+            let close_paren = pos + end_bracket + 1;
+            if close_paren < result.len() && result.as_bytes()[close_paren] == b')' {
+                let inner = &result[pos + "= ANY(ARRAY[".len()..pos + end_bracket];
+                let in_expr = if inner.trim().is_empty() {
+                    "IN (NULL)".to_string()
+                } else {
+                    format!("IN ({})", inner)
+                };
+                result.replace_range(pos..close_paren + 1, &in_expr);
+                continue;
+            }
+        }
+        break;
+    }
+
     result
 }
 
@@ -15367,7 +17578,21 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             let part = part.trim();
             let mut tokens = part.split_whitespace();
             let col_name = tokens.next()?.to_lowercase();
-            let pg_type = tokens.next()?.to_uppercase();
+            let mut pg_type = tokens.next()?.to_uppercase();
+            // If pg_type starts with '(' but doesn't end with ')', consume tokens until ')'
+            if (pg_type.starts_with("DECIMAL(")
+                || pg_type.starts_with("NUMERIC(")
+                || pg_type.starts_with("VARCHAR("))
+                && !pg_type.ends_with(')')
+            {
+                for next_tok in tokens.by_ref() {
+                    pg_type.push(' ');
+                    pg_type.push_str(&next_tok.to_uppercase());
+                    if next_tok.ends_with(')') {
+                        break;
+                    }
+                }
+            }
             // Normalize multi-word types (e.g. "DOUBLE PRECISION")
             let full_type = if pg_type == "DOUBLE" {
                 let next = tokens.next().map(|s| s.to_uppercase()).unwrap_or_default();
@@ -15379,9 +17604,10 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             } else {
                 pg_type
             };
-            let arrow_type = full_type
+            let compact_type = full_type.replace(' ', "");
+            let arrow_type = compact_type
                 .strip_prefix("NUMERIC")
-                .or_else(|| full_type.strip_prefix("DECIMAL"))
+                .or_else(|| compact_type.strip_prefix("DECIMAL"))
                 .filter(|suffix| suffix.starts_with('(') && suffix.ends_with(')'))
                 .map(|suffix| format!("Decimal{suffix}"))
                 .unwrap_or_else(|| {
@@ -15896,6 +18122,56 @@ mod s4_tests {
         let catalog = Arc::new(CatalogStubs::new());
         let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
         Arc::new(GatewayHandler::new(catalog, reader))
+    }
+
+    #[test]
+    fn show_diagnostic_returns_the_complete_catalog_row() {
+        let Ok(CatalogResponse::Rows { columns, rows }) =
+            diagnostic_catalog_response("SHOW DIAGNOSTIC RS-2018;").unwrap()
+        else {
+            panic!("SHOW DIAGNOSTIC must return one row");
+        };
+        assert_eq!(
+            columns,
+            vec![
+                "code",
+                "key",
+                "title",
+                "severity",
+                "sqlstate",
+                "retry_class",
+                "next_steps",
+                "doc_anchor"
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("RS-2018".to_string()),
+                Some("session.max_staleness_exceeded".to_string()),
+                Some("Published frontier exceeded the session max_staleness bound; query proceeded".to_string()),
+                Some("WARN".to_string()),
+                Some("01000".to_string()),
+                Some("NonRetryable".to_string()),
+                Some("Increase rockstream.max_staleness, reduce publish lag, or switch to session_wait_for mode.".to_string()),
+                Some("rs-2018".to_string()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn diagnostic_lookup_rejects_invalid_input_with_catalog_error() {
+        let Err((severity, sqlstate, message)) =
+            diagnostic_catalog_response("SHOW DIAGNOSTICS LIMIT nope;").unwrap()
+        else {
+            panic!("invalid diagnostic limit must fail");
+        };
+        assert_eq!(severity, "ERROR");
+        assert_eq!(sqlstate, "42601");
+        assert_eq!(
+            message,
+            "[RS-1012] sql.parse_error: SHOW DIAGNOSTICS LIMIT requires a non-negative integer. next_steps: Check SQL syntax; see docs/language-features.md for the supported SQL subset."
+        );
     }
 
     #[test]

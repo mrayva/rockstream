@@ -4313,9 +4313,9 @@ async fn create_index_name_conflict_returns_rs2016_via_wire() {
         "expected RS-2016 for index name conflict; got {result:?}"
     );
 
-    // Same name on same table is idempotent (no error).
+    // IF NOT EXISTS makes the same name on the same table idempotent.
     client
-        .simple_query("CREATE INDEX idx_conflict ON table_a (col1)")
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_conflict ON table_a (col1)")
         .await
         .expect("idempotent CREATE INDEX on same table should succeed");
 }
@@ -4757,7 +4757,7 @@ fn test_all_rs_codes_have_sqlstate() {
         ("42P01", GatewayError::ViewNotFound("v".into())),
         ("54000", GatewayError::ResultSetTooLarge),
         (
-            "53100",
+            "53200",
             GatewayError::ShardBackpressure {
                 current_bytes: 1,
                 limit_bytes: 2,
@@ -4788,12 +4788,12 @@ fn test_all_rs_codes_have_sqlstate() {
             GatewayError::ConnectionLimitExceeded { limit: 10_000 },
         ),
         (
-            "28P01",
+            "28000",
             GatewayError::InvalidPassword {
                 user: "alice".into(),
             },
         ),
-        ("0A000", GatewayError::NotSupported("x".into())),
+        ("XX000", GatewayError::NotSupported("x".into())),
         ("42601", GatewayError::ParseError("x".into())),
         ("XX000", GatewayError::PgWire("x".into())),
         ("25P02", GatewayError::InFailedSqlTransaction),
