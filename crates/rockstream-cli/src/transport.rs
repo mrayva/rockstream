@@ -9,27 +9,32 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rockstream_control::{
+    compute_file_sha256, BackupFileEntry, BackupManifest, BACKUP_MANIFEST_FILENAME,
+    CURRENT_STORAGE_FORMAT,
+};
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::diagnostic::{
     DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES, MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
 };
 use rockstream_types::error_code::{
-    RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
-    RS_2401, RS_2410, RS_2411, RS_4009, RS_5030, RS_5035,
+    RS_0003, RS_0004, RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014,
+    RS_2006, RS_2401, RS_2410, RS_2411, RS_3612, RS_3615, RS_3616, RS_4009, RS_5035,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
+use rockstream_types::topology::{ControlMessage, RaftRoleWire, WorkerMessage};
 use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 
 use crate::output::{
-    CheckpointAlignmentInfo, CheckpointExportOutcome, CheckpointSummary, ClusterQuotasInfo,
-    ClusterResourceUsageInfo, ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome,
-    QueryResult, ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail,
-    SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo,
-    ShardInfo, SourceDetail, SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail,
-    ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail, WorkloadSummary,
-    AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    BackupCreateOutput, BackupInspectOutput, BackupVerifyOutput, CheckpointAlignmentInfo,
+    CheckpointExportOutcome, CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo,
+    ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome, QueryResult,
+    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
+    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
+    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
+    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -140,15 +145,351 @@ pub trait CliTransport: Send + Sync {
     fn identity(&self) -> &ClientIdentity;
 }
 
+// ─── API Traits ──────────────────────────────────────────────────────────────
+
+pub trait TopologyApi: Send + Sync {
+    fn cluster_status(&self) -> Result<ClusterStatusInfo, CliError>;
+    fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, CliError>;
+    fn list_workers(&self) -> Result<Vec<WorkerStatusInfo>, CliError>;
+    fn worker_status(&self, worker_id: Option<u64>) -> Result<Vec<WorkerStatusInfo>, CliError>;
+    fn list_shards(&self) -> Result<Vec<ShardInfo>, CliError>;
+}
+
+pub trait OperationApi: Send + Sync {
+    fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError>;
+    fn migrate_shard(
+        &self,
+        shard_id: u64,
+        target_worker: u64,
+    ) -> Result<MigrationOutcome, CliError>;
+}
+
+pub trait CatalogApi: Send + Sync {
+    fn list_views(&self) -> Result<Vec<ViewSummary>, CliError>;
+    fn get_view(&self, name: &str) -> Result<ViewDetail, CliError>;
+    fn view_status(&self, name: Option<&str>) -> Result<Vec<ViewStatusInfo>, CliError>;
+    fn list_sources(&self) -> Result<Vec<SourceSummary>, CliError>;
+    fn get_source(&self, name: &str) -> Result<SourceDetail, CliError>;
+    fn list_schemas(&self) -> Result<Vec<SchemaSummary>, CliError>;
+    fn get_schema(&self, name: &str) -> Result<SchemaDetail, CliError>;
+    fn list_workloads(&self) -> Result<Vec<WorkloadSummary>, CliError>;
+    fn get_workload(&self, name: &str) -> Result<WorkloadDetail, CliError>;
+    fn resource_usage(
+        &self,
+        workload_name: Option<&str>,
+    ) -> Result<Vec<ResourceUsageInfo>, CliError>;
+    fn resource_cluster(&self) -> Result<ClusterResourceUsageInfo, CliError>;
+    fn schema_evolution_status(&self) -> Result<Vec<SchemaEvolutionStatusInfo>, CliError>;
+    fn schema_evolution_history(&self) -> Result<Vec<SchemaEvolutionHistoryInfo>, CliError>;
+    fn pause_view(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+    fn resume_view(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+    fn query_view(&self, name: &str, limit: Option<usize>) -> Result<QueryResult, CliError>;
+    fn subscribe_view(
+        &self,
+        _name: &str,
+        _from_epoch: Option<u64>,
+        _snapshot: bool,
+    ) -> Result<Vec<SubscribeEvent>, CliError> {
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog subscription unavailable",
+            "Verify the configured gateway endpoint and retry.",
+        ))
+    }
+    fn pause_source(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+    fn resume_source(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+    fn drop_source(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+    fn create_schema(
+        &mut self,
+        name: &str,
+        columns_spec: Option<&str>,
+    ) -> Result<MutationOutcome, CliError>;
+    fn drop_schema(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+    fn create_workload(
+        &mut self,
+        name: &str,
+        priority: Option<u32>,
+        freshness_slo_ms: Option<u64>,
+        memory_limit: Option<u64>,
+        max_parallelism: Option<usize>,
+    ) -> Result<MutationOutcome, CliError>;
+    fn alter_workload(
+        &mut self,
+        name: &str,
+        priority: Option<u32>,
+        freshness_slo_ms: Option<u64>,
+        memory_limit: Option<u64>,
+        max_parallelism: Option<usize>,
+    ) -> Result<MutationOutcome, CliError>;
+    fn drop_workload(&mut self, name: &str) -> Result<MutationOutcome, CliError>;
+}
+
+pub trait StorageAdminApi: Send + Sync {
+    fn export_checkpoint(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<CheckpointExportOutcome, CliError>;
+    fn restore_checkpoint(
+        &self,
+        audit_path: &Path,
+        source: &str,
+        target: &str,
+    ) -> Result<RestoreOutcome, CliError>;
+    fn list_checkpoints(&self, storage_path: &Path) -> Result<Vec<CheckpointSummary>, CliError>;
+    fn show_checkpoint(
+        &self,
+        storage_path: &Path,
+        checkpoint_id: u64,
+    ) -> Result<CheckpointAlignmentInfo, CliError>;
+    fn generate_support_bundle(
+        &self,
+        storage_path: &Path,
+        bundle_file: &Path,
+    ) -> Result<SupportBundleInfo, CliError>;
+    fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<crate::output::BackupCreateOutput, CliError>;
+    fn inspect_backup(
+        &self,
+        destination: &str,
+    ) -> Result<crate::output::BackupInspectOutput, CliError>;
+    fn verify_backup(
+        &self,
+        destination: &str,
+    ) -> Result<crate::output::BackupVerifyOutput, CliError>;
+    fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<crate::output::RestoreOutcome, CliError>;
+}
+
+fn unreachable_control_error(addr: &str, err: impl std::fmt::Display) -> CliError {
+    CliError::new(
+        RS_0004,
+        format!("cannot reach RockStream control service at {addr}: failed to reach control plane: {err}"),
+        "- verify `rockstream start` is running\n- check `rockstream config print-effective`\n- verify the configured control endpoint",
+    )
+}
+
+fn probe_control_plane(
+    addr: &str,
+    tls_config: Option<&rockstream_types::identity::InternalTlsConfig>,
+) -> Result<(), CliError> {
+    let addr_clone = addr.to_string();
+    let tls_cfg = tls_config.cloned();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
+        rt.block_on(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpStream;
+
+            if let Some(ref tls) = tls_cfg {
+                if tls.is_enabled() {
+                    let connector = match rockstream_runtime::tls::build_client_tls_connector(tls) {
+                        Ok(c) => c,
+                        Err(e) => return Err(CliError::new(
+                            RS_2411,
+                            format!("internal mTLS configuration error: {e}"),
+                            "Verify certificate and CA paths.",
+                        )),
+                    };
+                    let stream = match TcpStream::connect(&addr_clone).await {
+                        Ok(s) => s,
+                        Err(e) => return Err(unreachable_control_error(&addr_clone, e)),
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+                        .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap());
+                    let mut tls_stream = match connector.connect(server_name, stream).await {
+                        Ok(s) => s,
+                        Err(e) => return Err(CliError::new(
+                            RS_2411,
+                            format!("internal mTLS handshake failed: {e}"),
+                            "Verify that client certificate is valid, not expired, and signed by cluster CA.",
+                        )),
+                    };
+                    let _ = tls_stream.write_all(b"\n").await;
+                    let mut buf = [0u8; 1];
+                    let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), tls_stream.read(&mut buf)).await;
+                    if let Ok(Ok(0)) | Ok(Err(_)) = probe {
+                        return Err(CliError::new(
+                            RS_2411,
+                            "connection closed by control plane (client certificate untrusted or invalid)",
+                            "Verify that client certificate is valid, not expired, and signed by cluster CA.",
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+
+            let mut stream = match TcpStream::connect(&addr_clone).await {
+                Ok(s) => s,
+                Err(e) => return Err(unreachable_control_error(&addr_clone, e)),
+            };
+            let _ = stream.write_all(b"{\"type\":\"ping\"}\n").await;
+            let mut buf = [0u8; 1];
+            let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), stream.read(&mut buf)).await;
+            if probe.is_ok() {
+                return Err(CliError::new(
+                    RS_2410,
+                    format!("connection refused by control plane at {addr_clone}: client certificate required (internal mTLS enabled)"),
+                    "Provide --tls-cert-path, --tls-key-path, and --tls-ca-cert-path with a valid client certificate.",
+                ));
+            }
+
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
+}
+
+fn query_cluster_status(
+    addr: &str,
+    tls_config: Option<&rockstream_types::identity::InternalTlsConfig>,
+) -> Result<ClusterStatusInfo, CliError> {
+    let addr = addr.to_string();
+    let tls_config = tls_config.cloned();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
+        rt.block_on(async move {
+            use tokio::net::TcpStream;
+
+            let stream = TcpStream::connect(&addr)
+                .await
+                .map_err(|e| unreachable_control_error(&addr, e))?;
+            if let Some(tls) = tls_config {
+                if tls.is_enabled() {
+                    let connector = rockstream_runtime::tls::build_client_tls_connector(&tls)
+                        .map_err(|e| CliError::new(
+                            RS_2411,
+                            format!("internal mTLS configuration error: {e}"),
+                            "Verify certificate and CA paths.",
+                        ))?;
+                    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+                        .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap());
+                    let stream = connector.connect(server_name, stream).await.map_err(|e| {
+                        CliError::new(
+                            RS_2411,
+                            format!("internal mTLS handshake failed: {e}"),
+                            "Verify that client certificate is valid, not expired, and signed by cluster CA.",
+                        )
+                    })?;
+                    return read_cluster_status(stream).await;
+                }
+            }
+            read_cluster_status(stream).await
+        })
+    })
+    .join()
+    .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
+}
+
+fn remote_query_unavailable(resource: &str) -> CliError {
+    CliError::new(
+        RS_0004,
+        format!("live {resource} query is unavailable from the configured control service"),
+        "Verify the control endpoint exposes this operation, or use the explicitly labeled demo command.",
+    )
+}
+
+async fn read_cluster_status<S>(stream: S) -> Result<ClusterStatusInfo, CliError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut stream = stream;
+    let request = serde_json::to_string(&WorkerMessage::ClusterStatusQuery)
+        .map_err(|e| CliError::new(RS_0003, format!("failed to encode status request: {e}"), ""))?
+        + "\n";
+    stream.write_all(request.as_bytes()).await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to send status request: {e}"),
+            "Retry after verifying network connectivity to the control service.",
+        )
+    })?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        reader.read_line(&mut line),
+    )
+    .await
+    .map_err(|_| {
+        CliError::new(
+            RS_0003,
+            "control service did not answer the status request",
+            "Retry against the current control endpoint and inspect the control-plane logs.",
+        )
+    })?
+    .map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed reading control response: {e}"),
+            "Retry after checking the control-plane logs.",
+        )
+    })?;
+    if read == 0 {
+        return Err(CliError::new(
+            RS_0003,
+            "control service closed the status request without a reply",
+            "Retry against the current control endpoint and inspect the control-plane logs.",
+        ));
+    }
+
+    let response: ControlMessage = serde_json::from_str(line.trim()).map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to decode control response: {e}"),
+            "Upgrade the CLI and control plane together so they agree on the wire format.",
+        )
+    })?;
+    match response {
+        ControlMessage::ClusterStatusReport {
+            node_id,
+            role,
+            term,
+        } => Ok(ClusterStatusInfo {
+            node_id,
+            role: match role {
+                RaftRoleWire::Follower => "follower",
+                RaftRoleWire::Candidate => "candidate",
+                RaftRoleWire::Leader => "leader",
+                RaftRoleWire::NoRaft => "control",
+            }
+            .to_string(),
+            term,
+            active_workers: 0,
+            healthy_workers: 0,
+            leader_id: (role == RaftRoleWire::Leader).then_some(node_id).flatten(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+        other => Err(CliError::new(
+            RS_0003,
+            format!("unexpected control response to status request: {other:?}"),
+            "Retry against the current control endpoint and inspect the control-plane logs.",
+        )),
+    }
+}
+
 // ─── Control Client ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ControlClient {
     pub control_addr: Option<String>,
     pub identity: ClientIdentity,
-    pub mock_workers: Option<Vec<WorkerStatusInfo>>,
-    pub mock_shards: Option<Vec<ShardInfo>>,
-    pub mock_quotas: Option<ClusterQuotasInfo>,
     pub audit_events: Arc<Mutex<Vec<AuditEvent>>>,
     pub storage_path: Option<PathBuf>,
     pub tls_config: Option<rockstream_types::identity::InternalTlsConfig>,
@@ -159,9 +500,6 @@ impl ControlClient {
         Self {
             control_addr,
             identity,
-            mock_workers: None,
-            mock_shards: None,
-            mock_quotas: None,
             audit_events: Arc::new(Mutex::new(Vec::new())),
             storage_path: None,
             tls_config: None,
@@ -203,182 +541,41 @@ impl ControlClient {
         }
     }
 
-    pub fn with_mock_data(
-        mut self,
-        workers: Vec<WorkerStatusInfo>,
-        shards: Vec<ShardInfo>,
-        quotas: ClusterQuotasInfo,
-    ) -> Self {
-        self.mock_workers = Some(workers);
-        self.mock_shards = Some(shards);
-        self.mock_quotas = Some(quotas);
-        self
+    fn control_addr(&self) -> Result<&str, CliError> {
+        self.control_addr.as_deref().ok_or_else(|| {
+            unreachable_control_error("127.0.0.1:9200", "control endpoint is not configured")
+        })
     }
 
     pub fn cluster_status(&self) -> Result<ClusterStatusInfo, CliError> {
-        if let Some(workers) = &self.mock_workers {
-            let active = workers.len();
-            let healthy = workers.iter().filter(|w| w.healthy).count();
-            return Ok(ClusterStatusInfo {
-                node_id: Some(1),
-                role: "control".to_string(),
-                term: 1,
-                active_workers: active,
-                healthy_workers: healthy,
-                leader_id: Some(1),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            });
+        let addr = self.control_addr()?;
+        match query_cluster_status(addr, self.tls_config.as_ref()) {
+            Ok(status) => Ok(status),
+            Err(error) if error.code == RS_0003 && self.tls_config.is_none() => {
+                match probe_control_plane(addr, None) {
+                    Err(probe_error) => Err(probe_error),
+                    Ok(()) => Err(error),
+                }
+            }
+            Err(error) if error.code == RS_0003 && self.tls_config.is_some() => Err(CliError::new(
+                RS_2411,
+                format!("internal mTLS handshake failed: {}", error.message),
+                "Verify that client certificate is valid, not expired, and signed by cluster CA.",
+            )),
+            Err(error) => Err(error),
         }
-
-        let Some(addr) = &self.control_addr else {
-            return Ok(ClusterStatusInfo {
-                node_id: Some(1),
-                role: "all".to_string(),
-                term: 0,
-                active_workers: 1,
-                healthy_workers: 1,
-                leader_id: Some(1),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            });
-        };
-
-        // Connect to control service
-        let addr_clone = addr.clone();
-        let tls_cfg = self.tls_config.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
-            rt.block_on(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                use tokio::net::TcpStream;
-
-                if let Some(ref tls) = tls_cfg {
-                    if tls.is_enabled() {
-                        let connector = match rockstream_runtime::tls::build_client_tls_connector(tls) {
-                            Ok(c) => c,
-                            Err(e) => return Err(CliError::new(
-                                RS_2411,
-                                format!("internal mTLS configuration error: {e}"),
-                                "Verify certificate and CA paths.",
-                            )),
-                        };
-                        let stream = match TcpStream::connect(&addr_clone).await {
-                            Ok(s) => s,
-                            Err(e) => return Err(CliError::new(
-                                RS_0004,
-                                format!("failed to reach control plane at {addr_clone}: {e}"),
-                                "Verify the control service URL and ensure the control node is running and reachable.",
-                            )),
-                        };
-                        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
-                            .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap());
-                        let mut tls_stream = match connector.connect(server_name, stream).await {
-                            Ok(s) => s,
-                            Err(e) => return Err(CliError::new(
-                                RS_2411,
-                                format!("internal mTLS handshake failed: {e}"),
-                                "Verify that client certificate is valid, not expired, and signed by cluster CA.",
-                            )),
-                        };
-                        let _ = tls_stream.write_all(b"\n").await;
-                        let mut buf = [0u8; 1];
-                        let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), tls_stream.read(&mut buf)).await;
-                        if let Ok(Ok(0)) | Ok(Err(_)) = probe {
-                            return Err(CliError::new(
-                                RS_2411,
-                                "connection closed by control plane (client certificate untrusted or invalid)",
-                                "Verify that client certificate is valid, not expired, and signed by cluster CA.",
-                            ));
-                        }
-                        return Ok(ClusterStatusInfo {
-                            node_id: Some(1),
-                            role: "control".to_string(),
-                            term: 1,
-                            active_workers: 1,
-                            healthy_workers: 1,
-                            leader_id: Some(1),
-                            version: env!("CARGO_PKG_VERSION").to_string(),
-                        });
-                    }
-                }
-
-                let mut stream = match TcpStream::connect(&addr_clone).await {
-                    Ok(s) => s,
-                    Err(e) => return Err(CliError::new(
-                        RS_0004,
-                        format!("failed to reach control plane at {addr_clone}: {e}"),
-                        "Verify the control service URL and ensure the control node is running and reachable.",
-                    )),
-                };
-                let _ = stream.write_all(b"{\"type\":\"ping\"}\n").await;
-                let mut buf = [0u8; 1];
-                let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), stream.read(&mut buf)).await;
-                if probe.is_ok() {
-                    return Err(CliError::new(
-                        RS_2410,
-                        format!("connection refused by control plane at {addr_clone}: client certificate required (internal mTLS enabled)"),
-                        "Provide --tls-cert-path, --tls-key-path, and --tls-ca-cert-path with a valid client certificate.",
-                    ));
-                }
-
-                Ok(ClusterStatusInfo {
-                    node_id: Some(1),
-                    role: "control".to_string(),
-                    term: 1,
-                    active_workers: 1,
-                    healthy_workers: 1,
-                    leader_id: Some(1),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                })
-            })
-        })
-        .join()
-        .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
     }
 
     pub fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, CliError> {
-        if let Some(quotas) = &self.mock_quotas {
-            return Ok(quotas.clone());
-        }
-        Ok(ClusterQuotasInfo {
-            total_memory_budget_bytes: 64 * 1024 * 1024 * 1024,
-            used_memory_bytes: 4 * 1024 * 1024 * 1024,
-            max_parallelism: 64,
-            active_workloads: 2,
-            active_views: 4,
-        })
+        let addr = self.control_addr()?;
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("cluster quota"))
     }
 
     pub fn list_workers(&self) -> Result<Vec<WorkerStatusInfo>, CliError> {
-        if let Some(workers) = &self.mock_workers {
-            return Ok(workers.clone());
-        }
-        Ok(vec![
-            WorkerStatusInfo {
-                worker_id: 1,
-                role: "worker".to_string(),
-                address: "127.0.0.1:8001".to_string(),
-                capacity_headroom: 0.85,
-                host_id: "host-1".to_string(),
-                availability_zone: "us-east-1a".to_string(),
-                healthy: true,
-                lifecycle_state: "active".to_string(),
-                registered_at_ms: 1723620000000,
-            },
-            WorkerStatusInfo {
-                worker_id: 2,
-                role: "worker".to_string(),
-                address: "127.0.0.1:8002".to_string(),
-                capacity_headroom: 0.90,
-                host_id: "host-2".to_string(),
-                availability_zone: "us-east-1b".to_string(),
-                healthy: true,
-                lifecycle_state: "active".to_string(),
-                registered_at_ms: 1723620001000,
-            },
-        ])
+        let addr = self.control_addr()?;
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("worker topology"))
     }
 
     pub fn worker_status(&self, worker_id: Option<u64>) -> Result<Vec<WorkerStatusInfo>, CliError> {
@@ -399,25 +596,9 @@ impl ControlClient {
     }
 
     pub fn list_shards(&self) -> Result<Vec<ShardInfo>, CliError> {
-        if let Some(shards) = &self.mock_shards {
-            return Ok(shards.clone());
-        }
-        Ok(vec![
-            ShardInfo {
-                shard_id: 1,
-                worker_id: Some(1),
-                lease_token: 101,
-                status: "active".to_string(),
-                key_range: "[00000000..7fffffff]".to_string(),
-            },
-            ShardInfo {
-                shard_id: 2,
-                worker_id: Some(2),
-                lease_token: 102,
-                status: "active".to_string(),
-                key_range: "[80000000..ffffffff]".to_string(),
-            },
-        ])
+        let addr = self.control_addr()?;
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("shard topology"))
     }
 
     pub fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError> {
@@ -439,24 +620,14 @@ impl ControlClient {
             ));
         }
 
-        if let Some(addr) = &self.control_addr {
-            crate::request_worker_drain(addr, worker_id)?;
-        } else {
-            let workers = self.list_workers()?;
-            if !workers.iter().any(|w| w.worker_id == worker_id) {
-                self.record_audit(
-                    "cluster.workers.drain",
-                    &worker_id.to_string(),
-                    Some("worker not found"),
-                    Some("RS-1001"),
-                );
-                return Err(CliError::new(
-                    RS_1001,
-                    format!("Worker ID {worker_id} not found"),
-                    "Run 'rockstream cluster workers list' to check registered worker IDs.",
-                ));
+        let control_url = self.control_addr()?.to_string();
+        crate::request_worker_drain(&control_url, worker_id).map_err(|error| {
+            if error.code == RS_0003 {
+                unreachable_control_error(&control_url, error.message)
+            } else {
+                error
             }
-        }
+        })?;
 
         self.record_audit(
             "cluster.workers.drain",
@@ -476,7 +647,7 @@ impl ControlClient {
     pub fn migrate_shard(
         &self,
         shard_id: u64,
-        target_worker: u64,
+        _target_worker: u64,
     ) -> Result<MigrationOutcome, CliError> {
         if self.identity.role < required_role("shard migrate") {
             self.record_audit(
@@ -496,36 +667,406 @@ impl ControlClient {
             ));
         }
 
-        if shard_id == 999 {
-            self.record_audit(
-                "shard.migrate",
-                &shard_id.to_string(),
-                Some("in-flight migration conflict"),
-                Some("RS-5030"),
-            );
-            return Err(CliError::new(
-                RS_5030,
-                format!(
-                    "Illegal shard-migration state transition rejected: shard {shard_id} migration already in flight"
-                ),
-                "Drive the migration through the documented next state only, or resume from the persisted record instead of forcing a skipped state.",
-            ));
+        let addr = self.control_addr()?;
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("shard migration"))
+    }
+}
+
+impl TopologyApi for ControlClient {
+    fn cluster_status(&self) -> Result<ClusterStatusInfo, CliError> {
+        self.cluster_status()
+    }
+    fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, CliError> {
+        self.cluster_quotas()
+    }
+    fn list_workers(&self) -> Result<Vec<WorkerStatusInfo>, CliError> {
+        self.list_workers()
+    }
+    fn worker_status(&self, worker_id: Option<u64>) -> Result<Vec<WorkerStatusInfo>, CliError> {
+        self.worker_status(worker_id)
+    }
+    fn list_shards(&self) -> Result<Vec<ShardInfo>, CliError> {
+        self.list_shards()
+    }
+}
+
+impl OperationApi for ControlClient {
+    fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError> {
+        self.drain_worker(worker_id)
+    }
+    fn migrate_shard(
+        &self,
+        shard_id: u64,
+        target_worker: u64,
+    ) -> Result<MigrationOutcome, CliError> {
+        self.migrate_shard(shard_id, target_worker)
+    }
+}
+
+// ─── Remote Clients ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RemoteTopologyClient {
+    pub client: ControlClient,
+}
+
+impl RemoteTopologyClient {
+    pub fn new(control_addr: Option<String>, identity: ClientIdentity) -> Self {
+        let addr = control_addr.unwrap_or_else(|| "127.0.0.1:9200".to_string());
+        Self {
+            client: ControlClient::new(Some(addr), identity),
         }
+    }
 
-        self.record_audit(
-            "shard.migrate",
-            &shard_id.to_string(),
-            Some(&format!("to_worker={target_worker}")),
-            None,
-        );
+    pub fn with_internal_tls(
+        mut self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Self {
+        self.client = self.client.with_internal_tls(config);
+        self
+    }
 
-        Ok(MigrationOutcome {
-            shard_id,
-            source_worker: 1,
-            target_worker,
-            status: "COMPLETED".to_string(),
-            duration_ms: 42,
-        })
+    pub fn cluster_status(&self) -> Result<ClusterStatusInfo, CliError> {
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        query_cluster_status(addr, self.client.tls_config.as_ref())
+    }
+    pub fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, CliError> {
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.client.tls_config.as_ref())?;
+        Err(remote_query_unavailable("cluster quota"))
+    }
+    pub fn list_workers(&self) -> Result<Vec<WorkerStatusInfo>, CliError> {
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.client.tls_config.as_ref())?;
+        Err(remote_query_unavailable("worker topology"))
+    }
+    pub fn worker_status(&self, worker_id: Option<u64>) -> Result<Vec<WorkerStatusInfo>, CliError> {
+        let _ = worker_id;
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.client.tls_config.as_ref())?;
+        Err(remote_query_unavailable("worker status"))
+    }
+    pub fn list_shards(&self) -> Result<Vec<ShardInfo>, CliError> {
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.client.tls_config.as_ref())?;
+        Err(remote_query_unavailable("shard topology"))
+    }
+}
+
+impl TopologyApi for RemoteTopologyClient {
+    fn cluster_status(&self) -> Result<ClusterStatusInfo, CliError> {
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        query_cluster_status(addr, self.client.tls_config.as_ref())
+    }
+    fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, CliError> {
+        self.cluster_quotas()
+    }
+    fn list_workers(&self) -> Result<Vec<WorkerStatusInfo>, CliError> {
+        self.list_workers()
+    }
+    fn worker_status(&self, worker_id: Option<u64>) -> Result<Vec<WorkerStatusInfo>, CliError> {
+        self.worker_status(worker_id)
+    }
+    fn list_shards(&self) -> Result<Vec<ShardInfo>, CliError> {
+        self.list_shards()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteOperationClient {
+    pub client: ControlClient,
+}
+
+impl RemoteOperationClient {
+    pub fn new(control_addr: Option<String>, identity: ClientIdentity) -> Self {
+        let addr = control_addr.unwrap_or_else(|| "127.0.0.1:9200".to_string());
+        Self {
+            client: ControlClient::new(Some(addr), identity),
+        }
+    }
+
+    pub fn with_internal_tls(
+        mut self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Self {
+        self.client = self.client.with_internal_tls(config);
+        self
+    }
+
+    pub fn with_storage_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client = self.client.with_storage_path(path);
+        self
+    }
+
+    pub fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError> {
+        self.client.drain_worker(worker_id)
+    }
+
+    pub fn migrate_shard(
+        &self,
+        shard_id: u64,
+        target_worker: u64,
+    ) -> Result<MigrationOutcome, CliError> {
+        let _ = (shard_id, target_worker);
+        let addr = self
+            .client
+            .control_addr
+            .as_deref()
+            .unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.client.tls_config.as_ref())?;
+        Err(remote_query_unavailable("shard migration"))
+    }
+}
+
+impl OperationApi for RemoteOperationClient {
+    fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError> {
+        self.client.drain_worker(worker_id)
+    }
+    fn migrate_shard(
+        &self,
+        shard_id: u64,
+        target_worker: u64,
+    ) -> Result<MigrationOutcome, CliError> {
+        self.migrate_shard(shard_id, target_worker)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteCatalogClient {
+    pub control_addr: Option<String>,
+    pub identity: ClientIdentity,
+    pub tls_config: Option<rockstream_types::identity::InternalTlsConfig>,
+}
+
+impl RemoteCatalogClient {
+    pub fn new(control_addr: Option<String>, identity: ClientIdentity) -> Self {
+        let addr = control_addr.unwrap_or_else(|| "127.0.0.1:9200".to_string());
+        Self {
+            control_addr: Some(addr),
+            identity,
+            tls_config: None,
+        }
+    }
+
+    pub fn with_internal_tls(
+        mut self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Self {
+        self.tls_config = Some(config);
+        self
+    }
+}
+
+impl CatalogApi for RemoteCatalogClient {
+    fn list_views(&self) -> Result<Vec<ViewSummary>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog view"))
+    }
+    fn get_view(&self, _name: &str) -> Result<ViewDetail, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog view"))
+    }
+    fn view_status(&self, _name: Option<&str>) -> Result<Vec<ViewStatusInfo>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog view status"))
+    }
+    fn list_sources(&self) -> Result<Vec<SourceSummary>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog source"))
+    }
+    fn get_source(&self, _name: &str) -> Result<SourceDetail, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog source"))
+    }
+    fn list_schemas(&self) -> Result<Vec<SchemaSummary>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog schema"))
+    }
+    fn get_schema(&self, _name: &str) -> Result<SchemaDetail, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog schema"))
+    }
+    fn list_workloads(&self) -> Result<Vec<WorkloadSummary>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog workload"))
+    }
+    fn get_workload(&self, _name: &str) -> Result<WorkloadDetail, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("catalog workload"))
+    }
+    fn resource_usage(
+        &self,
+        _workload_name: Option<&str>,
+    ) -> Result<Vec<ResourceUsageInfo>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("resource usage"))
+    }
+    fn resource_cluster(&self) -> Result<ClusterResourceUsageInfo, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("cluster resource"))
+    }
+    fn schema_evolution_status(&self) -> Result<Vec<SchemaEvolutionStatusInfo>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("schema evolution status"))
+    }
+    fn schema_evolution_history(&self) -> Result<Vec<SchemaEvolutionHistoryInfo>, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(remote_query_unavailable("schema evolution history"))
+    }
+    fn pause_view(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn resume_view(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn query_view(&self, _name: &str, _limit: Option<usize>) -> Result<QueryResult, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog query unavailable",
+            "",
+        ))
+    }
+    fn pause_source(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn resume_source(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn drop_source(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn create_schema(
+        &mut self,
+        _name: &str,
+        _columns_spec: Option<&str>,
+    ) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn drop_schema(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn create_workload(
+        &mut self,
+        _name: &str,
+        _priority: Option<u32>,
+        _freshness_slo_ms: Option<u64>,
+        _memory_limit: Option<u64>,
+        _max_parallelism: Option<usize>,
+    ) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn alter_workload(
+        &mut self,
+        _name: &str,
+        _priority: Option<u32>,
+        _freshness_slo_ms: Option<u64>,
+        _memory_limit: Option<u64>,
+        _max_parallelism: Option<usize>,
+    ) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
+    }
+    fn drop_workload(&mut self, _name: &str) -> Result<MutationOutcome, CliError> {
+        let addr = self.control_addr.as_deref().unwrap_or("127.0.0.1:9200");
+        probe_control_plane(addr, self.tls_config.as_ref())?;
+        Err(CliError::new(
+            RS_0004,
+            "remote catalog mutation unavailable",
+            "",
+        ))
     }
 }
 
@@ -544,7 +1085,7 @@ pub struct CatalogClient {
 
 impl Default for CatalogClient {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::new(ClientIdentity::default())
     }
 }
 
@@ -586,103 +1127,6 @@ impl CatalogClient {
         if let Some(ref sp) = self.storage_path {
             append_audit_file(sp, &event);
         }
-    }
-
-    pub fn with_defaults() -> Self {
-        let mut client = Self::new(ClientIdentity::default());
-
-        // Default workload
-        let wl = WorkloadDetail {
-            name: "analytics".to_string(),
-            priority: 128,
-            freshness_slo_ms: Some(5000),
-            memory_limit_bytes: Some(1024 * 1024 * 1024),
-            max_parallelism: Some(16),
-            assigned_views: vec!["active_users".to_string(), "hourly_revenue".to_string()],
-        };
-        client.workloads.insert("analytics".to_string(), wl);
-
-        // Default views
-        let v1 = ViewDetail {
-            name: "active_users".to_string(),
-            state: "RUNNING".to_string(),
-            workload: Some("analytics".to_string()),
-            freshness_slo_ms: Some(5000),
-            memory_limit_bytes: Some(512 * 1024 * 1024),
-            depends_on: vec!["users_source".to_string()],
-            query: "SELECT id, count(*) FROM users GROUP BY id".to_string(),
-            created_at_ms: 1723620000000,
-        };
-        let v2 = ViewDetail {
-            name: "hourly_revenue".to_string(),
-            state: "RUNNING".to_string(),
-            workload: Some("analytics".to_string()),
-            freshness_slo_ms: Some(5000),
-            memory_limit_bytes: Some(512 * 1024 * 1024),
-            depends_on: vec!["orders_source".to_string()],
-            query: "SELECT hour, sum(amount) FROM orders GROUP BY hour".to_string(),
-            created_at_ms: 1723620005000,
-        };
-        client.views.insert("active_users".to_string(), v1);
-        client.views.insert("hourly_revenue".to_string(), v2);
-
-        // Default sources
-        let mut src_opts = BTreeMap::new();
-        src_opts.insert("topic".to_string(), "users_events".to_string());
-        src_opts.insert("group_id".to_string(), "rs_ingest".to_string());
-        let s1 = SourceDetail {
-            name: "users_source".to_string(),
-            connector_type: "kafka".to_string(),
-            table: "users".to_string(),
-            status: "active".to_string(),
-            options: src_opts,
-            current_offset: Some("partition_0:482910".to_string()),
-            lag_ms: Some(12),
-        };
-        client.sources.insert("users_source".to_string(), s1);
-
-        // Default schemas
-        let sc1 = SchemaDetail {
-            name: "users".to_string(),
-            entity_type: "table".to_string(),
-            columns: vec![
-                SchemaColumn {
-                    name: "id".to_string(),
-                    data_type: "BIGINT".to_string(),
-                    nullable: false,
-                },
-                SchemaColumn {
-                    name: "name".to_string(),
-                    data_type: "VARCHAR".to_string(),
-                    nullable: true,
-                },
-                SchemaColumn {
-                    name: "created_at".to_string(),
-                    data_type: "TIMESTAMP".to_string(),
-                    nullable: false,
-                },
-            ],
-        };
-        let sc2 = SchemaDetail {
-            name: "active_users".to_string(),
-            entity_type: "view".to_string(),
-            columns: vec![
-                SchemaColumn {
-                    name: "id".to_string(),
-                    data_type: "BIGINT".to_string(),
-                    nullable: false,
-                },
-                SchemaColumn {
-                    name: "count".to_string(),
-                    data_type: "BIGINT".to_string(),
-                    nullable: false,
-                },
-            ],
-        };
-        client.schemas.insert("users".to_string(), sc1);
-        client.schemas.insert("active_users".to_string(), sc2);
-
-        client
     }
 
     pub fn list_views(&self) -> Result<Vec<ViewSummary>, CliError> {
@@ -1601,6 +2045,122 @@ impl CatalogClient {
     }
 }
 
+impl CatalogApi for CatalogClient {
+    fn list_views(&self) -> Result<Vec<ViewSummary>, CliError> {
+        self.list_views()
+    }
+    fn get_view(&self, name: &str) -> Result<ViewDetail, CliError> {
+        self.get_view(name)
+    }
+    fn view_status(&self, name: Option<&str>) -> Result<Vec<ViewStatusInfo>, CliError> {
+        self.view_status(name)
+    }
+    fn list_sources(&self) -> Result<Vec<SourceSummary>, CliError> {
+        self.list_sources()
+    }
+    fn get_source(&self, name: &str) -> Result<SourceDetail, CliError> {
+        self.get_source(name)
+    }
+    fn list_schemas(&self) -> Result<Vec<SchemaSummary>, CliError> {
+        self.list_schemas()
+    }
+    fn get_schema(&self, name: &str) -> Result<SchemaDetail, CliError> {
+        self.get_schema(name)
+    }
+    fn list_workloads(&self) -> Result<Vec<WorkloadSummary>, CliError> {
+        self.list_workloads()
+    }
+    fn get_workload(&self, name: &str) -> Result<WorkloadDetail, CliError> {
+        self.get_workload(name)
+    }
+    fn resource_usage(
+        &self,
+        workload_name: Option<&str>,
+    ) -> Result<Vec<ResourceUsageInfo>, CliError> {
+        self.resource_usage(workload_name)
+    }
+    fn resource_cluster(&self) -> Result<ClusterResourceUsageInfo, CliError> {
+        self.resource_cluster()
+    }
+    fn schema_evolution_status(&self) -> Result<Vec<SchemaEvolutionStatusInfo>, CliError> {
+        self.schema_evolution_status()
+    }
+    fn schema_evolution_history(&self) -> Result<Vec<SchemaEvolutionHistoryInfo>, CliError> {
+        self.schema_evolution_history()
+    }
+    fn pause_view(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.pause_view(name)
+    }
+    fn resume_view(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.resume_view(name)
+    }
+    fn query_view(&self, name: &str, limit: Option<usize>) -> Result<QueryResult, CliError> {
+        self.query_view(name, limit)
+    }
+    fn subscribe_view(
+        &self,
+        name: &str,
+        from_epoch: Option<u64>,
+        snapshot: bool,
+    ) -> Result<Vec<SubscribeEvent>, CliError> {
+        self.subscribe_view(name, from_epoch, snapshot)
+    }
+    fn pause_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.pause_source(name)
+    }
+    fn resume_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.resume_source(name)
+    }
+    fn drop_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.drop_source(name)
+    }
+    fn create_schema(
+        &mut self,
+        name: &str,
+        columns_spec: Option<&str>,
+    ) -> Result<MutationOutcome, CliError> {
+        self.create_schema(name, columns_spec)
+    }
+    fn drop_schema(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.drop_schema(name)
+    }
+    fn create_workload(
+        &mut self,
+        name: &str,
+        priority: Option<u32>,
+        freshness_slo_ms: Option<u64>,
+        memory_limit: Option<u64>,
+        max_parallelism: Option<usize>,
+    ) -> Result<MutationOutcome, CliError> {
+        self.create_workload(
+            name,
+            priority,
+            freshness_slo_ms,
+            memory_limit,
+            max_parallelism,
+        )
+    }
+    fn alter_workload(
+        &mut self,
+        name: &str,
+        priority: Option<u32>,
+        freshness_slo_ms: Option<u64>,
+        memory_limit: Option<u64>,
+        max_parallelism: Option<usize>,
+    ) -> Result<MutationOutcome, CliError> {
+        self.alter_workload(
+            name,
+            priority,
+            freshness_slo_ms,
+            memory_limit,
+            max_parallelism,
+        )
+    }
+    fn drop_workload(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
+        self.drop_workload(name)
+    }
+}
+
 // ─── Storage Client ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -2137,5 +2697,699 @@ impl StorageClient {
             all.into_iter().take(max_events).collect()
         };
         Ok(filtered)
+    }
+
+    pub fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<BackupCreateOutput, CliError> {
+        if self.identity.role < Role::Admin {
+            let event = AuditEvent::now(self.identity.user.clone(), "backup.create", destination)
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401");
+            append_audit_file(storage_path, &event);
+            return Err(CliError::new(
+                RS_2401,
+                format!(
+                    "permission denied: principal '{}' lacks required role {:?}",
+                    self.identity.user,
+                    Role::Admin
+                ),
+                "Request elevated RBAC role (Admin) or run under an authorized principal.",
+            ));
+        }
+
+        let dest_path = Path::new(destination);
+        if dest_path.exists() {
+            if dest_path.is_dir() {
+                let mut entries = fs::read_dir(dest_path).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!("RS-3612: cannot access destination path: {e}"),
+                        "Verify directory permissions",
+                    )
+                })?;
+                if entries.next().is_some() {
+                    return Err(CliError::new(
+                        RS_2401,
+                        format!("RS-2401: destination path '{}' is not empty; backup refuses to overwrite existing directory", destination),
+                        "Specify an empty or non-existent destination directory",
+                    ));
+                }
+            } else {
+                return Err(CliError::new(
+                    RS_2401,
+                    format!(
+                        "RS-2401: destination path '{}' already exists and is not a directory",
+                        destination
+                    ),
+                    "Specify a non-existent or empty directory path",
+                ));
+            }
+        }
+
+        fs::create_dir_all(dest_path).map_err(|e| {
+            CliError::new(
+                RS_3612,
+                format!("RS-3612: storage access error for destination '{destination}': {e}"),
+                "Check directory permissions and retry",
+            )
+        })?;
+
+        let mut source_files = Vec::new();
+        let _ = collect_files_recursive(storage_path, storage_path, &mut source_files);
+
+        let mut file_entries = Vec::new();
+        let mut total_bytes = 0u64;
+
+        for (src, rel) in source_files {
+            let dst = dest_path.join(&rel);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!("RS-3612: failed to create destination parent dir: {e}"),
+                        "Check directory permissions",
+                    )
+                })?;
+            }
+            let bytes = fs::read(&src).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!(
+                        "RS-3612: failed to read source file '{}': {e}",
+                        src.display()
+                    ),
+                    "Check source permissions",
+                )
+            })?;
+            fs::write(&dst, &bytes).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!(
+                        "RS-3612: failed to write destination file '{}': {e}",
+                        dst.display()
+                    ),
+                    "Check destination permissions",
+                )
+            })?;
+            let sha256 = compute_file_sha256(&bytes);
+            let byte_len = bytes.len() as u64;
+            total_bytes += byte_len;
+            file_entries.push(BackupFileEntry {
+                path: rel,
+                byte_len,
+                sha256,
+            });
+        }
+
+        if file_entries.is_empty() {
+            let marker_rel = "storage_version".to_string();
+            let marker_dst = dest_path.join(&marker_rel);
+            let marker_bytes = b"rockstream-v0.65\n";
+            fs::write(&marker_dst, marker_bytes).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!("RS-3612: failed to write marker file: {e}"),
+                    "Check permissions",
+                )
+            })?;
+            let sha256 = compute_file_sha256(marker_bytes);
+            let byte_len = marker_bytes.len() as u64;
+            total_bytes += byte_len;
+            file_entries.push(BackupFileEntry {
+                path: marker_rel,
+                byte_len,
+                sha256,
+            });
+        }
+
+        let catalog_revision = 1u64;
+        let checkpoint_id = 1u64;
+        let frontier = 100u64;
+
+        let manifest = BackupManifest::new(
+            catalog_revision,
+            checkpoint_id,
+            frontier,
+            CURRENT_STORAGE_FORMAT,
+            file_entries,
+        );
+
+        let manifest_json = manifest.to_json().map_err(|e| {
+            CliError::new(
+                RS_5035,
+                format!("failed to serialize backup manifest: {e}"),
+                "Retry backup",
+            )
+        })?;
+
+        fs::write(dest_path.join(BACKUP_MANIFEST_FILENAME), manifest_json).map_err(|e| {
+            CliError::new(
+                RS_3612,
+                format!("RS-3612: failed to write manifest.json: {e}"),
+                "Check permissions",
+            )
+        })?;
+
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "backup.create",
+            destination.to_string(),
+        )
+        .with_detail(format!(
+            "checkpoint_id={} catalog_revision={} frontier={} files={} bytes={}",
+            manifest.checkpoint_id,
+            manifest.catalog_revision,
+            manifest.frontier,
+            manifest.files.len(),
+            total_bytes
+        ));
+        append_audit_file(storage_path, &event);
+
+        Ok(BackupCreateOutput {
+            destination: destination.to_string(),
+            catalog_revision: manifest.catalog_revision,
+            checkpoint_id: manifest.checkpoint_id,
+            frontier: manifest.frontier,
+            file_count: manifest.files.len(),
+            total_bytes,
+            manifest_checksum: manifest.checksum,
+            status: "SUCCESS".to_string(),
+        })
+    }
+
+    pub fn inspect_backup(&self, destination: &str) -> Result<BackupInspectOutput, CliError> {
+        let dest_path = Path::new(destination);
+        let manifest_file = dest_path.join(BACKUP_MANIFEST_FILENAME);
+        if !manifest_file.exists() {
+            return Err(CliError::new(
+                RS_3615,
+                format!("RS-3615: backup manifest missing at '{destination}'"),
+                "Verify backup destination path contains manifest.json",
+            ));
+        }
+
+        let content = fs::read_to_string(&manifest_file).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: failed to read manifest file: {e}"),
+                "Verify backup permissions and file integrity",
+            )
+        })?;
+
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: corrupted manifest JSON: {e}"),
+                "Inspect manifest or restore from a known good backup",
+            )
+        })?;
+
+        if let Err((code, msg)) = manifest.validate() {
+            return Err(CliError::new(
+                code,
+                msg,
+                "Backup manifest failed validation; cannot use backup",
+            ));
+        }
+
+        let total_bytes = manifest.files.iter().map(|f| f.byte_len).sum();
+
+        Ok(BackupInspectOutput {
+            destination: destination.to_string(),
+            format_version: manifest.format_version,
+            catalog_revision: manifest.catalog_revision,
+            checkpoint_id: manifest.checkpoint_id,
+            frontier: manifest.frontier,
+            storage_format: manifest.storage_format,
+            file_count: manifest.files.len(),
+            total_bytes,
+            manifest_checksum: manifest.checksum,
+            status: "VALID".to_string(),
+            errors: Vec::new(),
+        })
+    }
+
+    pub fn verify_backup(&self, destination: &str) -> Result<BackupVerifyOutput, CliError> {
+        let dest_path = Path::new(destination);
+        let manifest_file = dest_path.join(BACKUP_MANIFEST_FILENAME);
+        if !manifest_file.exists() {
+            return Err(CliError::new(
+                RS_3615,
+                format!("RS-3615: backup manifest missing at '{destination}'"),
+                "Verify backup destination path contains manifest.json",
+            ));
+        }
+
+        let content = fs::read_to_string(&manifest_file).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: failed to read manifest file: {e}"),
+                "Verify backup permissions and file integrity",
+            )
+        })?;
+
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: corrupted manifest JSON: {e}"),
+                "Inspect manifest or restore from a known good backup",
+            )
+        })?;
+
+        if let Err((code, msg)) = manifest.validate() {
+            return Err(CliError::new(
+                code,
+                msg,
+                "Backup manifest failed validation",
+            ));
+        }
+
+        let mut verified_files = 0;
+        let mut total_bytes = 0;
+
+        for file in &manifest.files {
+            let file_path = dest_path.join(&file.path);
+            if !file_path.exists() {
+                return Err(CliError::new(
+                    RS_3615,
+                    format!("RS-3615: payload file '{}' missing from backup", file.path),
+                    "Restore missing file or re-create backup",
+                ));
+            }
+            let bytes = fs::read(&file_path).map_err(|e| {
+                CliError::new(
+                    RS_3615,
+                    format!("RS-3615: failed to read payload file '{}': {e}", file.path),
+                    "Verify file permissions",
+                )
+            })?;
+            if bytes.len() as u64 != file.byte_len {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' length mismatch: expected {}, got {}",
+                        file.path,
+                        file.byte_len,
+                        bytes.len()
+                    ),
+                    "Backup file is truncated or corrupted",
+                ));
+            }
+            let digest = compute_file_sha256(&bytes);
+            if digest != file.sha256 {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' checksum mismatch: expected {}, got {}",
+                        file.path, file.sha256, digest
+                    ),
+                    "Backup file data corrupted or tampered",
+                ));
+            }
+            verified_files += 1;
+            total_bytes += file.byte_len;
+        }
+
+        Ok(BackupVerifyOutput {
+            destination: destination.to_string(),
+            file_count: manifest.files.len(),
+            verified_files,
+            total_bytes,
+            manifest_checksum: manifest.checksum,
+            status: "SUCCESS".to_string(),
+            errors: Vec::new(),
+        })
+    }
+
+    pub fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<RestoreOutcome, CliError> {
+        if self.identity.role < Role::Admin {
+            let event = AuditEvent::now(self.identity.user.clone(), "backup.restore", source)
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401");
+            append_audit_file(target, &event);
+            return Err(CliError::new(
+                RS_2401,
+                format!(
+                    "permission denied: principal '{}' lacks required role {:?}",
+                    self.identity.user,
+                    Role::Admin
+                ),
+                "Request elevated RBAC role (Admin) or run under an authorized principal.",
+            ));
+        }
+
+        let source_path = Path::new(source);
+        let manifest_file = source_path.join(BACKUP_MANIFEST_FILENAME);
+        if !manifest_file.exists() {
+            return Err(CliError::new(
+                RS_3615,
+                format!("RS-3615: source backup manifest missing at '{source}'"),
+                "Provide a valid backup path containing manifest.json",
+            ));
+        }
+
+        let content = fs::read_to_string(&manifest_file).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: failed to read source manifest: {e}"),
+                "Verify backup permissions and file integrity",
+            )
+        })?;
+
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            CliError::new(
+                RS_3615,
+                format!("RS-3615: corrupted source manifest JSON: {e}"),
+                "Restore from a known valid backup",
+            )
+        })?;
+
+        if let Err((code, msg)) = manifest.validate() {
+            return Err(CliError::new(
+                code,
+                msg,
+                "Source backup manifest is invalid; refusing to restore",
+            ));
+        }
+
+        let mut total_bytes = 0;
+        for file in &manifest.files {
+            let file_path = source_path.join(&file.path);
+            if !file_path.exists() {
+                return Err(CliError::new(
+                    RS_3615,
+                    format!(
+                        "RS-3615: payload file '{}' missing from source backup",
+                        file.path
+                    ),
+                    "Refusing to restore from incomplete backup",
+                ));
+            }
+            let bytes = fs::read(&file_path).map_err(|e| {
+                CliError::new(
+                    RS_3615,
+                    format!("RS-3615: cannot read payload file '{}': {e}", file.path),
+                    "Check source permissions",
+                )
+            })?;
+            if bytes.len() as u64 != file.byte_len {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' length mismatch: expected {}, got {}",
+                        file.path,
+                        file.byte_len,
+                        bytes.len()
+                    ),
+                    "Source backup is corrupted",
+                ));
+            }
+            let digest = compute_file_sha256(&bytes);
+            if digest != file.sha256 {
+                return Err(CliError::new(
+                    RS_3616,
+                    format!(
+                        "RS-3616: payload file '{}' checksum mismatch: expected {}, got {}",
+                        file.path, file.sha256, digest
+                    ),
+                    "Source backup file corrupted or tampered",
+                ));
+            }
+            total_bytes += file.byte_len;
+        }
+
+        if target.exists() {
+            if target.is_dir() {
+                let mut entries = fs::read_dir(target).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!("RS-3612: cannot access target destination: {e}"),
+                        "Verify directory permissions",
+                    )
+                })?;
+                if entries.next().is_some() && !yes {
+                    return Err(CliError::new(
+                        RS_0005,
+                        format!(
+                            "destination directory '{}' is non-empty; confirmation required to overwrite",
+                            target.display()
+                        ),
+                        "Pass --yes for script execution or answer y at the prompt.",
+                    ));
+                }
+            } else if !yes {
+                return Err(CliError::new(
+                    RS_0005,
+                    format!(
+                        "destination path '{}' already exists; confirmation required to overwrite",
+                        target.display()
+                    ),
+                    "Pass --yes for script execution or answer y at the prompt.",
+                ));
+            }
+        }
+
+        fs::create_dir_all(target).map_err(|e| {
+            CliError::new(
+                RS_3612,
+                format!("RS-3612: failed to create target directory: {e}"),
+                "Check target permissions",
+            )
+        })?;
+
+        for file in &manifest.files {
+            let src_file = source_path.join(&file.path);
+            let dst_file = target.join(&file.path);
+            if let Some(parent) = dst_file.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    CliError::new(
+                        RS_3612,
+                        format!(
+                            "RS-3612: failed to create parent dir '{}': {e}",
+                            parent.display()
+                        ),
+                        "Check target permissions",
+                    )
+                })?;
+            }
+            fs::copy(&src_file, &dst_file).map_err(|e| {
+                CliError::new(
+                    RS_3612,
+                    format!(
+                        "RS-3612: failed to copy '{}' to '{}': {e}",
+                        src_file.display(),
+                        dst_file.display()
+                    ),
+                    "Check target disk space and permissions",
+                )
+            })?;
+        }
+
+        let _ = fs::copy(&manifest_file, target.join(BACKUP_MANIFEST_FILENAME));
+
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "backup.restore",
+            target.to_string_lossy().into_owned(),
+        )
+        .with_detail(format!(
+            "checkpoint_id={} source={} files={} bytes={}",
+            manifest.checkpoint_id,
+            source,
+            manifest.files.len(),
+            total_bytes
+        ));
+        append_audit_file(target, &event);
+
+        Ok(RestoreOutcome {
+            checkpoint_id: manifest.checkpoint_id,
+            source: source.to_string(),
+            target: target.to_string_lossy().into_owned(),
+            object_count: manifest.files.len() as u64,
+            byte_count: total_bytes,
+            restored_shards: 1,
+            status: "SUCCESS".to_string(),
+        })
+    }
+}
+
+fn collect_files_recursive(
+    dir: &Path,
+    base: &Path,
+    files: &mut Vec<(PathBuf, String)>,
+) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, base, files)?;
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let rel_str = rel.to_string_lossy().into_owned();
+                if rel_str != "audit.jsonl" && rel_str != BACKUP_MANIFEST_FILENAME {
+                    files.push((path, rel_str));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl StorageAdminApi for StorageClient {
+    fn export_checkpoint(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<CheckpointExportOutcome, CliError> {
+        self.export_checkpoint(storage_path, destination)
+    }
+    fn restore_checkpoint(
+        &self,
+        audit_path: &Path,
+        source: &str,
+        target: &str,
+    ) -> Result<RestoreOutcome, CliError> {
+        self.restore_checkpoint(audit_path, source, target)
+    }
+    fn list_checkpoints(&self, storage_path: &Path) -> Result<Vec<CheckpointSummary>, CliError> {
+        self.list_checkpoints(storage_path)
+    }
+    fn show_checkpoint(
+        &self,
+        storage_path: &Path,
+        checkpoint_id: u64,
+    ) -> Result<CheckpointAlignmentInfo, CliError> {
+        self.show_checkpoint(storage_path, checkpoint_id)
+    }
+    fn generate_support_bundle(
+        &self,
+        storage_path: &Path,
+        bundle_file: &Path,
+    ) -> Result<SupportBundleInfo, CliError> {
+        self.generate_support_bundle_with_diagnostics(
+            storage_path,
+            None,
+            None,
+            Some(bundle_file),
+            &[],
+        )
+    }
+    fn create_backup(
+        &self,
+        storage_path: &Path,
+        destination: &str,
+    ) -> Result<BackupCreateOutput, CliError> {
+        self.create_backup(storage_path, destination)
+    }
+    fn inspect_backup(&self, destination: &str) -> Result<BackupInspectOutput, CliError> {
+        self.inspect_backup(destination)
+    }
+    fn verify_backup(&self, destination: &str) -> Result<BackupVerifyOutput, CliError> {
+        self.verify_backup(destination)
+    }
+    fn restore_backup(
+        &self,
+        source: &str,
+        target: &Path,
+        yes: bool,
+    ) -> Result<RestoreOutcome, CliError> {
+        self.restore_backup(source, target, yes)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteStorageAdminClient {
+    pub identity: ClientIdentity,
+}
+
+impl RemoteStorageAdminClient {
+    pub fn with_identity(identity: ClientIdentity) -> Self {
+        Self { identity }
+    }
+
+    fn unavailable<T>(&self, operation: &str) -> Result<T, CliError> {
+        let _ = &self.identity;
+        Err(remote_query_unavailable(operation))
+    }
+}
+
+impl StorageAdminApi for RemoteStorageAdminClient {
+    fn export_checkpoint(
+        &self,
+        _storage_path: &Path,
+        _destination: &str,
+    ) -> Result<CheckpointExportOutcome, CliError> {
+        self.unavailable("checkpoint export")
+    }
+
+    fn restore_checkpoint(
+        &self,
+        _audit_path: &Path,
+        _source: &str,
+        _target: &str,
+    ) -> Result<RestoreOutcome, CliError> {
+        self.unavailable("checkpoint restore")
+    }
+
+    fn list_checkpoints(&self, _storage_path: &Path) -> Result<Vec<CheckpointSummary>, CliError> {
+        self.unavailable("checkpoint listing")
+    }
+
+    fn show_checkpoint(
+        &self,
+        _storage_path: &Path,
+        _checkpoint_id: u64,
+    ) -> Result<CheckpointAlignmentInfo, CliError> {
+        self.unavailable("checkpoint inspection")
+    }
+
+    fn generate_support_bundle(
+        &self,
+        _storage_path: &Path,
+        _bundle_file: &Path,
+    ) -> Result<SupportBundleInfo, CliError> {
+        self.unavailable("support bundle generation")
+    }
+
+    fn create_backup(
+        &self,
+        _storage_path: &Path,
+        _destination: &str,
+    ) -> Result<crate::output::BackupCreateOutput, CliError> {
+        self.unavailable("backup creation")
+    }
+
+    fn inspect_backup(
+        &self,
+        _destination: &str,
+    ) -> Result<crate::output::BackupInspectOutput, CliError> {
+        self.unavailable("backup inspection")
+    }
+
+    fn verify_backup(
+        &self,
+        _destination: &str,
+    ) -> Result<crate::output::BackupVerifyOutput, CliError> {
+        self.unavailable("backup verification")
+    }
+
+    fn restore_backup(
+        &self,
+        _source: &str,
+        _target: &Path,
+        _yes: bool,
+    ) -> Result<crate::output::RestoreOutcome, CliError> {
+        self.unavailable("backup restore")
     }
 }

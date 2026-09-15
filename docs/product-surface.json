@@ -2,12 +2,587 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "8ac497fc7f89345b3ba0ae1163cc91c7a26c4e696d04a36a420604bf25e3cf48",
+    "candidate_identity_digest": "2f65e688ef9b98aeebbf367b0c57202f3901090bc87079d63af12f7115930940",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
   "cli_surface": {
     "commands": [
+      {
+        "name": "admin",
+        "about": "Administrative operations (drain, migrate, raft, checkpoint)",
+        "subcommands": [
+          {
+            "name": "backup",
+            "about": "Point-in-time durable backup operations (create, inspect, verify)",
+            "subcommands": [
+              {
+                "name": "create",
+                "about": "Create a full point-in-time backup",
+                "options": [
+                  {
+                    "name": "destination",
+                    "help": "Destination directory or URI",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "inspect",
+                "about": "Inspect a backup manifest and point-in-time consistency metadata",
+                "options": [
+                  {
+                    "name": "destination",
+                    "help": "Destination directory or URI",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "verify",
+                "about": "Cryptographically verify backup integrity against manifest checksums",
+                "options": [
+                  {
+                    "name": "destination",
+                    "help": "Destination directory or URI",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "checkpoint",
+            "about": "Checkpoint administration and manual triggering",
+            "subcommands": [
+              {
+                "name": "export",
+                "about": "Export latest committed checkpoint",
+                "options": [
+                  {
+                    "name": "destination",
+                    "long": "destination",
+                    "help": "Destination object-store URL",
+                    "required": true,
+                    "value_name": "DESTINATION"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "list",
+                "about": "List cluster checkpoints",
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "restore",
+                "about": "Restore committed export",
+                "options": [
+                  {
+                    "name": "source",
+                    "long": "source",
+                    "help": "Export object-store URL",
+                    "required": true,
+                    "value_name": "SOURCE"
+                  },
+                  {
+                    "name": "storage",
+                    "long": "storage",
+                    "help": "Fresh target object-store URL",
+                    "required": true,
+                    "value_name": "STORAGE"
+                  },
+                  {
+                    "name": "yes",
+                    "long": "yes",
+                    "help": "Confirm destructive action without interactive prompt",
+                    "required": false,
+                    "value_name": "YES",
+                    "possible_values": [
+                      "true",
+                      "false"
+                    ]
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "show",
+                "about": "Show per-shard checkpoint alignment state",
+                "options": [
+                  {
+                    "name": "checkpoint_id",
+                    "help": "Checkpoint ID",
+                    "required": true,
+                    "value_name": "CHECKPOINT_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "drain",
+            "about": "Gracefully drain workloads from a worker node",
+            "options": [
+              {
+                "name": "control",
+                "long": "control",
+                "help": "Control service URL",
+                "required": false,
+                "value_name": "CONTROL"
+              },
+              {
+                "name": "worker_id",
+                "long": "worker-id",
+                "help": "Worker ID to drain",
+                "required": true,
+                "value_name": "WORKER_ID"
+              },
+              {
+                "name": "yes",
+                "short": "y",
+                "long": "yes",
+                "help": "Automatically confirm execution without interactive prompt",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "migrate",
+            "about": "Migrate a shard to a target worker node",
+            "options": [
+              {
+                "name": "control",
+                "long": "control",
+                "help": "Control service URL",
+                "required": false,
+                "value_name": "CONTROL"
+              },
+              {
+                "name": "shard_id",
+                "long": "shard-id",
+                "help": "Shard ID to migrate",
+                "required": true,
+                "value_name": "SHARD_ID"
+              },
+              {
+                "name": "target_worker",
+                "long": "target-worker",
+                "help": "Target worker ID",
+                "required": true,
+                "value_name": "TARGET_WORKER"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "raft",
+            "about": "Raft consensus administrative inspection and operations",
+            "subcommands": [
+              {
+                "name": "status",
+                "about": "Inspect Raft consensus cluster membership and leadership",
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "restore",
+            "about": "Restore a database backup into a clean or authorized destination",
+            "options": [
+              {
+                "name": "source",
+                "help": "Source backup directory or object-store URI",
+                "required": true,
+                "value_name": "SOURCE"
+              },
+              {
+                "name": "target",
+                "short": "t",
+                "long": "target",
+                "help": "Target destination directory",
+                "required": false,
+                "value_name": "TARGET"
+              },
+              {
+                "name": "yes",
+                "short": "y",
+                "long": "yes",
+                "help": "Force overwrite of existing non-empty destination",
+                "required": false,
+                "value_name": "YES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
       {
         "name": "audit",
         "about": "Audit log inspection commands",
@@ -960,6 +1535,421 @@
         ]
       },
       {
+        "name": "dev",
+        "about": "Developer and offline development tooling",
+        "subcommands": [
+          {
+            "name": "completions",
+            "about": "Generate shell completion scripts for Bash, Zsh, or Fish",
+            "options": [
+              {
+                "name": "shell",
+                "help": "Target shell to generate completions for",
+                "required": true,
+                "value_name": "SHELL",
+                "possible_values": [
+                  "bash",
+                  "zsh",
+                  "fish"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "debug",
+            "about": "Low-level debugging and arrangement state inspection",
+            "subcommands": [
+              {
+                "name": "arrangement",
+                "about": "Inspect intermediate arrangement Z-set state for an operator",
+                "options": [
+                  {
+                    "name": "epoch",
+                    "long": "epoch",
+                    "help": "Historical epoch to inspect",
+                    "required": false,
+                    "value_name": "EPOCH"
+                  },
+                  {
+                    "name": "key",
+                    "help": "Key expression to inspect",
+                    "required": true,
+                    "value_name": "KEY"
+                  },
+                  {
+                    "name": "op_id",
+                    "help": "Operator ID to inspect",
+                    "required": true,
+                    "value_name": "OP_ID"
+                  },
+                  {
+                    "name": "view",
+                    "help": "View name to inspect",
+                    "required": true,
+                    "value_name": "VIEW"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "explain",
+            "about": "Explain the incremental execution plan for a view",
+            "options": [
+              {
+                "name": "estimate",
+                "long": "estimate",
+                "help": "Show calibrated capacity, state memory, and throughput estimates without deploying",
+                "required": false,
+                "value_name": "ESTIMATE",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "name": "op_ids",
+                "long": "op-ids",
+                "help": "Show operator IDs and addressability details for intermediate state",
+                "required": false,
+                "value_name": "OP_IDS",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "name": "view",
+                "help": "View name to explain",
+                "required": true,
+                "value_name": "VIEW"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "manifest",
+            "about": "Evidence manifest verification and inspection",
+            "subcommands": [
+              {
+                "name": "validate",
+                "about": "Validate an evidence-manifest.json file",
+                "options": [
+                  {
+                    "name": "base_dir",
+                    "long": "base-dir",
+                    "help": "Optional base directory containing referenced artifact files",
+                    "required": false,
+                    "value_name": "BASE_DIR"
+                  },
+                  {
+                    "name": "path",
+                    "help": "Path to the evidence-manifest.json file",
+                    "required": true,
+                    "value_name": "PATH"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "qualify",
+            "about": "Run release qualification suite or check prerequisites",
+            "options": [
+              {
+                "name": "check_prerequisites",
+                "long": "check-prerequisites",
+                "help": "Check execution environment prerequisites fail-closed",
+                "required": false,
+                "value_name": "CHECK_PREREQUISITES",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "name": "output",
+                "long": "output",
+                "help": "Output file path for raw metrics and summary",
+                "required": false,
+                "value_name": "OUTPUT"
+              },
+              {
+                "name": "suite",
+                "long": "suite",
+                "help": "Qualification test suite to execute",
+                "required": false,
+                "value_name": "SUITE"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "sim",
+            "about": "Run offline dataflow simulation",
+            "options": [
+              {
+                "name": "scenario",
+                "long": "scenario",
+                "help": "Path to simulation scenario definition",
+                "required": false,
+                "value_name": "SCENARIO"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "sql",
+            "about": "Parse, lower, and explain a SQL query without deploying",
+            "options": [
+              {
+                "name": "query",
+                "help": "SQL query to parse and lower",
+                "required": true,
+                "value_name": "QUERY"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
         "name": "doctor",
         "about": "Run non-destructive diagnostic checks on binary, config, system, storage, and network reachability",
         "options": [
@@ -1294,6 +2284,271 @@
         ]
       },
       {
+        "name": "project",
+        "about": "Project scaffolding and workspace management",
+        "subcommands": [
+          {
+            "name": "apply",
+            "about": "Apply project schema and seed data over live pgwire connection",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Project directory containing project.toml (defaults to current dir)",
+                "required": false,
+                "value_name": "DIR",
+                "default_value": "."
+              },
+              {
+                "name": "endpoint",
+                "long": "endpoint",
+                "help": "Gateway address to connect to (defaults to 127.0.0.1:5432)",
+                "required": false,
+                "value_name": "ENDPOINT",
+                "default_value": "127.0.0.1:5432"
+              },
+              {
+                "name": "timeout",
+                "long": "timeout",
+                "help": "Connection / statement timeout in seconds",
+                "required": false,
+                "value_name": "TIMEOUT",
+                "default_value": "30"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "init",
+            "about": "Initialize a new RockStream project from a template",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Target directory to scaffold the project into (defaults to ./<name>)",
+                "required": false,
+                "value_name": "DIR"
+              },
+              {
+                "name": "force",
+                "long": "force",
+                "help": "Overwrite existing files in non-empty directory",
+                "required": false,
+                "value_name": "FORCE",
+                "default_value": "false",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "name": "name",
+                "help": "Project name (defaults to \"my_project\")",
+                "required": false,
+                "value_name": "NAME",
+                "default_value": "my_project"
+              },
+              {
+                "name": "template",
+                "long": "template",
+                "help": "Project template: \"local\" (experimental templates are in examples/experimental/)",
+                "required": false,
+                "value_name": "TEMPLATE",
+                "default_value": "local"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "new",
+            "about": "Scaffold a new RockStream project into a new directory",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Target directory to scaffold the project into (defaults to ./<name>)",
+                "required": false,
+                "value_name": "DIR"
+              },
+              {
+                "name": "force",
+                "long": "force",
+                "help": "Overwrite existing files in non-empty directory",
+                "required": false,
+                "value_name": "FORCE",
+                "default_value": "false",
+                "possible_values": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "name": "name",
+                "help": "Project name",
+                "required": true,
+                "value_name": "NAME"
+              },
+              {
+                "name": "template",
+                "long": "template",
+                "help": "Project template: \"local\"",
+                "required": false,
+                "value_name": "TEMPLATE",
+                "default_value": "local"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "verify",
+            "about": "Verify project materialized views against expected query results",
+            "options": [
+              {
+                "name": "dir",
+                "long": "dir",
+                "help": "Project directory containing project.toml (defaults to current dir)",
+                "required": false,
+                "value_name": "DIR",
+                "default_value": "."
+              },
+              {
+                "name": "endpoint",
+                "long": "endpoint",
+                "help": "Gateway address to connect to (defaults to 127.0.0.1:5432)",
+                "required": false,
+                "value_name": "ENDPOINT",
+                "default_value": "127.0.0.1:5432"
+              },
+              {
+                "name": "timeout",
+                "long": "timeout",
+                "help": "Connection / statement timeout in seconds",
+                "required": false,
+                "value_name": "TIMEOUT",
+                "default_value": "30"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
         "name": "qualify",
         "about": "Run release qualification suite or check prerequisites",
         "options": [
@@ -1321,6 +2576,78 @@
             "help": "Qualification test suite to execute",
             "required": false,
             "value_name": "SUITE"
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
+        "name": "query",
+        "about": "Execute an incremental query against a view or stream via embedded pgwire client",
+        "options": [
+          {
+            "name": "endpoint",
+            "long": "endpoint",
+            "help": "Gateway address to connect to",
+            "required": false,
+            "value_name": "ENDPOINT",
+            "default_value": "127.0.0.1:5432"
+          },
+          {
+            "name": "file",
+            "long": "file",
+            "help": "Path to SQL file to execute",
+            "required": false,
+            "value_name": "FILE"
+          },
+          {
+            "name": "format",
+            "long": "format",
+            "help": "Output format: table, json, or csv",
+            "required": false,
+            "value_name": "FORMAT",
+            "default_value": "table"
+          },
+          {
+            "name": "query",
+            "help": "SQL query to execute",
+            "required": false,
+            "value_name": "QUERY",
+            "default_value": ""
+          },
+          {
+            "name": "timing",
+            "long": "timing",
+            "help": "Measure and display query execution timing",
+            "required": false,
+            "value_name": "TIMING",
+            "default_value": "false",
+            "possible_values": [
+              "true",
+              "false"
+            ]
           }
         ],
         "exit_codes": [
@@ -1826,6 +3153,44 @@
         ]
       },
       {
+        "name": "shell",
+        "about": "Launch interactive SQL/admin REPL shell over live pgwire connection",
+        "options": [
+          {
+            "name": "endpoint",
+            "long": "endpoint",
+            "help": "Gateway address to connect to",
+            "required": false,
+            "value_name": "ENDPOINT",
+            "default_value": "127.0.0.1:5432"
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
         "name": "source",
         "about": "Source inspection commands",
         "subcommands": [
@@ -2087,6 +3452,8 @@
             "default_value": "off",
             "possible_values": [
               "off",
+              "scram",
+              "md5",
               "oidc",
               "mtls"
             ]
@@ -2253,7 +3620,13 @@
             "help": "Node role",
             "required": false,
             "value_name": "ROLE",
-            "default_value": "all"
+            "default_value": "all",
+            "possible_values": [
+              "all",
+              "gateway",
+              "worker",
+              "control"
+            ]
           },
           {
             "name": "same_host_shm_segment_bytes",
@@ -2305,6 +3678,34 @@
             "value_name": "WORKER_ID"
           }
         ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
+        "name": "status",
+        "about": "Print cluster topology and health status",
         "exit_codes": [
           {
             "code": 0,
@@ -5220,6 +6621,16 @@
         "doc_anchor": "rs-2056"
       },
       {
+        "code": "RS-2057",
+        "key": "write.duplicate_key",
+        "title": "Duplicate key value violates primary key constraint",
+        "severity": "ERROR",
+        "sqlstate": "23505",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Ensure inserted or updated primary key values are unique.",
+        "doc_anchor": "rs-2057"
+      },
+      {
         "code": "RS-2060",
         "key": "write.epoch_exhausted",
         "title": "Commit epoch reached u64::MAX",
@@ -5908,6 +7319,46 @@
         "retry_class": "ExponentialBackoff",
         "default_next_steps": "Wait for in-flight shard drain tasks to complete before enqueueing additional assignments.",
         "doc_anchor": "rs-3612"
+      },
+      {
+        "code": "RS-3615",
+        "key": "backup.missing_file_or_manifest",
+        "title": "Missing payload file or truncated/unfinalized manifest",
+        "severity": "FATAL",
+        "sqlstate": "58030",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Restore missing file from backup replica or retry backup creation; ensure backup completes cleanly.",
+        "doc_anchor": "rs-3615"
+      },
+      {
+        "code": "RS-3616",
+        "key": "backup.checksum_mismatch",
+        "title": "Checksum mismatch on manifest or data file",
+        "severity": "FATAL",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Replace corrupted file from verified backup replica; discard invalid backup.",
+        "doc_anchor": "rs-3616"
+      },
+      {
+        "code": "RS-3617",
+        "key": "backup.incompatible_format",
+        "title": "Incompatible backup manifest format version or unsupported storage layout",
+        "severity": "FATAL",
+        "sqlstate": "0A000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Upgrade RockStream binary or use a backup with supported format version.",
+        "doc_anchor": "rs-3617"
+      },
+      {
+        "code": "RS-3618",
+        "key": "backup.broken_catalog_reference",
+        "title": "Broken catalog reference or catalog revision inconsistency",
+        "severity": "FATAL",
+        "sqlstate": "42P01",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Verify catalog snapshot and frontier consistency; ensure catalog revision matches cluster checkpoint.",
+        "doc_anchor": "rs-3618"
       },
       {
         "code": "RS-3701",

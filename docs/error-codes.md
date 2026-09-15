@@ -14,10 +14,10 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - [0xxx: Internal & General System](#0xxx-internal--general-system) (5 codes)
 - [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (26 codes)
 - [17xx: Lease Management & Raft Leadership](#17xx-lease-management--raft-leadership) (4 codes)
-- [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (37 codes)
+- [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
-- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (49 codes)
+- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (53 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
 - [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
@@ -402,6 +402,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-2054`](#rs-2054) | `query.statement_timeout` | Query exceeded the configured statement timeout | `Error` | `57014` | `ExponentialBackoff` |
 | [`RS-2055`](#rs-2055) | `limit.connection_limit_exceeded` | Server-wide connection limit reached | `Error` | `53300` | `ExponentialBackoff` |
 | [`RS-2056`](#rs-2056) | `write.malformed_values_list` | Malformed INSERT VALUES list or schema mismatch | `Error` | `42601` | `NonRetryable` |
+| [`RS-2057`](#rs-2057) | `write.duplicate_key` | Duplicate key value violates primary key constraint | `Error` | `23505` | `NonRetryable` |
 | [`RS-2060`](#rs-2060) | `write.epoch_exhausted` | Commit epoch reached u64::MAX | `Fatal` | `54000` | `NonRetryable` |
 
 ### <a id="rs-2000"></a> `RS-2000` — Malformed table DDL statement
@@ -691,6 +692,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `42601`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Ensure every VALUES row has matching parenthesis and correct column count.
+
+### <a id="rs-2057"></a> `RS-2057` — Duplicate key value violates primary key constraint
+
+- **Key**: `write.duplicate_key`
+- **Severity**: `Error`
+- **SQLSTATE**: `23505`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Ensure inserted or updated primary key values are unique.
 
 ### <a id="rs-2060"></a> `RS-2060` — Commit epoch reached u64::MAX
 
@@ -1004,6 +1013,10 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-3610`](#rs-3610) | `worker.drain_target_not_found` | Worker drain target does not exist in the current topology | `Error` | `55000` | `Immediate` |
 | [`RS-3611`](#rs-3611) | `worker.no_active_drain_recipient` | Worker drain cannot proceed because no active recipient worker is available | `Error` | `55000` | `Immediate` |
 | [`RS-3612`](#rs-3612) | `worker.drain_queue_capacity_reached` | Worker drain queue reached its configured bound; backpressure applied | `Error` | `53200` | `ExponentialBackoff` |
+| [`RS-3615`](#rs-3615) | `backup.missing_file_or_manifest` | Missing payload file or truncated/unfinalized manifest | `Fatal` | `58030` | `NonRetryable` |
+| [`RS-3616`](#rs-3616) | `backup.checksum_mismatch` | Checksum mismatch on manifest or data file | `Fatal` | `XX000` | `NonRetryable` |
+| [`RS-3617`](#rs-3617) | `backup.incompatible_format` | Incompatible backup manifest format version or unsupported storage layout | `Fatal` | `0A000` | `NonRetryable` |
+| [`RS-3618`](#rs-3618) | `backup.broken_catalog_reference` | Broken catalog reference or catalog revision inconsistency | `Fatal` | `42P01` | `NonRetryable` |
 | [`RS-3701`](#rs-3701) | `view.waiting_on_source` | View is waiting on source/frontier progress | `Warning` | `55000` | `Immediate` |
 | [`RS-3702`](#rs-3702) | `view.quota_admission_rejected` | View admission rejected by quota controls | `Warning` | `53200` | `ExponentialBackoff` |
 | [`RS-3703`](#rs-3703) | `view.spilling` | View lag is dominated by spill delay | `Warning` | `53100` | `ExponentialBackoff` |
@@ -1340,6 +1353,38 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `53200`
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Wait for in-flight shard drain tasks to complete before enqueueing additional assignments.
+
+### <a id="rs-3615"></a> `RS-3615` — Missing payload file or truncated/unfinalized manifest
+
+- **Key**: `backup.missing_file_or_manifest`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `58030`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Restore missing file from backup replica or retry backup creation; ensure backup completes cleanly.
+
+### <a id="rs-3616"></a> `RS-3616` — Checksum mismatch on manifest or data file
+
+- **Key**: `backup.checksum_mismatch`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `XX000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Replace corrupted file from verified backup replica; discard invalid backup.
+
+### <a id="rs-3617"></a> `RS-3617` — Incompatible backup manifest format version or unsupported storage layout
+
+- **Key**: `backup.incompatible_format`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `0A000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Upgrade RockStream binary or use a backup with supported format version.
+
+### <a id="rs-3618"></a> `RS-3618` — Broken catalog reference or catalog revision inconsistency
+
+- **Key**: `backup.broken_catalog_reference`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `42P01`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Verify catalog snapshot and frontier consistency; ensure catalog revision matches cluster checkpoint.
 
 ### <a id="rs-3701"></a> `RS-3701` — View is waiting on source/frontier progress
 

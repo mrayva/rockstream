@@ -169,26 +169,56 @@ fn local_init_transcript_and_layout_are_exact() {
     );
     assert_eq!(
         *blocks.iter().find(|block| block.starts_with("my-project/\n")).unwrap(),
-        "my-project/\n├── README.md\n├── data/seed.csv\n├── queries.sql\n├── rockstream.toml\n├── schema.sql\n└── scripts/\n    ├── cleanup.sh\n    └── verify.sh\n"
+        "my-project/\n├── README.md\n├── data/seed.csv\n├── project.toml\n├── queries/verify.sql\n├── rockstream.toml\n└── schema.sql\n"
     );
 
     let expected_files = [
         (
             "rockstream.toml",
             r#"# RockStream Configuration — Local Standalone Deployment
+version = 1
+
+[node]
+role = "all"
+
 [gateway]
-listen = "127.0.0.1:5432"
+listen_addr = "127.0.0.1:5432"
 
 [storage]
-backend = "lfs"
-path = "./storage"
+url = "file://./data"
 
 [metrics]
-listen = "127.0.0.1:9090"
+listen_addr = "127.0.0.1:9090"
 enabled = true
 
 [logging]
 level = "info"
+"#,
+        ),
+        (
+            "project.toml",
+            r#"version = 1
+name = "my-project"
+
+[[apply]]
+file = "schema.sql"
+
+[[seed]]
+table = "orders"
+file = "data/seed.csv"
+format = "csv"
+
+[[verify]]
+name = "sales_by_store"
+query = """
+SELECT store_id, total_amount
+FROM sales_by_store
+ORDER BY store_id;
+"""
+expected = """
+100|120
+200|40
+"""
 "#,
         ),
         (
@@ -208,14 +238,14 @@ FROM orders
 GROUP BY store_id;
 "#,
         ),
-        (
-            "queries.sql",
-            "-- Diagnostic & Verification Queries\nSELECT store_id, total_amount FROM sales_by_store ORDER BY store_id;\n",
-        ),
         ("data/seed.csv", "id,store_id,amount\n1,100,50\n2,100,70\n3,200,40\n"),
         (
+            "queries/verify.sql",
+            "-- Verification query\nSELECT store_id, total_amount FROM sales_by_store ORDER BY store_id;\n",
+        ),
+        (
             "README.md",
-            r#"# RockStream Local Standalone Project
+            r#"# RockStream Local Standalone Project: my-project
 
 This project runs a single-node RockStream instance maintaining incremental materialized views over local storage.
 
@@ -226,44 +256,15 @@ This project runs a single-node RockStream instance maintaining incremental mate
    rockstream start --storage ./storage --listen 127.0.0.1:5432
    ```
 
-2. Run automated verification:
+2. Apply project schema and seed data:
    ```bash
-   bash scripts/verify.sh
+   rockstream project apply
    ```
 
-3. Teardown and cleanup:
+3. Verify maintained views:
    ```bash
-   bash scripts/cleanup.sh
+   rockstream project verify
    ```
-"#,
-        ),
-        (
-            "scripts/verify.sh",
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-
-GATEWAY_PORT="${ROCKSTREAM_PORT:-5432}"
-GATEWAY_HOST="${ROCKSTREAM_HOST:-127.0.0.1}"
-
-echo "==> Verifying RockStream local standalone deployment on ${GATEWAY_HOST}:${GATEWAY_PORT}..."
-
-if ! command -v psql >/dev/null 2>&1; then
-    echo "Notice: psql not found in PATH, skipping psql query checks."
-    exit 0
-fi
-
-psql -h "${GATEWAY_HOST}" -p "${GATEWAY_PORT}" -U rockstream -d rockstream -c "SELECT store_id, total_amount, order_count FROM sales_by_store ORDER BY store_id;"
-echo "==> Verification completed successfully."
-"#,
-        ),
-        (
-            "scripts/cleanup.sh",
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-
-echo "==> Cleaning up local RockStream project state..."
-rm -rf ./storage
-echo "==> Cleanup complete."
 "#,
         ),
     ];
@@ -282,30 +283,19 @@ echo "==> Cleanup complete."
         assert_eq!(fs::read_to_string(target.join(path)).unwrap(), expected);
     }
 
-    let verify = Command::new("/bin/bash")
-        .arg("scripts/verify.sh")
-        .current_dir(&target)
-        .env("PATH", "/nonexistent")
-        .output()
-        .unwrap();
     assert_eq!(
-        String::from_utf8(verify.stdout).unwrap(),
         block_output(
-            block_for_command(&blocks, "$ bash scripts/verify.sh"),
-            "$ bash scripts/verify.sh",
-        )
+            block_for_command(&blocks, "$ rockstream project apply"),
+            "$ rockstream project apply",
+        ),
+        "Project 'my-project' applied successfully:\n  - schema 'schema.sql' (applied)\n  - seed table 'orders' from 'data/seed.csv' (ingested)\n\nNext step:\n  rockstream project verify\n"
     );
-    let cleanup = Command::new("/bin/bash")
-        .arg("scripts/cleanup.sh")
-        .current_dir(&target)
-        .output()
-        .unwrap();
     assert_eq!(
-        String::from_utf8(cleanup.stdout).unwrap(),
         block_output(
-            block_for_command(&blocks, "$ bash scripts/cleanup.sh"),
-            "$ bash scripts/cleanup.sh",
-        )
+            block_for_command(&blocks, "$ rockstream project verify"),
+            "$ rockstream project verify",
+        ),
+        "PASSED verification 'sales_by_store' (2 rows)\n"
     );
 }
 

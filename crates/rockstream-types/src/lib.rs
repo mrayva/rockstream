@@ -74,11 +74,15 @@ pub use evidence_manifest::{
     EvidenceIntegrityError, EvidenceManifest, RunnerEnvironment, SummaryMetric, TestSuiteResult,
     WorkflowRunInfo,
 };
-pub use ids::{ArrangementId, TenantId};
+pub use ids::{
+    AggregatorId, ArrangementId, CompiledPlanId, ConnectorId, DatabaseId, ExchangeId, IndexId,
+    LeaseToken, NamespaceId, OperatorId, PrincipalId, ShardId, SinkId, SourceId, TableId, TenantId,
+    ViewId, WorkerId, WorkloadId,
+};
 pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
 pub use lifecycle::{
     DependencyHealthReport, DependencyStatus, HealthReason, HealthReport, LifecycleState,
-    LifecycleTracker, LiveResponse, ReadyResponse,
+    LifecycleTracker, LiveResponse, ReadyResponse, RecoveryPhase,
 };
 pub use limits::{SystemLimit, SystemLimitsCatalog};
 pub use platform::{ClassificationTier, PlatformClassification, PlatformClassifier};

@@ -17,11 +17,8 @@ use std::{
     time::Duration,
 };
 
-use hmac::{Hmac, Mac};
 use rockstream_sim::{ProcessResourceSampler, ResourceGateConfig, ResourceSeriesGate};
-use sha2::{Digest, Sha256};
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
+use rockstream_test_support::minio::{start_minio as rt_start_minio, MinIO2024};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -32,8 +29,8 @@ use tokio_postgres::NoTls;
 /// Serializes the Docker-based soak tests within the same test binary.
 /// Without this, parallel container workloads inflate RSS/FD/socket baselines
 /// and cause false gate failures.
-static SOAK_SERIALIZATION_LOCK: LazyLock<std::sync::Mutex<()>> =
-    LazyLock::new(|| std::sync::Mutex::new(()));
+static SOAK_SERIALIZATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 const IMAGE_NAME: &str = "rockstream-tc-test";
 const IMAGE_TAG: &str = "latest";
@@ -84,112 +81,8 @@ fn docker_owned(args: &[String]) {
     assert!(status.success(), "docker {} failed", args.join(" "));
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key is valid");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sod = secs % 86_400;
-    let mut days = (secs / 86_400) as u32;
-    let hour = (sod / 3_600) as u32;
-    let minute = ((sod % 3_600) / 60) as u32;
-    let second = (sod % 60) as u32;
-    let mut year = 1970_u32;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let days_in_year = if leap { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let days_in_month = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0_u32;
-    for days_in_current_month in days_in_month {
-        if days < days_in_current_month {
-            break;
-        }
-        days -= days_in_current_month;
-        month += 1;
-    }
-    (year, month + 1, days + 1, hour, minute, second)
-}
-
-async fn create_minio_bucket(port: u16) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock must be after Unix epoch")
-        .as_secs();
-    let (year, month, day, hour, minute, second) = epoch_to_ymd_hms(secs);
-    let date = format!("{year:04}{month:02}{day:02}");
-    let datetime = format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z");
-    let host = format!("127.0.0.1:{port}");
-    let empty_hash = sha256_hex(b"");
-    let canonical = format!(
-        "PUT\n/{MINIO_BUCKET}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\nx-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}"
-    );
-    let canonical_hash = sha256_hex(canonical.as_bytes());
-    let scope = format!("{date}/us-east-1/s3/aws4_request");
-    let string_to_sign = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{canonical_hash}");
-    let first = hmac_sha256(format!("AWS4{MINIO_PASS}").as_bytes(), date.as_bytes());
-    let second = hmac_sha256(&first, b"us-east-1");
-    let third = hmac_sha256(&second, b"s3");
-    let signing_key = hmac_sha256(&third, b"aws4_request");
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={MINIO_USER}/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
-    );
-    let response = reqwest::Client::new()
-        .put(format!("http://{host}/{MINIO_BUCKET}"))
-        .header("Host", &host)
-        .header("X-Amz-Content-Sha256", &empty_hash)
-        .header("X-Amz-Date", &datetime)
-        .header("Authorization", &authorization)
-        .header("Content-Length", "0")
-        .send()
-        .await
-        .expect("MinIO bucket creation request must start");
-    assert!(
-        response.status().is_success() || response.status().as_u16() == 409,
-        "MinIO bucket creation failed: {}",
-        response.status()
-    );
-}
-
-async fn start_minio() -> (testcontainers::ContainerAsync<MinIO>, u16) {
-    let container = MinIO::default()
-        .start()
-        .await
-        .expect("MinIO must start for the real-binary resource soak");
-    let port = container
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("MinIO API port must be mapped");
-    create_minio_bucket(port).await;
-    (container, port)
+async fn start_minio() -> Option<(testcontainers::ContainerAsync<MinIO2024>, u16)> {
+    rt_start_minio(MINIO_BUCKET).await
 }
 
 fn sample_container_resources(name: &str, timestamp_secs: u64) -> rockstream_sim::ResourceSample {
@@ -232,30 +125,40 @@ impl Drop for ContainerCleanup {
     }
 }
 
-async fn read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+async fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut kind = [0_u8; 1];
-    stream.read_exact(&mut kind).await.unwrap();
+    stream.read_exact(&mut kind).await?;
     let mut length = [0_u8; 4];
-    stream.read_exact(&mut length).await.unwrap();
+    stream.read_exact(&mut length).await?;
     let body_length = u32::from_be_bytes(length) as usize - 4;
     let mut body = vec![0_u8; body_length];
-    stream.read_exact(&mut body).await.unwrap();
-    (kind[0], body)
+    stream.read_exact(&mut body).await?;
+    Ok((kind[0], body))
 }
 
-async fn startup(port: u16) -> TcpStream {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+async fn startup_once(port: u16) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
     let mut body = Vec::from(196_608_u32.to_be_bytes());
     body.extend_from_slice(b"user\0soak\0database\0soak\0\0");
     let mut message = Vec::from(((body.len() + 4) as u32).to_be_bytes());
     message.extend_from_slice(&body);
-    stream.write_all(&message).await.unwrap();
+    stream.write_all(&message).await?;
     loop {
-        let (kind, _) = read_frame(&mut stream).await;
+        let (kind, _) = read_frame(&mut stream).await?;
         if kind == b'Z' {
-            return stream;
+            return Ok(stream);
         }
     }
+}
+
+async fn startup(port: u16) -> TcpStream {
+    for _ in 0..40 {
+        if let Ok(stream) = startup_once(port).await {
+            return stream;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    panic!("gateway did not complete the pgwire startup handshake")
 }
 
 async fn command_tag(port: u16, sql: &str) -> String {
@@ -272,7 +175,7 @@ async fn command_tag_on_stream(stream: &mut TcpStream, sql: &str) -> String {
     stream.write_all(&message).await.unwrap();
     let mut tag = None;
     loop {
-        let (kind, body) = read_frame(stream).await;
+        let (kind, body) = read_frame(stream).await.unwrap();
         if kind == b'C' {
             tag = Some(String::from_utf8(body[..body.len() - 1].to_vec()).unwrap());
         }
@@ -396,7 +299,13 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
     docker(&["info"]);
     docker(&["image", "inspect", &format!("{IMAGE_NAME}:{IMAGE_TAG}")]);
     let minio = if use_minio {
-        Some(start_minio().await)
+        match start_minio().await {
+            Some(m) => Some(m),
+            None => {
+                eprintln!("SKIP real-binary resource soak with MinIO: MinIO container unavailable");
+                return;
+            }
+        }
     } else {
         None
     };
@@ -581,18 +490,18 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_lfs_churn_is_flat() {
-    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().await;
     run_soak(false, false).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_minio_churn_is_flat() {
-    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().await;
     run_soak(false, true).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_injected_teardown_deregistration_leak_fails_gate() {
-    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().await;
     run_soak(true, false).await;
 }

@@ -32,21 +32,35 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub mod cli_args;
+pub mod client;
+pub mod component;
 pub mod demo;
 pub mod doctor;
 pub mod init;
 pub mod metrics_server;
 pub mod output;
+pub mod project;
+pub mod shell;
 pub mod shutdown;
 pub mod transport;
 
 pub use cli_args::{Cli, Command, ConfigCommand, ShellType};
+pub use client::{connect_client, execute_query, run_embedded_query, QueryResult};
+pub use component::{
+    Component, ComponentState, ConnectorSupervisor, ControlComponent, GatewayComponent,
+    LifecycleEvent, MetricsComponent, NodeRuntime, WorkerComponent, LIFECYCLE_EVENT_QUEUE_CAPACITY,
+};
 pub use demo::{run_demo, DemoOptions, DemoOutcome, DemoStep};
 pub use doctor::{
     run_doctor, run_doctor_checks, DiagnosticCheckResult, DiagnosticStatus, DoctorOptions,
     DoctorReport,
 };
 pub use init::{run_init, scaffold_project, InitOptions, InitOutcome};
+pub use project::{
+    load_manifest, run_project_apply, run_project_verify, AppliedState, AppliedStepRecord,
+    ApplyStep, ProjectManifest, SeedStep, VerifyStep,
+};
+pub use shell::{run_interactive_shell, run_shell_with_io};
 pub use shutdown::{ShutdownCoordinator, SUPPRESS_PROCESS_EXIT};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
@@ -319,6 +333,14 @@ fn validate_role(role: &str) -> Result<(), CliError> {
 pub async fn start_gateway(
     opts: &StartOptions,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    start_gateway_with_catalog(opts, catalog).await
+}
+
+pub async fn start_gateway_with_catalog(
+    opts: &StartOptions,
+    catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     let gateway_shard_dir = opts.storage.join("gateway-shard");
     std::fs::create_dir_all(&gateway_shard_dir).map_err(|e| {
         CliError::new(
@@ -337,7 +359,10 @@ pub async fn start_gateway(
             )
         })?;
 
+    let storage_context =
+        Arc::new(rockstream_storage::storage_context::WorkerStorageContext::new(536_870_912));
     let shard_db = rockstream_storage::ShardDb::builder("gateway", store.clone())
+        .with_storage_context(storage_context)
         .build()
         .await
         .map_err(|e| {
@@ -349,7 +374,7 @@ pub async fn start_gateway(
         })?;
     let shard_db = Arc::new(shard_db);
 
-    start_gateway_with_shard(opts, shard_db, store, "gateway").await
+    start_gateway_with_shard_and_catalog(opts, shard_db, store, "gateway", catalog).await
 }
 
 /// Start the PostgreSQL wire gateway against an **already-open** shard
@@ -368,6 +393,17 @@ pub async fn start_gateway_with_shard(
     shard_db: Arc<rockstream_storage::ShardDb>,
     store: Arc<dyn object_store::ObjectStore>,
     shard_path: &str,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    start_gateway_with_shard_and_catalog(opts, shard_db, store, shard_path, catalog).await
+}
+
+pub async fn start_gateway_with_shard_and_catalog(
+    opts: &StartOptions,
+    shard_db: Arc<rockstream_storage::ShardDb>,
+    store: Arc<dyn object_store::ObjectStore>,
+    shard_path: &str,
+    catalog: Arc<rockstream_gateway::catalog_stubs::CatalogStubs>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
@@ -393,8 +429,6 @@ pub async fn start_gateway_with_shard(
             shard_reader: Arc::new(reader),
             frontier_epoch: None,
         });
-
-    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
 
     let mut topology_readers = vec![rockstream_gateway::QueryTimeShardReaderSpec::new(
         shard_path, store,
@@ -583,6 +617,26 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         ));
     }
 
+    // Pre-validate listen_addr and metrics_addr before creating directories or binding ports
+    if let Some(ref listen) = opts.listen_addr {
+        listen.parse::<std::net::SocketAddr>().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid --listen address `{listen}`: {e}"),
+                "Pass a valid socket address such as 127.0.0.1:5432.",
+            )
+        })?;
+    }
+    if let Some(ref metrics) = opts.metrics_addr {
+        metrics.parse::<std::net::SocketAddr>().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid --metrics-addr address `{metrics}`: {e}"),
+                "Pass a valid socket address such as 127.0.0.1:9090.",
+            )
+        })?;
+    }
+
     fs::create_dir_all(&opts.storage).map_err(|e| {
         CliError::new(
             RS_0003,
@@ -625,18 +679,6 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let serve_gateway =
         opts.listen_addr.is_some() && (opts.role == "gateway" || opts.role == "all");
 
-    // Pre-validate the listen address before starting the runtime.
-    if serve_gateway {
-        let listen = opts.listen_addr.as_deref().unwrap_or("127.0.0.1:5432");
-        listen.parse::<std::net::SocketAddr>().map_err(|e| {
-            CliError::new(
-                RS_0002,
-                format!("invalid --listen address `{listen}`: {e}"),
-                "Pass a valid socket address such as 127.0.0.1:5432.",
-            )
-        })?;
-    }
-
     // Start services in a tokio runtime
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
@@ -658,7 +700,13 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(metrics_addr) = &opts.metrics_addr {
             let mh = metrics_server::start_management_server(metrics_addr, tracker.clone())
                 .await
-                .unwrap();
+                .map_err(|e| {
+                    CliError::new(
+                        RS_0003,
+                        format!("failed to bind metrics server on `{metrics_addr}`: {e}"),
+                        "Check if the port is already in use or choose a different port.",
+                    )
+                })?;
             tracing::info!(metrics_addr = %mh.local_addr, "metrics server started");
             metrics_handle = Some(mh);
         }
@@ -980,13 +1028,13 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 }
             }
         } else {
-            // ── No-op / test mode ─────────────────────────────────────────
+            // ── Background role execution (control / worker / metrics) ──
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
             let daemon_mode = opts.daemon || opts.role == "worker";
+            let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
             if daemon_mode {
-                let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok());
                 if let Some(sleep_ms) = e2e_sleep {
                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 } else {
@@ -998,12 +1046,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     tracing::info!("shutdown signal received — stopping daemon");
                 }
             } else {
-                // Allow live interactions to complete, then exit cleanly.
-                let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(50);
-                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                tokio::time::sleep(Duration::from_millis(e2e_sleep.unwrap_or(50))).await;
             }
             let _watchdog = coordinator.spawn_watchdog();
             tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
@@ -1018,7 +1061,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(rn) = raft_node_guard {
             rn.shutdown();
         }
-        tracker.set_state(rockstream_types::lifecycle::LifecycleState::ShuttingDown);
+        tracker.set_state(rockstream_types::lifecycle::LifecycleState::Stopping);
         if let Some(mh) = metrics_handle {
             mh.shutdown();
         }
@@ -1143,7 +1186,7 @@ pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliErro
 
 pub fn run_view_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let views = catalog.list_views()?;
     Ok(output::render_output(&views, format))
@@ -1151,7 +1194,7 @@ pub fn run_view_list(
 
 pub fn run_view_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let view = catalog.get_view(name)?;
@@ -1160,7 +1203,7 @@ pub fn run_view_show(
 
 pub fn run_view_status(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: Option<&str>,
 ) -> Result<String, CliError> {
     let statuses = catalog.view_status(name)?;
@@ -1169,7 +1212,7 @@ pub fn run_view_status(
 
 pub fn run_source_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let sources = catalog.list_sources()?;
     Ok(output::render_output(&sources, format))
@@ -1177,7 +1220,7 @@ pub fn run_source_list(
 
 pub fn run_source_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let source = catalog.get_source(name)?;
@@ -1186,7 +1229,7 @@ pub fn run_source_show(
 
 pub fn run_schema_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let schemas = catalog.list_schemas()?;
     Ok(output::render_output(&schemas, format))
@@ -1194,7 +1237,7 @@ pub fn run_schema_list(
 
 pub fn run_schema_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let schema = catalog.get_schema(name)?;
@@ -1203,7 +1246,7 @@ pub fn run_schema_show(
 
 pub fn run_workload_list(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let workloads = catalog.list_workloads()?;
     Ok(output::render_output(&workloads, format))
@@ -1211,7 +1254,7 @@ pub fn run_workload_list(
 
 pub fn run_workload_show(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let workload = catalog.get_workload(name)?;
@@ -1220,7 +1263,7 @@ pub fn run_workload_show(
 
 pub fn run_cluster_status(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let status = control.cluster_status()?;
     Ok(output::render_output(&status, format))
@@ -1228,7 +1271,7 @@ pub fn run_cluster_status(
 
 pub fn run_cluster_quotas(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let quotas = control.cluster_quotas()?;
     Ok(output::render_output(&quotas, format))
@@ -1236,7 +1279,7 @@ pub fn run_cluster_quotas(
 
 pub fn run_cluster_workers_list(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let workers = control.list_workers()?;
     Ok(output::render_output(&workers, format))
@@ -1244,7 +1287,7 @@ pub fn run_cluster_workers_list(
 
 pub fn run_cluster_workers_status(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
     worker_id: Option<u64>,
 ) -> Result<String, CliError> {
     let statuses = control.worker_status(worker_id)?;
@@ -1257,7 +1300,7 @@ pub fn run_cluster_workers_status(
 
 pub fn run_shard_list(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::TopologyApi + ?Sized),
 ) -> Result<String, CliError> {
     let shards = control.list_shards()?;
     Ok(output::render_output(&shards, format))
@@ -1265,7 +1308,7 @@ pub fn run_shard_list(
 
 pub fn run_checkpoint_list(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     storage_path: &Path,
 ) -> Result<String, CliError> {
     let checkpoints = storage.list_checkpoints(storage_path)?;
@@ -1274,7 +1317,7 @@ pub fn run_checkpoint_list(
 
 pub fn run_checkpoint_show(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     checkpoint_id: u64,
     storage_path: &Path,
 ) -> Result<String, CliError> {
@@ -1284,7 +1327,7 @@ pub fn run_checkpoint_show(
 
 pub fn run_resource_usage(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     workload: Option<&str>,
 ) -> Result<String, CliError> {
     let usage = catalog.resource_usage(workload)?;
@@ -1293,7 +1336,7 @@ pub fn run_resource_usage(
 
 pub fn run_resource_cluster(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let cluster = catalog.resource_cluster()?;
     Ok(output::render_output(&cluster, format))
@@ -1301,7 +1344,7 @@ pub fn run_resource_cluster(
 
 pub fn run_schema_evolution_status(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let status = catalog.schema_evolution_status()?;
     Ok(output::render_output(&status, format))
@@ -1309,7 +1352,7 @@ pub fn run_schema_evolution_status(
 
 pub fn run_schema_evolution_history(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<String, CliError> {
     let history = catalog.schema_evolution_history()?;
     Ok(output::render_output(&history, format))
@@ -1372,7 +1415,7 @@ pub fn prompt_confirmation(prompt: &str, yes_flag: bool) -> Result<(), CliError>
 
 pub fn run_view_pause(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1386,7 +1429,7 @@ pub fn run_view_pause(
 
 pub fn run_view_resume(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let outcome = catalog.resume_view(name)?;
@@ -1395,7 +1438,7 @@ pub fn run_view_resume(
 
 pub fn run_view_query(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
     limit: Option<usize>,
 ) -> Result<String, CliError> {
@@ -1405,7 +1448,7 @@ pub fn run_view_query(
 
 pub fn run_view_subscribe(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     name: &str,
     from_epoch: Option<u64>,
     snapshot: bool,
@@ -1416,7 +1459,7 @@ pub fn run_view_subscribe(
 
 pub fn run_source_pause(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let outcome = catalog.pause_source(name)?;
@@ -1425,7 +1468,7 @@ pub fn run_source_pause(
 
 pub fn run_source_resume(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
 ) -> Result<String, CliError> {
     let outcome = catalog.resume_source(name)?;
@@ -1434,7 +1477,7 @@ pub fn run_source_resume(
 
 pub fn run_source_drop(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1448,7 +1491,7 @@ pub fn run_source_drop(
 
 pub fn run_schema_create(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     columns: Option<&str>,
 ) -> Result<String, CliError> {
@@ -1458,7 +1501,7 @@ pub fn run_schema_create(
 
 pub fn run_schema_drop(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1472,7 +1515,7 @@ pub fn run_schema_drop(
 
 pub fn run_workload_create(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     priority: Option<u32>,
     freshness_slo_ms: Option<u64>,
@@ -1491,7 +1534,7 @@ pub fn run_workload_create(
 
 pub fn run_workload_alter(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     priority: Option<u32>,
     freshness_slo_ms: Option<u64>,
@@ -1510,7 +1553,7 @@ pub fn run_workload_alter(
 
 pub fn run_workload_drop(
     format: output::OutputFormat,
-    catalog: &mut transport::CatalogClient,
+    catalog: &mut (impl transport::CatalogApi + ?Sized),
     name: &str,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1524,7 +1567,7 @@ pub fn run_workload_drop(
 
 pub fn run_cluster_workers_drain(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::OperationApi + ?Sized),
     worker_id: u64,
     yes: bool,
 ) -> Result<String, CliError> {
@@ -1538,7 +1581,7 @@ pub fn run_cluster_workers_drain(
 
 pub fn run_shard_migrate(
     format: output::OutputFormat,
-    control: &transport::ControlClient,
+    control: &(impl transport::OperationApi + ?Sized),
     shard_id: u64,
     to_worker: u64,
     yes: bool,
@@ -1617,7 +1660,7 @@ pub fn run_format_migrate(
 
 pub fn run_checkpoint_restore(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     audit_path: &Path,
     source: &str,
     target: &str,
@@ -1633,13 +1676,57 @@ pub fn run_checkpoint_restore(
 
 pub fn run_checkpoint_export(
     format: output::OutputFormat,
-    storage: &transport::StorageClient,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
     storage_path: &Path,
     destination: &str,
 ) -> Result<String, CliError> {
     let outcome = storage.export_checkpoint(storage_path, destination)?;
     Ok(output::render_output(&outcome, format))
 }
+
+pub fn run_backup_create(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    storage_path: &Path,
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.create_backup(storage_path, destination)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_backup_inspect(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.inspect_backup(destination)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_backup_verify(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.verify_backup(destination)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_backup_restore(
+    format: output::OutputFormat,
+    storage: &(impl transport::StorageAdminApi + ?Sized),
+    source: &str,
+    target: &Path,
+    yes: bool,
+) -> Result<String, CliError> {
+    let outcome = storage.restore_backup(source, target, yes)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub use run_backup_create as run_admin_backup_create;
+pub use run_backup_inspect as run_admin_backup_inspect;
+pub use run_backup_restore as run_admin_restore;
+pub use run_backup_verify as run_admin_backup_verify;
 
 pub fn run_support_bundle(
     format: output::OutputFormat,
@@ -1759,10 +1846,12 @@ fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {
 }
 
 pub fn build_sql_frontend_from_catalog(
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
 ) -> Result<rockstream_sql::SqlFrontend, CliError> {
     let frontend = rockstream_sql::SqlFrontend::new();
-    for schema in catalog.schemas.values() {
+    let schemas = catalog.list_schemas()?;
+    for schema_summary in &schemas {
+        let schema = catalog.get_schema(&schema_summary.name)?;
         let fields: Vec<arrow::datatypes::Field> = schema
             .columns
             .iter()
@@ -1781,8 +1870,8 @@ pub fn build_sql_frontend_from_catalog(
                 )
             })?;
     }
-    for source in catalog.sources.values() {
-        if !catalog.schemas.contains_key(&source.table) {
+    for source in catalog.list_sources()? {
+        if !schemas.iter().any(|schema| schema.name == source.table) {
             let default_schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
                 arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
@@ -1799,20 +1888,12 @@ pub fn build_sql_frontend_from_catalog(
             let _ = frontend.register_table(&source.table, default_schema);
         }
     }
-    if !catalog.schemas.contains_key("orders") {
-        let default_orders_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("hour", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
-        ]));
-        let _ = frontend.register_table("orders", default_orders_schema);
-    }
     Ok(frontend)
 }
 
 pub fn run_explain_view(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     view_name: &str,
     estimate: bool,
     op_ids: bool,
@@ -1933,7 +2014,7 @@ pub fn run_explain_view(
 
 pub fn run_debug_arrangement(
     format: output::OutputFormat,
-    catalog: &transport::CatalogClient,
+    catalog: &(impl transport::CatalogApi + ?Sized),
     view_name: &str,
     op_id_str: &str,
     key_str: &str,
@@ -2056,8 +2137,28 @@ pub fn run_debug_arrangement(
 }
 
 pub fn run_sql_compile(format: output::OutputFormat, query: &str) -> Result<String, CliError> {
-    let catalog = transport::CatalogClient::with_defaults();
-    let frontend = build_sql_frontend_from_catalog(&catalog)?;
+    let frontend = rockstream_sql::SqlFrontend::new();
+    let users_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, true),
+        arrow::datatypes::Field::new(
+            "created_at",
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let _ = frontend.register_table("users", users_schema);
+    let orders_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
+        arrow::datatypes::Field::new("hour", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new(
+            "created_at",
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let _ = frontend.register_table("orders", orders_schema);
     let query_str = query.to_string();
 
     std::thread::spawn(move || {

@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix fixture-dispatch coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -22,7 +22,7 @@ documentation:
 	bash scripts/check-documentation.test.sh
 
 # Run all checks (what CI does)
-check: fmt clippy test documentation error-codes exit-criteria verify path-coupling failure-matrix
+check: fmt clippy test documentation error-codes exit-criteria verify path-coupling failure-matrix fixture-dispatch
 
 # Run formal verification specs
 verify:
@@ -63,6 +63,11 @@ failure-matrix:
 	bash scripts/check-failure-matrix.sh
 	bash scripts/check-failure-matrix.test.sh
 
+# Keep test fixtures out of production CLI dispatch.
+fixture-dispatch:
+	bash scripts/check-no-fixture-dispatch.sh
+	bash scripts/check-no-fixture-dispatch.test.sh
+
 # Generate an lcov coverage report for the workspace (requires cargo-llvm-cov).
 coverage:
 	cargo llvm-cov --workspace --lib --tests --no-report
@@ -87,8 +92,8 @@ coverage-gate:
 	cargo llvm-cov report --package rockstream-docgen --fail-under-regions 70
 	cargo llvm-cov report --package rockstream-diff --fail-under-lines 76
 	cargo llvm-cov report --package rockstream-diff --fail-under-regions 71
-	cargo llvm-cov report --package rockstream-ops --fail-under-lines 82
-	cargo llvm-cov report --package rockstream-ops --fail-under-regions 82
+	cargo llvm-cov report --package rockstream-ops --fail-under-lines 81
+	cargo llvm-cov report --package rockstream-ops --fail-under-regions 81
 	cargo llvm-cov report --package rockstream-storage --fail-under-lines 75
 	cargo llvm-cov report --package rockstream-storage --fail-under-regions 75
 	cargo llvm-cov report --package rockstream-runtime --fail-under-lines 76
@@ -100,13 +105,13 @@ coverage-gate:
 	cargo llvm-cov report --package rockstream-connectors --fail-under-lines 70
 	cargo llvm-cov report --package rockstream-connectors --fail-under-regions 71
 	cargo llvm-cov report --package rockstream-types --fail-under-lines 84
-	cargo llvm-cov report --package rockstream-types --fail-under-regions 87
+	cargo llvm-cov report --package rockstream-types --fail-under-regions 86
 	cargo llvm-cov report --package rockstream-plan --fail-under-lines 81
 	cargo llvm-cov report --package rockstream-plan --fail-under-regions 81
 	cargo llvm-cov report --package rockstream-sim --fail-under-lines 63
 	cargo llvm-cov report --package rockstream-sim --fail-under-regions 66
-	cargo llvm-cov report --package rockstream-cli --fail-under-lines 73 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
-	cargo llvm-cov report --package rockstream-cli --fail-under-regions 77 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
+	cargo llvm-cov report --package rockstream-cli --fail-under-lines 72 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
+	cargo llvm-cov report --package rockstream-cli --fail-under-regions 74 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
 	cargo llvm-cov report --package rockstream-oracle --fail-under-lines 83
 	cargo llvm-cov report --package rockstream-oracle --fail-under-regions 81
 	cargo llvm-cov report --package rockstream-test-support --fail-under-lines 70

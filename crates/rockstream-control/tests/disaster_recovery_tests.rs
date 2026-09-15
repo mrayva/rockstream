@@ -1,16 +1,17 @@
-mod support;
-
 use std::sync::Arc;
 
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use rockstream_control::{CheckpointExportService, CheckpointManifestStore};
 use rockstream_runtime::RecoveryDriver;
 use rockstream_storage::ShardDb;
+use rockstream_test_support::docker_available;
+use rockstream_test_support::minio::{
+    create_minio_bucket, minio_object_store, start_minio, MinIO2024,
+};
 use rockstream_types::{
     checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint},
     ids::{LeaseToken, ShardId},
 };
-use support::{create_minio_bucket, docker_available, minio_object_store};
 
 async fn seed_checkpoint(store: Arc<dyn ObjectStore>, checkpoint_id: u64) -> ClusterCheckpoint {
     let db = ShardDb::builder("shards/0", store.clone())
@@ -232,7 +233,7 @@ async fn lfs_truncated_export_fails_closed_rs5035() {
 async fn minio_stores(
     suffix: &str,
 ) -> Option<(
-    testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO>,
+    testcontainers::ContainerAsync<MinIO2024>,
     Arc<dyn ObjectStore>,
     Arc<dyn ObjectStore>,
     Arc<dyn ObjectStore>,
@@ -241,16 +242,13 @@ async fn minio_stores(
         eprintln!("SKIP MinIO disaster recovery test: Docker not available");
         return None;
     }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
     let source_bucket = format!("rs-dr-source-{suffix}");
+    let (container, port) = match start_minio(&source_bucket).await {
+        Some(res) => res,
+        None => return None,
+    };
     let export_bucket = format!("rs-dr-export-{suffix}");
     let target_bucket = format!("rs-dr-target-{suffix}");
-    create_minio_bucket(port, &source_bucket).await;
     create_minio_bucket(port, &export_bucket).await;
     create_minio_bucket(port, &target_bucket).await;
     Some((
@@ -347,6 +345,25 @@ async fn minio_tc_truncated_export_fails_closed_rs5035() {
         .head(&Path::from("control/bootstrap/active-generation"))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn test_disaster_recovery_lfs_full_lifecycle() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(LocalFileSystem::new_with_prefix(source_dir.path()).unwrap());
+    let export = Arc::new(LocalFileSystem::new_with_prefix(export_dir.path()).unwrap());
+    let target = Arc::new(LocalFileSystem::new_with_prefix(target_dir.path()).unwrap());
+    export_restore_and_assert(source, export, target, "lfs-lifecycle").await;
+}
+
+#[tokio::test]
+async fn test_disaster_recovery_minio_full_lifecycle() {
+    let Some((_container, source, export, target)) = minio_stores("full-lifecycle").await else {
+        return;
+    };
+    export_restore_and_assert(source, export, target, "minio-lifecycle").await;
 }
 
 #[test]

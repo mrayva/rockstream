@@ -73,6 +73,7 @@
 | RS-2054 | query.statement_timeout | Query exceeded the configured statement timeout | ERROR | 57014 | ExponentialBackoff | Increase statement_timeout or optimize the query. | rs-2054 |
 | RS-2055 | limit.connection_limit_exceeded | Server-wide connection limit reached | ERROR | 53300 | ExponentialBackoff | Close idle connections or increase max_connections. | rs-2055 |
 | RS-2056 | write.malformed_values_list | Malformed INSERT VALUES list or schema mismatch | ERROR | 42601 | NonRetryable | Ensure every VALUES row has matching parenthesis and correct column count. | rs-2056 |
+| RS-2057 | write.duplicate_key | Duplicate key value violates primary key constraint | ERROR | 23505 | NonRetryable | Ensure inserted or updated primary key values are unique. | rs-2057 |
 | RS-2060 | write.epoch_exhausted | Commit epoch reached u64::MAX | FATAL | 54000 | NonRetryable | Create a new shard before retrying. | rs-2060 |
 | RS-2400 | auth.unauthenticated | Unauthenticated: request missing or carrying invalid credentials | ERROR | 28000 | NonRetryable | Provide valid credentials (Bearer token or mTLS certificate) | rs-2400 |
 | RS-2401 | auth.permission_denied | Permission denied: authenticated principal lacks required RBAC role | ERROR | 28000 | NonRetryable | Request elevated RBAC role from an admin or contact the namespace owner | rs-2401 |
@@ -142,6 +143,10 @@
 | RS-3610 | worker.drain_target_not_found | Worker drain target does not exist in the current topology | ERROR | 55000 | Immediate | Verify target worker ID exists in active cluster topology before initiating drain. | rs-3610 |
 | RS-3611 | worker.no_active_drain_recipient | Worker drain cannot proceed because no active recipient worker is available | ERROR | 55000 | Immediate | Ensure at least one active recipient worker is online before initiating drain. | rs-3611 |
 | RS-3612 | worker.drain_queue_capacity_reached | Worker drain queue reached its configured bound; backpressure applied | ERROR | 53200 | ExponentialBackoff | Wait for in-flight shard drain tasks to complete before enqueueing additional assignments. | rs-3612 |
+| RS-3615 | backup.missing_file_or_manifest | Missing payload file or truncated/unfinalized manifest | FATAL | 58030 | NonRetryable | Restore missing file from backup replica or retry backup creation; ensure backup completes cleanly. | rs-3615 |
+| RS-3616 | backup.checksum_mismatch | Checksum mismatch on manifest or data file | FATAL | XX000 | NonRetryable | Replace corrupted file from verified backup replica; discard invalid backup. | rs-3616 |
+| RS-3617 | backup.incompatible_format | Incompatible backup manifest format version or unsupported storage layout | FATAL | 0A000 | NonRetryable | Upgrade RockStream binary or use a backup with supported format version. | rs-3617 |
+| RS-3618 | backup.broken_catalog_reference | Broken catalog reference or catalog revision inconsistency | FATAL | 42P01 | NonRetryable | Verify catalog snapshot and frontier consistency; ensure catalog revision matches cluster checkpoint. | rs-3618 |
 | RS-3701 | view.waiting_on_source | View is waiting on source/frontier progress | WARN | 55000 | Immediate | Check source/frontier health and producer lag; verify watermark advancement for the upstream source. | rs-3701 |
 | RS-3702 | view.quota_admission_rejected | View admission rejected by quota controls | WARN | 53200 | ExponentialBackoff | Reduce state pressure, free quota in competing workloads, or adjust admission and memory budgets before retrying. | rs-3702 |
 | RS-3703 | view.spilling | View lag is dominated by spill delay | WARN | 53100 | ExponentialBackoff | Reduce spill pressure by lowering hot-key skew, increasing memory budget, or reducing ingest burst size. | rs-3703 |

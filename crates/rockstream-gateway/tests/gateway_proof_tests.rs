@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hmac::{Hmac, Mac};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use rockstream_gateway::{
@@ -36,7 +35,6 @@ use rockstream_types::{
     view_lifecycle::ViewState,
     workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority},
 };
-use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::NoTls;
@@ -76,105 +74,6 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
 }
 
 #[allow(dead_code)]
-fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
-}
-
-#[allow(dead_code)]
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-#[allow(dead_code)]
-fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sod = secs % 86400;
-    let mut days = (secs / 86400) as u32;
-    let h = (sod / 3600) as u32;
-    let m = ((sod % 3600) / 60) as u32;
-    let s = (sod % 60) as u32;
-    let mut year = 1970u32;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let dy = if leap { 366 } else { 365 };
-        if days < dy {
-            break;
-        }
-        days -= dy;
-        year += 1;
-    }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let dpm = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0u32;
-    for &d in &dpm {
-        if days < d {
-            break;
-        }
-        days -= d;
-        month += 1;
-    }
-    (year, month + 1, days + 1, h, m, s)
-}
-
-#[allow(dead_code)]
-async fn create_minio_bucket(port: u16, bucket: &str) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let (y, mo, d, hh, mm, ss) = epoch_to_ymd_hms(secs);
-    let date = format!("{y:04}{mo:02}{d:02}");
-    let datetime = format!("{y:04}{mo:02}{d:02}T{hh:02}{mm:02}{ss:02}Z");
-    let host = format!("127.0.0.1:{port}");
-    let region = "us-east-1";
-    let empty_hash = sha256_hex(b"");
-    let canonical = format!(
-        "PUT\n/{bucket}\n\nhost:{host}\nx-amz-content-sha256:{empty_hash}\nx-amz-date:{datetime}\n\nhost;x-amz-content-sha256;x-amz-date\n{empty_hash}"
-    );
-    let canonical_hash = sha256_hex(canonical.as_bytes());
-    let scope = format!("{date}/{region}/s3/aws4_request");
-    let sts = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{canonical_hash}");
-    let k1 = hmac_sha256(b"AWS4minioadmin", date.as_bytes());
-    let k2 = hmac_sha256(&k1, region.as_bytes());
-    let k3 = hmac_sha256(&k2, b"s3");
-    let signing_key = hmac_sha256(&k3, b"aws4_request");
-    let sig = hex::encode(hmac_sha256(&signing_key, sts.as_bytes()));
-    let auth = format!(
-        "AWS4-HMAC-SHA256 Credential=minioadmin/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig}"
-    );
-    let status = reqwest::Client::new()
-        .put(format!("http://{host}/{bucket}"))
-        .header("Host", &host)
-        .header("X-Amz-Content-Sha256", &empty_hash)
-        .header("X-Amz-Date", &datetime)
-        .header("Authorization", &auth)
-        .header("Content-Length", "0")
-        .send()
-        .await
-        .expect("CreateBucket PUT request failed")
-        .status();
-    assert!(
-        status.is_success() || status.as_u16() == 409,
-        "CreateBucket failed: {status}"
-    );
-}
-
 async fn connect_with_notices(
     port: u16,
 ) -> (
@@ -744,6 +643,10 @@ async fn read_u32_be(stream: &mut tokio::net::TcpStream) -> u32 {
 // ── S8: proof_psql_select_limit_10_under_10ms_p99 ─────────────────────────────
 
 /// P1: 100 back-to-back `SELECT * FROM my_view LIMIT 10` queries; p99 < 10 ms.
+#[cfg_attr(
+    coverage,
+    ignore = "latency SLO is not meaningful under coverage instrumentation"
+)]
 #[tokio::test]
 async fn proof_psql_select_limit_10_under_10ms_p99() {
     // 1. In-memory LFS shard with 100 rows.
@@ -1464,6 +1367,7 @@ async fn insert_returning_returns_written_rows() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
@@ -1471,27 +1375,34 @@ async fn insert_returning_returns_written_rows() {
     let client = connect_port(local_addr.port()).await;
 
     let rows = client
-        .simple_query("INSERT INTO products (id, name) VALUES (1, 'Widget') RETURNING *")
+        .simple_query("INSERT INTO products (id, name) VALUES (42, 'Widget') RETURNING *")
         .await
-        .expect("INSERT RETURNING failed");
+        .expect("INSERT … RETURNING failed");
 
-    let data_rows: Vec<_> = rows
-        .iter()
-        .filter_map(|m| {
-            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
-                Some(r)
-            } else {
-                None
-            }
-        })
+    let data_messages: Vec<_> = rows
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .collect();
 
     assert_eq!(
-        data_rows.len(),
+        data_messages.len(),
         1,
-        "expected 1 row from RETURNING, got {}",
-        data_rows.len()
+        "expected exactly 1 row from INSERT RETURNING"
     );
+    if let tokio_postgres::SimpleQueryMessage::Row(row) = &data_messages[0] {
+        assert_eq!(
+            row.get("id"),
+            Some("42"),
+            "id column must match inserted value"
+        );
+        assert_eq!(
+            row.get("name"),
+            Some("Widget"),
+            "name column must match inserted value"
+        );
+    } else {
+        panic!("expected Row message");
+    }
 }
 
 // ── S7: insert_select_returning_multi_row ────────────────────────────────────
@@ -1513,6 +1424,7 @@ async fn insert_select_returning_multi_row() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
@@ -1610,6 +1522,7 @@ async fn multi_row_insert_values_returning_returns_all_rows() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
@@ -2178,25 +2091,15 @@ async fn proof_idempotent_replay_noop_lfs() {
 #[tokio::test]
 #[cfg(feature = "testcontainers")]
 async fn proof_idempotent_replay_noop_minio() {
-    use object_store::aws::AmazonS3Builder;
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::minio::MinIO;
+    let (_minio, port) = match rockstream_test_support::minio::start_minio("testbucket").await {
+        Some(m) => m,
+        None => return,
+    };
 
-    let minio = MinIO::default().start().await.expect("MinIO start failed");
-    let host = minio.get_host().await.expect("host");
-    let port = minio.get_host_port_ipv4(9000).await.expect("port");
-    create_minio_bucket(port, "testbucket").await;
-
-    let store = Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(format!("http://{host}:{port}"))
-            .with_bucket_name("testbucket")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .expect("S3 builder"),
-    );
+    let store = Arc::new(rockstream_test_support::minio::minio_object_store(
+        port,
+        "testbucket",
+    ));
 
     let shard_db = Arc::new(
         rockstream_storage::ShardDb::builder("proof-p3b-minio", store.clone())
@@ -2844,6 +2747,14 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
     use rockstream_types::explain::ExplainLevel;
 
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        pk_cols: vec![],
+    });
     catalog.add_view(CatalogView {
         name: "inc_mv".to_string(),
         sql: "SELECT id FROM base".to_string(),
@@ -2875,12 +2786,12 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
     let frontend = SqlFrontend::new();
     frontend
         .register_table(
-            "inc_mv",
+            "base",
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
         )
         .unwrap();
     let direct = frontend
-        .explain_incremental_for_sql("SELECT * FROM inc_mv", ExplainLevel::Default, &[])
+        .explain_incremental_for_sql("SELECT id FROM base", ExplainLevel::Default, &[])
         .await
         .unwrap();
 
@@ -2922,6 +2833,14 @@ async fn explain_incremental_analyze_reflects_live_view_traffic() {
 
     rockstream_types::metrics::reset_all();
     let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        pk_cols: vec![],
+    });
     catalog.add_view(CatalogView {
         name: "analyze_mv".to_string(),
         sql: "SELECT id FROM base".to_string(),
@@ -3287,6 +3206,7 @@ async fn copy_in_auth_enforced_lfs() {
                 data_type: "Utf8".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
 
     // ── RS-2400: JwtVerifier rejects missing/empty token ─────────────────────
@@ -3359,30 +3279,17 @@ async fn copy_in_auth_enforced_lfs() {
 async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
     use rockstream_gateway::copy_state::{COPY_IN_BUFFER_ROWS, MAX_COPY_IN_BATCH_ROWS};
     use std::sync::atomic::Ordering;
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::minio::MinIO;
 
-    let container = MinIO::default()
-        .start()
-        .await
-        .expect("MinIO container start");
-    let host = container.get_host().await.expect("get MinIO host");
-    let minio_port = container
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("get MinIO port");
-    create_minio_bucket(minio_port, "testbucket").await;
+    let (_container, minio_port) =
+        match rockstream_test_support::minio::start_minio("testbucket").await {
+            Some(m) => m,
+            None => return,
+        };
 
-    let store = Arc::new(
-        object_store::aws::AmazonS3Builder::new()
-            .with_endpoint(format!("http://{host}:{minio_port}"))
-            .with_bucket_name("testbucket")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .expect("build MinIO store"),
-    );
+    let store = Arc::new(rockstream_test_support::minio::minio_object_store(
+        minio_port,
+        "testbucket",
+    ));
 
     let shard_db = Arc::new(
         ShardDb::builder("v027-s8-minio", store.clone())
@@ -4674,6 +4581,7 @@ async fn proof_index_scan_point_lookup_via_wire() {
                 data_type: "Int64".to_string(),
             },
         ],
+        pk_cols: vec![],
     });
     let view_reader = Arc::new(NoopViewReader);
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -6408,6 +6316,7 @@ async fn explain_reports_pruned_shard_count() {
             name: "region".to_string(),
             data_type: "Utf8".to_string(),
         }],
+        pk_cols: vec![],
     });
     catalog.set_shard_stats(
         "orders",

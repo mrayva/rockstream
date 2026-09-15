@@ -112,3 +112,88 @@ fn history_and_adr_indexes_resolve() {
         );
     }
 }
+
+#[test]
+fn generated_readme_commands_are_executable() {
+    use clap::Parser;
+    use rockstream_cli::cli_args::Cli;
+    use rockstream_cli::init::{scaffold_project, InitOptions};
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().expect("tempdir");
+    let proj_dir = temp_dir.path().join("readme_check");
+    let opts = InitOptions {
+        name: "readme_check".to_string(),
+        template: "local".to_string(),
+        dir: Some(proj_dir.clone()),
+        force: false,
+    };
+    scaffold_project(&opts).expect("scaffold");
+
+    let readme = fs::read_to_string(proj_dir.join("README.md")).expect("read README.md");
+    let mut in_code_block = false;
+    let mut commands = Vec::new();
+
+    for line in readme.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block && trimmed.starts_with("rockstream ") {
+            commands.push(trimmed.to_string());
+        }
+    }
+
+    assert!(!commands.is_empty(), "README must contain commands");
+    for cmd in commands {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(
+            Cli::try_parse_from(&parts).is_ok(),
+            "command '{}' from generated README must parse cleanly as valid CLI invocation",
+            cmd
+        );
+    }
+}
+
+#[test]
+fn test_published_configuration_examples_run_in_release() {
+    use rockstream_cli::init::{scaffold_project, InitOptions};
+    use rockstream_types::config_resolver::{CliConfigOverrides, ConfigResolver};
+    use rockstream_types::config_validation::validate_config_str;
+    use tempfile::TempDir;
+
+    let root = repo_root();
+
+    // 1. Scaffold project template rockstream.toml and validate it cleanly
+    let temp_dir = TempDir::new().expect("tempdir");
+    let proj_dir = temp_dir.path().join("template_check");
+    let opts = InitOptions {
+        name: "template_check".to_string(),
+        template: "local".to_string(),
+        dir: Some(proj_dir.clone()),
+        force: false,
+    };
+    scaffold_project(&opts).expect("scaffold");
+
+    let template_toml =
+        fs::read_to_string(proj_dir.join("rockstream.toml")).expect("read template toml");
+    let report = validate_config_str(&template_toml, false);
+    assert!(
+        report.diagnostics.is_empty(),
+        "scaffolded project rockstream.toml must validate with zero diagnostics, got: {:?}",
+        report.diagnostics
+    );
+
+    // 2. Reference app configuration compatibility
+    let ref_app_cfg = root.join("examples/reference-app/rockstream.toml");
+    if ref_app_cfg.exists() {
+        let empty_overrides = CliConfigOverrides::default();
+        let resolved = ConfigResolver::resolve(Some(&ref_app_cfg), &empty_overrides);
+        assert!(
+            resolved.is_ok(),
+            "reference app configuration must resolve successfully: {:?}",
+            resolved.err()
+        );
+    }
+}

@@ -13,6 +13,8 @@
 //! scan-and-delete or compaction-filter patterns.
 
 pub mod arrangement_catalog;
+pub mod catalog;
+pub mod concurrency_governor;
 pub mod error;
 pub mod format_migration;
 pub mod keys;
@@ -26,6 +28,7 @@ pub mod wal;
 pub mod wal_cache;
 
 pub use arrangement_catalog::{ArrangementCatalog, ArrangementEntry};
+pub use concurrency_governor::{ConcurrencyGovernor, ConcurrencyLimitError};
 pub use error::StorageError;
 pub use keys::{
     minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, JoinSide, ShardKeyEncoder,
@@ -33,17 +36,20 @@ pub use keys::{
 };
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;
+pub use rockstream_types::config::StorageUrl;
 pub use rockstream_types::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 pub use shard_db::{
     is_allow_law_operand_fallback, set_allow_law_operand_fallback, BatchOp, CheckpointHandle,
-    PartialAggSpec, ShardDb, WriteBatch,
+    PartialAggSpec, ScanProgressHandle, ShardDb, WriteBatch, MAX_RECOVERY_SCAN_BUFFER_BYTES,
+    MAX_RESTORE_SCAN_PAGE_ROWS,
 };
 pub use storage_context::{
     BlockCacheKey, SharedStorageContext, StorageCacheStats, WorkerStorageContext,
 };
 pub use tiered_store::{
     build_migration_object_store, build_runtime_object_store, build_s3_backend_from_config,
-    s3_express_build_config, tier_aged_ssts, TieredObjectStore, MAX_TIERING_SCAN_OBJECTS,
+    build_storage_backend_from_url, s3_express_build_config, tier_aged_ssts, TieredObjectStore,
+    MAX_TIERING_SCAN_OBJECTS,
 };
 pub use trace::{SharedArrangementTrace, TraceBatch, TraceManifestHeader, TraceSegmentDescriptor};
 pub use wal_cache::WalListingCache;
