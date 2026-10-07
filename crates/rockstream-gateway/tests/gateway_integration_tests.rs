@@ -7,7 +7,10 @@ use std::{sync::Arc, time::Duration};
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView},
+    catalog_stubs::{
+        CatalogColumn, CatalogIndexEntry, CatalogIndexState, CatalogStubs, CatalogTable,
+        CatalogView,
+    },
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -206,6 +209,205 @@ async fn proof_pg_catalog_schema_reflection_queries() {
 }
 
 // ── S3/S4: view_reader and multi_shard inline tests already in src/ ───────────
+#[tokio::test]
+async fn psql_list_relations_preserves_expressions_and_aliases() {
+    let catalog = CatalogStubs::new();
+    catalog.add_table(CatalogTable::new("orders", vec![]));
+    catalog.add_view(CatalogView {
+        name: "sales_by_store".to_string(),
+        sql: "SELECT store_id, SUM(amount) FROM orders GROUP BY store_id".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let (addr, handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+    let query = r#"SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type",
+  pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+WHERE c.relkind IN ('r','p','v','m','S','f','')
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname !~ '^pg_toast'
+      AND n.nspname <> 'information_schema'
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY 1,2;"#;
+
+    for (query, expected_columns, expected_rows) in [
+        (
+            query,
+            vec!["Schema", "Name", "Type", "Owner"],
+            vec![
+                vec!["public", "orders", "table", "rockstream"],
+                vec!["public", "sales_by_store", "view", "rockstream"],
+            ],
+        ),
+        (
+            r#"SELECT c.relkind AS "Name" FROM pg_catalog.pg_class c"#,
+            vec!["Name"],
+            vec![vec!["r"], vec!["v"]],
+        ),
+        (
+            r#"SELECT c.relname AS "Name" FROM pg_catalog.pg_class c"#,
+            vec!["Name"],
+            vec![vec!["orders"], vec!["sales_by_store"]],
+        ),
+        (
+            query,
+            vec!["Schema", "Name", "Type", "Owner"],
+            vec![
+                vec!["public", "orders", "table", "rockstream"],
+                vec!["public", "sales_by_store", "view", "rockstream"],
+            ],
+        ),
+    ] {
+        let messages = client.simple_query(query).await.unwrap();
+        let rows: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows[0]
+                .columns()
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>(),
+            expected_columns
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| (0..row.len())
+                    .map(|i| row.get(i).unwrap())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            expected_rows
+        );
+    }
+    handle.abort();
+}
+
+#[tokio::test]
+async fn psql_catalog_queries_return_exact_metadata() {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        sql: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+    }
+    let catalog = CatalogStubs::new();
+    catalog.add_table(CatalogTable::new(
+        "orders",
+        ["id", "store_id", "amount"]
+            .into_iter()
+            .map(|name| CatalogColumn {
+                name: name.into(),
+                data_type: "Int64".into(),
+            })
+            .collect(),
+    ));
+    catalog.add_view(CatalogView {
+        name: "sales_by_store".into(),
+        sql: "SELECT store_id, SUM(amount) AS total_amount FROM orders GROUP BY store_id".into(),
+        columns: ["store_id", "total_amount"]
+            .into_iter()
+            .map(|name| CatalogColumn {
+                name: name.into(),
+                data_type: "Int64".into(),
+            })
+            .collect(),
+        namespace: "public".into(),
+        op_id: None,
+    });
+    catalog.add_schema("analytics");
+    catalog.add_view(CatalogView {
+        name: "analytics.report".into(),
+        sql: "SELECT 1".into(),
+        columns: vec![],
+        namespace: "analytics".into(),
+        op_id: None,
+    });
+    catalog.add_index(CatalogIndexEntry {
+        name: "orders_id_idx".into(),
+        table: "orders".into(),
+        index_cols: vec!["id".into()],
+        state: CatalogIndexState::Ready,
+        op_id: None,
+    });
+    assert!(catalog
+        .handle_query("SELECT 'pg_attribute' FROM orders", &Default::default())
+        .is_none());
+    let (addr, handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/psql_catalog_queries.json")).unwrap();
+    for case in cases {
+        let messages = client
+            .simple_query(&case.sql)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        let mut columns = Vec::new();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut completed = Vec::new();
+        for message in messages {
+            match message {
+                tokio_postgres::SimpleQueryMessage::RowDescription(fields) => {
+                    columns = fields.iter().map(|f| f.name().to_string()).collect();
+                }
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    rows.push(
+                        (0..row.len())
+                            .map(|i| row.get(i).map(str::to_string))
+                            .collect(),
+                    );
+                }
+                tokio_postgres::SimpleQueryMessage::CommandComplete(count) => completed.push(count),
+                _ => panic!("unexpected catalog response for {}", case.name),
+            }
+        }
+        assert_eq!(columns, case.columns, "{} columns", case.name);
+        assert_eq!(rows, case.rows, "{} rows", case.name);
+        assert_eq!(
+            completed,
+            vec![case.rows.len() as u64],
+            "{} completion",
+            case.name
+        );
+    }
+    let rows = client
+        .query(
+            "SELECT c.relname AS name FROM pg_catalog.pg_class c WHERE c.relname = $1",
+            &[&"orders"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<_, String>("name"))
+            .collect::<Vec<_>>(),
+        vec!["orders"]
+    );
+    let error = client
+        .simple_query("SELECT unsupported_catalog_function(relname) FROM pg_catalog.pg_class")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(
+        (error.code().code(), error.message()),
+        (
+            "0A000",
+            "[RS-2026] unsupported catalog function: unsupported_catalog_function"
+        )
+    );
+    handle.abort();
+}
+
 // (Tests in view_reader.rs and multi_shard_reader.rs)
 
 // ── S5: extended_query_protocol_parse_bind_execute ────────────────────────────
