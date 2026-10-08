@@ -13797,9 +13797,10 @@ impl GatewayServer {
                                     if peek_buf == [0, 0, 0, 8, 4, 210, 22, 47] {
                                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                                         let mut ssl_req = [0u8; 8];
-                                        let declined = socket.read_exact(&mut ssl_req).await.is_ok()
-                                            && socket.write_all(b"N").await.is_ok()
-                                            && socket.flush().await.is_ok();
+                                        let declined =
+                                            socket.read_exact(&mut ssl_req).await.is_ok()
+                                                && socket.write_all(b"N").await.is_ok()
+                                                && socket.flush().await.is_ok();
                                         if declined {
                                             // Re-peek: this is now either the client's real
                                             // StartupMessage, or nothing (client hung up after
