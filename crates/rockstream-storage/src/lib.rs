@@ -34,17 +34,20 @@ pub use keys::{
     minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, JoinSide, ShardKeyEncoder,
     ShardPrefix, DISTINCT_DISCRIMINATOR, FORMAT_VERSION_DISCRIMINATOR, MINMAX_DISCRIMINATOR,
 };
-pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
+pub use merge_registry::{
+    resolve_law_operand, LawOperandError, LawOperandView, MergeOperatorRegistry, MergeTag,
+    SumCountMergeOperator,
+};
 pub use reader::ShardReader;
 pub use rockstream_types::config::StorageUrl;
 pub use rockstream_types::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 pub use shard_db::{
     is_allow_law_operand_fallback, set_allow_law_operand_fallback, BatchOp, CheckpointHandle,
-    PartialAggSpec, ScanProgressHandle, ShardDb, WriteBatch, MAX_RECOVERY_SCAN_BUFFER_BYTES,
-    MAX_RESTORE_SCAN_PAGE_ROWS,
+    PartialAggSpec, ScanPage, ScanProgressHandle, ShardDb, WriteBatch,
+    MAX_RECOVERY_SCAN_BUFFER_BYTES, MAX_RESTORE_SCAN_PAGE_ROWS,
 };
 pub use storage_context::{
-    BlockCacheKey, SharedStorageContext, StorageCacheStats, WorkerStorageContext,
+    BlockCacheKey, NvmeCacheConfig, SharedStorageContext, StorageCacheStats, WorkerStorageContext,
 };
 pub use tiered_store::{
     build_migration_object_store, build_runtime_object_store, build_s3_backend_from_config,

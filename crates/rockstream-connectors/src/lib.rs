@@ -16,14 +16,20 @@ pub mod source_runtime;
 
 pub use fault_injecting_store::FaultInjectingObjectStore;
 pub use kafka_sink::KafkaSink;
-pub use kafka_source::KafkaSource;
+pub use kafka_source::{
+    decode_kafka_payload, redact_sensitive_payload, IncarnationStatus, KafkaDlqDiagnostic,
+    KafkaDlqPolicy, KafkaSource, KafkaSourceIdentity, KafkaSourceIdentityV1,
+    DEFAULT_IDLE_PARTITION_TIMEOUT, DEFAULT_MAX_EPOCH_BATCH_BYTES, DEFAULT_MAX_EPOCH_BATCH_RECORDS,
+    KAFKA_SOURCE_BUFFER_LIMIT,
+};
 pub use postgres_cdc::{
-    CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn, PgOutputColumn,
-    PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata, PgOutputSnapshotRelation,
-    PgOutputSourceSnapshot, PostgresCdcFailure, PostgresCdcSource, PostgresCdcStatus,
-    POSTGRES_CDC_MAX_IN_FLIGHT_BYTES, POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS,
-    POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS, POSTGRES_CDC_MAX_TRANSACTION_BYTES,
-    POSTGRES_CDC_MAX_WAL_LAG_BYTES, POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,
+    decode_pgoutput_event, CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn,
+    PgOutputColumn, PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata,
+    PgOutputSnapshotRelation, PgOutputSourceSnapshot, PostgresCdcFailure, PostgresCdcSource,
+    PostgresCdcStatus, QuadLsnProgress, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES,
+    POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS, POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS,
+    POSTGRES_CDC_MAX_TRANSACTION_BYTES, POSTGRES_CDC_MAX_WAL_LAG_BYTES,
+    POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,
 };
 pub use sink_connector::{
     assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,
@@ -35,9 +41,10 @@ pub use source_connector::{
     SourcePollLifecycle, WatermarkCapability, WindowWatermarkPolicy,
 };
 pub use source_epoch::{
-    BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, SnapshotDeltaFence,
-    SourceCheckpoint, SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry,
-    SourceEpochRegistry, SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES,
+    BackfillCursor, BackfillLifecycle, BackfillPhase, CoupledBatchDescriptor,
+    CoupledTransactionBuilder, OffsetToken, SnapshotDeltaFence, SourceCheckpoint,
+    SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry, SourceEpochRegistry,
+    SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES,
 };
 pub use source_runtime::{
     SourceOwnerLease, SourceRuntimeCoordinator, SourceRuntimeMetrics,

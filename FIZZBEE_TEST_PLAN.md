@@ -169,7 +169,7 @@ verifying coordination logic.
 | Z-set algebra / `incremental == batch` equivalence | `rockstream-oracle` + DataFusion ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 1–3) |
 | Operator semantics (MIN/MAX, joins, windows, Top-K) | Oracle property tests |
 | Arrangement byte encodings, key schemes | `SimRuntime` paired assertions ([DESIGN.md §17.3](DESIGN.md)) |
-| SlateDB internal LSM/compaction behavior | SlateDB determinism gate ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 0) |
+| SlateDB internal LSM/compaction behavior, including arrangement Bloom filtering and NVMe tiered caching | SlateDB determinism gate ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 0) and arrangement lookup benchmarks |
 | pgwire protocol, SQL compilation, planner | Integration tests (Phase 7) |
 | Performance / throughput / latency budgets | `criterion` benchmarks, real-object-store integration |
 | Recursion fixed-point convergence (inner-time) | Deferred — model only if Phase 4 distributed recursion destabilizes |
@@ -477,7 +477,11 @@ The naming convention is `<Model>-<S|L><n>`: `S` = safety, `L` = liveness.
 - **M3-S3 — Checkpoint-coupled commit.** `always`: a sink epoch transitions to
   `committed` only if its cluster checkpoint is already `committed` in
   `ControlPlane.checkpoint_index`. No output is externally visible before its
-  checkpoint is durable.
+  checkpoint is durable. At the runtime boundary, the verified adapter
+  (`CoupledBatchDescriptor` / `CoupledTransactionBuilder`) mechanically derives
+  coupled mutations (operator state, view output, source checkpoint marker, and
+  frontier advancement) from batch key inspection before invoking the verified
+  `coupled_commit_is_durable` decision kernel.
 
 - **M3-S4 — Recovery dispatch idempotency.** `always`: for each
   `SinkIdempotencyProfile`, replaying the recovery action from any crash point
@@ -642,6 +646,9 @@ validates real backend restart/recovery against the verified M1-M7 state machine
 MinIO container registry pins used by storage integration tests are test
 infrastructure; changing the registry host for the same MinIO release does not
 change the model or its assertions.
+The SlateDB v0.16/object_store v0.14 upgrade changes storage API calls and path
+construction only; durable object prefixes, commit ordering, and recovery state
+transitions remain unchanged, so no FizzBee state-transition changes are needed.
 
 To guard against vacuously-passing models (a model that never reaches the
 interesting state trivially satisfies every `always`), each spec includes
@@ -665,11 +672,78 @@ interesting state trivially satisfies every `always`), each spec includes
   in-flight write (both the plain and shard-fence write families) is rejected
   (see §3.8 above).
 
+The v0.66 management backup workflow uses the durable operation record as its
+cross-process execution claim: only `pending` and `waiting` records may enter
+the executor, while a `running` record is left to its current owner. The
+paired process-level assertion is
+`release_management_backup_idempotency_is_atomic_across_processes` in
+`crates/rockstream-cli/tests/management_backup_process_tests.rs`. This
+management workflow is outside the M1–M7 FizzBee state machines, but is
+documented here to keep the runtime protocol and verification inventory
+synchronized.
+
 Postgres CDC polling consumes one credit for every queued change in a complete
 transaction, including changes at or before the caller's offset that are
 filtered from the returned batch. The exact boundary is covered by
 `cdc_poll_credits_count_filtered_records_exactly` in
 `crates/rockstream-connectors/tests/cdc_transaction_atomicity_tests.rs`.
+
+Key-affinity source deltas route each row through the configured source routing
+column, an FNV virtual bucket, and rendezvous ownership before forwarding a
+`RuntimeExchangeMessage` to the owning worker. The control plane waits for
+per-request worker progress but does not retain row payloads; the exact wire,
+progress, and empty-delta behavior is covered by
+`test_control_plane_retains_zero_row_payloads_or_output_history` in
+`crates/rockstream-control/tests/control_plane_decoupling_tests.rs`. This
+data-plane routing path is outside the core M1–M7 FizzBee state machines.
+
+The v0.67.1 state beyond RAM architecture bounds memory through spill governors,
+streaming paged scans, and demand-loaded state restoration in
+`crates/rockstream-runtime` and `crates/rockstream-storage`. Bounded write buffering
+and disk occupancy limits fail closed with RS-5003 and RS-2021, verified by
+`crates/rockstream-runtime/tests/spill_budget_governor_tests.rs`,
+`crates/rockstream-runtime/tests/paged_recovery_tests.rs`, and
+`crates/rockstream-storage/tests/paged_scan_tests.rs`. While outside the core
+M1–M7 FizzBee models, the storage and recovery paging protocols conform to the
+recovery driver invariants.
+
+In-flight Z-set epoch compaction accumulates signed row delta weights within active
+100–300ms micro-batch epoch windows prior to persistence or network exchange in
+`crates/rockstream-runtime`. Offsetting modifications collapsing to zero net weight
+(`weight == 0`) are omitted from downstream arrangement lookups, storage flushes, and
+shuffle frames, while surviving non-zero weights collapse into a single emitted update.
+This in-memory compaction is outside the core M1–M7 FizzBee coordination state machines
+(operating entirely within single-epoch micro-batch buffers), verified by
+`crates/rockstream-runtime/tests/in_flight_zset_epoch_compaction_tests.rs` with exact
+output assertions covering net-zero omission and window boundary drains.
+
+The v0.69 PostgreSQL CDC golden connector establishes the complete snapshot and
+WAL fence coordination protocol, quad-LSN progress persistence, transaction
+grouping bounds, bounded worker budgets, and schema evolution isolation in
+`crates/rockstream-connectors` and `crates/rockstream-gateway`. Durable catalog
+reconstruction preserves transactional idempotency across snapshots and log
+compaction (`crates/rockstream-storage/src/catalog/mod.rs`). While external CDC
+ingestion is outside the internal M1–M7 FizzBee consensus models, the fence
+coordination and acknowledgment barrier protocols adhere to the end-to-end
+guarantee matrix covered by
+`crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs` and
+`crates/rockstream-gateway/tests/source_ddl_postgres_kafka_tests.rs`.
+
+The v0.70 Kafka golden connector provides external streaming ingestion with
+partition offset watermark coordination, bounded buffer consumer groups,
+rebalance fence isolation, and schema policy verification in
+`crates/rockstream-connectors/src/kafka_source.rs`. While external Kafka consumer
+protocol dispatch is outside the internal M1–M7 FizzBee consensus models, offset
+advancement barriers and partitioned stream ingestion integrate with the worker
+epoch progress protocol and are verified by integration test coverage and CLI
+template initialization tests.
+
+The v0.71 operational observability and diagnostics release provides canonical
+health dimensions, a 10-field status model, 12 doctor probes, and authoritative
+SQL catalog tables (`rockstream_catalog.*`). While diagnostic inspection and
+metrics export are outside the internal M1–M7 FizzBee consensus models, health
+and status evaluations reflect durable shard/worker state and are verified by
+integration test suites and deterministic simulation tests.
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
@@ -701,7 +775,7 @@ check, not just an aspirational claim.
 | M2-L1 (liveness) | `frontier_lease_tests.rs::frontier_leader_lease_cas_survives_restart_lfs`/`_minio_tc` assert `published_frontier` survives a restart and is observed by the recovering handle — publication progress is not lost across a crash. Spec: `formal/m2_frontier_agg.fizz` M2-L1. | `rockstream-control` |
 | M2-L2 (liveness) | Same tests as M2-L1: a second aggregator acquires with a strictly higher token after the first's simulated crash and continues publishing successfully — failover progress. Spec: `formal/m2_frontier_agg.fizz` M2-L2. | `rockstream-control` |
 | COV-M2 | `crates/rockstream-sim/tests/frontier_publisher_election.rs::three_frontier_aggregators_stale_publisher_never_republishes` (v0.45.6 S8): three simulated `FrontierAggregator`s contend for the same `frontier/leader` CAS record; `buggify!("frontier.stale_publish_race", p)` forces a fenced aggregator to attempt a late publish after a new leader's CAS has already succeeded, reaching the `fencing_occurred` coverage-witness state and asserting the stale attempt is always rejected. Spec: `formal/m2_frontier_agg.fizz` COV-M2. | `rockstream-sim` |
-| M3-S1–S4 | Assert idempotency-key uniqueness before `prepare`; assert one external artifact per key after recovery. Specifically: `assert_no_duplicate_delivery` (M3-S1), `assert_no_lost_delivery_after_checkpoint` (M3-S2), `assert_epoch_committed_only_after_cluster_checkpoint` (M3-S3), `assert_recovery_dispatch_idempotent` (M3-S4) — all in `crates/rockstream-connectors/src/sink_connector.rs`. | `rockstream-connectors` |
+| M3-S1–S4 | Assert idempotency-key uniqueness before `prepare`; assert one external artifact per key after recovery. Specifically: `assert_no_duplicate_delivery` (M3-S1), `assert_no_lost_delivery_after_checkpoint` (M3-S2), `assert_epoch_committed_only_after_cluster_checkpoint` (M3-S3), `assert_recovery_dispatch_idempotent` (M3-S4) — all in `crates/rockstream-connectors/src/sink_connector.rs`. Checkpoint-coupled commit is enforced by the verified adapter boundary (`CoupledBatchDescriptor` / `commit_m3` in `crates/rockstream-connectors/src/source_epoch.rs`), mechanically deriving and validating coupled mutations before delegating to `coupled_commit_is_durable`. | `rockstream-connectors` |
 | COV-M3 | `crates/rockstream-connectors/tests/kafka_tx_timeout_tests.rs::seeded_kafka_tx_timeout_fault_injection_across_seeds` uses `buggify!("kafka.tx_timeout", p)` to force the broker to abort an open transaction between `pre_commit` and `commit`, reaching the coverage-witness state, then drives `CheckBeforeCommit` recovery and asserts exactly-once delivery. Spec: `formal/m3_sink_2pc.fizz` COV-M3. | `rockstream-connectors` |
 | M4-S1, M4-S3 | `assert_valid_writer(shard_id, token, current_token, …)` in `crates/rockstream-runtime/src/fence.rs` before every epoch commit; `assert_single_lease_holder(shard_id, count)` checked after every lease `acquire`/`force_acquire` call. Panics with `RS-1702` on stale token. Spec: `formal/m4_self_fencing.fizz` M4-S1, M4-S3. | `rockstream-runtime` |
 | M4-S2 | `SelfFenceGuard::must_self_fence()` / `assert_within_deadline()` in `crates/rockstream-runtime/src/fence.rs`; worker must call `guard.tick(can_reach_control)` on every heartbeat and terminate when `must_self_fence()` returns `true`. Panics with `RS-1702` on deadline exceeded. Spec: `formal/m4_self_fencing.fizz` M4-S2. | `rockstream-runtime` |

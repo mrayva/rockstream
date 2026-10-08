@@ -34,6 +34,7 @@ rockstream-control.workspace = true
 arrow.workspace = true
 datafusion.workspace = true
 sqlparser.workspace = true
+regex.workspace = true
 rockstream-ops.workspace = true
 rockstream-plan.workspace = true
 rockstream-diff.workspace = true
@@ -46,11 +47,12 @@ chrono.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
 postgres-types.workspace = true
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { workspace = true }
 rockstream-connectors.workspace = true
 
 
 [dev-dependencies]
+tonic = { workspace = true }
 rockstream-test-support.workspace = true
 tokio-postgres.workspace = true
 tempfile.workspace = true

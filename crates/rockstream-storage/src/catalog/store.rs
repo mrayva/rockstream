@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -170,6 +170,7 @@ impl DurableCatalogStore {
             state.sinks.values().cloned().collect(),
             state.roles.values().cloned().collect(),
             state.compiled_plans.values().cloned().collect(),
+            state.committed_operations.iter().copied().collect(),
         )?;
         drop(state);
 
@@ -289,6 +290,8 @@ impl DurableCatalogStore {
                     if let Ok(snap) = CatalogSnapshot::decode(&bytes) {
                         start_revision = snap.revision;
                         recovered_state.revision = snap.revision;
+                        recovered_state.committed_operations =
+                            snap.committed_operations.into_iter().collect();
                         catalog.id_allocator.observe(snap.high_water_mark);
 
                         for db in snap.databases {

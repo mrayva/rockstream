@@ -8,3 +8,7 @@ output.txt
 
 /formal/out/
 /evidence/r1-local/artifacts/
+.cache
+.DS_Store
+/.scratch
+/.p2p/

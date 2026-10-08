@@ -7,9 +7,11 @@ members = [
     "crates/rockstream-diff",
     "crates/rockstream-docgen",
     "crates/rockstream-gateway",
+    "crates/rockstream-management-proto",
     "crates/rockstream-ops",
     "crates/rockstream-oracle",
     "crates/rockstream-plan",
+    "crates/rockstream-verified",
     "crates/rockstream-runtime",
     "crates/rockstream-sim",
     "crates/rockstream-sql",
@@ -24,11 +26,14 @@ overflow-checks = true
 strip = "symbols"
 
 [workspace.package]
-version = "0.65.0"
+version = "0.71.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/trickle-labs/rockstream"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_only)"] }
 
 [workspace.dependencies]
 libfuzzer-sys = "0.4"
@@ -44,7 +49,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 criterion = { version = "0.5", features = ["html_reports"] }
 datafusion = "53"
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 tempfile = "3"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio"] }
@@ -62,13 +67,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 md5 = "0.7"
 antichain = { version = "0.3.1", features = ["serde"] }
-slatedb = "0.13"
+slatedb = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 crc32fast = "1.4"
+blake3 = "1.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -90,6 +96,7 @@ rust_decimal = "1"
 postgres-types = { version = "0.2", features = ["with-uuid-1", "with-serde_json-1", "array-impls"] }
 rdkafka = "0.36"
 ring = { version = "0.17", default-features = false, features = ["std"] }
+vstd = "=0.0.0-2026-09-06-0133"
 
 
 # Workspace crate references
@@ -99,9 +106,11 @@ rockstream-control = { path = "crates/rockstream-control" }
 rockstream-diff = { path = "crates/rockstream-diff" }
 rockstream-docgen = { path = "crates/rockstream-docgen" }
 rockstream-gateway = { path = "crates/rockstream-gateway" }
+rockstream-management-proto = { path = "crates/rockstream-management-proto" }
 rockstream-ops = { path = "crates/rockstream-ops" }
 rockstream-oracle = { path = "crates/rockstream-oracle" }
 rockstream-plan = { path = "crates/rockstream-plan" }
+rockstream-verified = { path = "crates/rockstream-verified" }
 rockstream-runtime = { path = "crates/rockstream-runtime" }
 rockstream-sim = { path = "crates/rockstream-sim" }
 rockstream-sql = { path = "crates/rockstream-sql" }

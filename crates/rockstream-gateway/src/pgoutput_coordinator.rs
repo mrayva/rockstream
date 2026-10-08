@@ -323,6 +323,7 @@ pub struct SharedPgOutputCoordinator {
     pub runtime: SourceRuntimeCoordinator<PostgresCdcSource>,
     pub relation_routes: BTreeMap<u32, RelationRoute>,
     pub blocked_state: Option<BlockedRelationState>,
+    pub blocked_relations: BTreeMap<u32, BlockedRelationState>,
     shard_db: Arc<ShardDb>,
     envelope_buffer: SpillableArrangement<EnvelopeKey, SerdeSpill<EncodedChange>>,
     pub active_envelope: Option<ActiveEnvelope>,
@@ -346,6 +347,7 @@ impl SharedPgOutputCoordinator {
             runtime,
             relation_routes: BTreeMap::new(),
             blocked_state: None,
+            blocked_relations: BTreeMap::new(),
             shard_db: Arc::clone(&shard_db),
             envelope_buffer: SpillableArrangement::new(
                 Some(shard_db),
@@ -427,6 +429,22 @@ impl SharedPgOutputCoordinator {
         Ok(())
     }
 
+    pub fn is_relation_blocked(&self, relation_id: u32) -> bool {
+        self.blocked_relations.contains_key(&relation_id)
+            || self
+                .blocked_state
+                .as_ref()
+                .is_some_and(|b| b.relation.relation_id == relation_id)
+    }
+
+    pub fn block_relation(&mut self, blocked: BlockedRelationState) {
+        let relation_id = blocked.relation.relation_id;
+        self.blocked_relations.insert(relation_id, blocked.clone());
+        if self.blocked_state.is_none() {
+            self.blocked_state = Some(blocked);
+        }
+    }
+
     pub fn stage_route(&mut self, xid: u32, route: RelationRoute) -> Result<(), GatewayError> {
         let active = self.require_xid(xid)?;
         active.unrouted_relations.remove(&route.relation_id);
@@ -465,6 +483,9 @@ impl SharedPgOutputCoordinator {
         new_values: Option<Vec<Option<String>>>,
     ) -> Result<(), GatewayError> {
         self.require_xid(xid)?;
+        if self.is_relation_blocked(relation_id) {
+            return Ok(());
+        }
         let schema_version = self
             .active_envelope
             .as_ref()
@@ -536,16 +557,30 @@ impl SharedPgOutputCoordinator {
             ));
         }
         let route_updates = active.route_updates.values().cloned().collect();
-        let mut entries = self
-            .envelope_buffer
-            .scan_all()
-            .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?;
-        entries.sort_by_key(|entry| entry.0.to_spill_bytes());
-        let changes = entries
-            .into_iter()
-            .filter(|(key, _)| key.xid == xid)
-            .map(|(_, value)| value.0)
-            .collect();
+        let changes =
+            if self.envelope_buffer.spilled_bytes() == 0 {
+                let mut changes = Vec::with_capacity(active.next_sequence as usize);
+                for sequence in 0..active.next_sequence {
+                    let key = EnvelopeKey { xid, sequence };
+                    if let Some(entry) = self.envelope_buffer.get(&key).map_err(|error| {
+                        coordinator_error(&format!("get pgoutput change: {error}"))
+                    })? {
+                        changes.push(entry.0);
+                    }
+                }
+                changes
+            } else {
+                let mut entries = self
+                    .envelope_buffer
+                    .scan_all()
+                    .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?;
+                entries.sort_by_key(|entry| entry.0.to_spill_bytes());
+                entries
+                    .into_iter()
+                    .filter(|(key, _)| key.xid == xid)
+                    .map(|(_, value)| value.0)
+                    .collect()
+            };
         Ok(BufferedPgOutputEnvelope {
             xid,
             commit_lsn,
@@ -560,20 +595,18 @@ impl SharedPgOutputCoordinator {
         })?;
         let xid = active.xid;
         let route_updates = active.route_updates.clone();
-        let keys = self
-            .envelope_buffer
-            .scan_all()
-            .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?
-            .into_iter()
-            .map(|(key, _)| key)
-            .filter(|key| key.xid == xid)
+        let had_spill = self.envelope_buffer.spilled_bytes() > 0;
+        let keys = (0..active.next_sequence)
+            .map(|sequence| EnvelopeKey { xid, sequence })
             .collect::<Vec<_>>();
-        for key in keys {
+        for key in &keys {
             self.envelope_buffer
-                .remove(&key)
+                .remove(key)
                 .map_err(|error| coordinator_error(&format!("delete pgoutput spill: {error}")))?;
         }
-        db.flush().await?;
+        if had_spill {
+            db.flush().await?;
+        }
         self.relation_routes.extend(route_updates);
         self.active_envelope = None;
         self.activating_views.clear();
@@ -677,6 +710,19 @@ pub struct BlockedRelationState {
     pub xid: u32,
     pub relation: rockstream_connectors::PgOutputRelationMetadata,
     pub last_safe_lsn: PgLsn,
+    #[serde(default)]
+    pub recovery_procedure: Option<String>,
+}
+
+impl BlockedRelationState {
+    pub fn recovery_procedure(&self) -> String {
+        self.recovery_procedure.clone().unwrap_or_else(|| {
+            format!(
+                "rockstream source rebuild <src> --table {}",
+                self.relation.name
+            )
+        })
+    }
 }
 
 pub fn append_blocked_state(

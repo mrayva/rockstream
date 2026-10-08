@@ -296,6 +296,8 @@ pub const RS_0003: ErrorCode = ErrorCode::new(3);
 pub const RS_0004: ErrorCode = ErrorCode::new(4);
 /// Destructive command confirmation required.
 pub const RS_0005: ErrorCode = ErrorCode::new(5);
+/// Formal Verus qualification or verification gate failed.
+pub const RS_0906: ErrorCode = ErrorCode::new(906);
 /// Pipeline not found.
 pub const RS_1001: ErrorCode = ErrorCode::new(1001);
 /// Incompatible schema change.
@@ -340,6 +342,8 @@ pub const RS_1020: ErrorCode = ErrorCode::new(1020);
 pub const RS_1021: ErrorCode = ErrorCode::new(1021);
 /// Migration state exceeded its configured timeout budget.
 pub const RS_1030: ErrorCode = ErrorCode::new(1030);
+/// Numeric value out of range or arithmetic overflow.
+pub const RS_1201: ErrorCode = ErrorCode::new(1201);
 /// Inner-frontier stall in distributed recursion; per-shard recompute triggered.
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence.
@@ -490,8 +494,14 @@ pub const RS_2601: ErrorCode = ErrorCode::new(2601);
 pub const RS_3001: ErrorCode = ErrorCode::new(3001);
 /// Pipeline blocked: object store brownout, local buffer exhausted.
 pub const RS_3003: ErrorCode = ErrorCode::new(3003);
+/// Exchange frame lease token stale or superseded.
+pub const RS_3004: ErrorCode = ErrorCode::new(3004);
 /// Self-fencing configuration invalid: self_fence_after constraint violated.
 pub const RS_3005: ErrorCode = ErrorCode::new(3005);
+/// Exchange frame exceeds max_batch_bytes limit.
+pub const RS_3006: ErrorCode = ErrorCode::new(3006);
+/// Exchange request ID reused with conflicting payload digest.
+pub const RS_3008: ErrorCode = ErrorCode::new(3008);
 /// Merge operand malformed.
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Legacy durable shuffle error (retired, use RS-3011..3016).
@@ -670,6 +680,8 @@ pub const RS_5034: ErrorCode = ErrorCode::new(5034);
 pub const RS_5035: ErrorCode = ErrorCode::new(5035);
 /// Non-composable hot key routed to a single spill shard.
 pub const RS_5036: ErrorCode = ErrorCode::new(5036);
+/// Malformed arrangement catalog header length.
+pub const RS_5037: ErrorCode = ErrorCode::new(5037);
 /// Incompatible upstream schema evolution detected.
 pub const RS_6001: ErrorCode = ErrorCode::new(6001);
 /// Frontier aggregator shard registry is full; new shard reports rejected.
@@ -678,6 +690,8 @@ pub const RS_8001: ErrorCode = ErrorCode::new(8001);
 pub const RS_8002: ErrorCode = ErrorCode::new(8002);
 /// Sync-flush-before-lease-handoff-read violation on frontier publication.
 pub const RS_8003: ErrorCode = ErrorCode::new(8003);
+/// Membership-aware frontier report or configuration transition was rejected.
+pub const RS_8004: ErrorCode = ErrorCode::new(8004);
 /// Admission control rejected the capacity request.
 pub const RS_9001: ErrorCode = ErrorCode::new(9001);
 

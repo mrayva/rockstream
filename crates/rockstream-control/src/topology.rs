@@ -6,7 +6,7 @@
 
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -192,7 +192,7 @@ impl TopologyPersistentStore {
     }
 
     fn worker_path(&self, worker_id: WorkerId) -> Path {
-        self.prefix.child(format!("{}.json", worker_id.0))
+        self.prefix.clone().join(format!("{}.json", worker_id.0))
     }
 
     pub async fn save_worker(&self, worker: &WorkerInfo) -> Result<(), String> {
@@ -268,6 +268,7 @@ mod tests {
             same_host_arrow_shm_v1: true,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: id.is_multiple_of(2),
+            shared_shard_store_id: None,
         })
     }
 
@@ -346,6 +347,7 @@ mod tests {
             same_host_arrow_shm_v1: false,
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
+            shared_shard_store_id: None,
         });
         cat.register(&reg2);
         assert_eq!(cat.len(), 1);

@@ -2,7 +2,7 @@
   "manifest_metadata": {
     "schema_version": "1.0.0",
     "engine_version": "0.59.20",
-    "candidate_identity_digest": "2f65e688ef9b98aeebbf367b0c57202f3901090bc87079d63af12f7115930940",
+    "candidate_identity_digest": "135e556acb8f96f7cde100eb06edc07f7924287a0f0975c5768da4e7ddc1c05c",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
@@ -444,6 +444,136 @@
             ]
           },
           {
+            "name": "operation",
+            "about": "Inspect or cancel durable management operations",
+            "subcommands": [
+              {
+                "name": "cancel",
+                "about": "Cancel an operation before its irreversible boundary",
+                "options": [
+                  {
+                    "name": "operation_id",
+                    "help": "",
+                    "required": true,
+                    "value_name": "OPERATION_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "list",
+                "about": "List retained management operations",
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              },
+              {
+                "name": "show",
+                "about": "Show one management operation",
+                "options": [
+                  {
+                    "name": "operation_id",
+                    "help": "",
+                    "required": true,
+                    "value_name": "OPERATION_ID"
+                  }
+                ],
+                "exit_codes": [
+                  {
+                    "code": 0,
+                    "title": "Success",
+                    "description": "Command completed successfully without error"
+                  },
+                  {
+                    "code": 1,
+                    "title": "Execution Error",
+                    "description": "Runtime failure or operation error during execution"
+                  },
+                  {
+                    "code": 2,
+                    "title": "Usage Error",
+                    "description": "Invalid arguments, options, or flags provided to CLI"
+                  }
+                ],
+                "error_codes": [
+                  "RS-0001",
+                  "RS-1001",
+                  "RS-1012",
+                  "RS-1013",
+                  "RS-2001"
+                ]
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
             "name": "raft",
             "about": "Raft consensus administrative inspection and operations",
             "subcommands": [
@@ -671,6 +801,34 @@
             ]
           }
         ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
+        "name": "capabilities",
+        "about": "List capabilities advertised by the management service",
         "exit_codes": [
           {
             "code": 0,
@@ -1266,6 +1424,34 @@
                 "value_name": "WEBHOOK_LISTEN"
               }
             ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
+          },
+          {
+            "name": "summary",
+            "about": "Show the server's effective configuration with secret values redacted",
             "exit_codes": [
               {
                 "code": 0,
@@ -2070,6 +2256,34 @@
             "value_name": "VIEW"
           }
         ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
+        "name": "health",
+        "about": "Show authoritative process health from the management service",
         "exit_codes": [
           {
             "code": 0,
@@ -3125,6 +3339,42 @@
               "RS-1013",
               "RS-2001"
             ]
+          },
+          {
+            "name": "show",
+            "about": "Show one shard and its current lease",
+            "options": [
+              {
+                "name": "shard_id",
+                "help": "Shard ID",
+                "required": true,
+                "value_name": "SHARD_ID"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
           }
         ],
         "exit_codes": [
@@ -3552,6 +3802,13 @@
             "required": false,
             "value_name": "LISTEN",
             "default_value": "127.0.0.1:5432"
+          },
+          {
+            "name": "management_addr",
+            "long": "management-addr",
+            "help": "Address the typed management RPC listener binds to",
+            "required": false,
+            "value_name": "MANAGEMENT_ADDR"
           },
           {
             "name": "max_exchange_compression_states",
@@ -5961,6 +6218,16 @@
         "doc_anchor": "rs-0005"
       },
       {
+        "code": "RS-0906",
+        "key": "formal.verus_qualification_failed",
+        "title": "Formal Verus qualification failed",
+        "severity": "ERROR",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass.",
+        "doc_anchor": "rs-0906"
+      },
+      {
         "code": "RS-1001",
         "key": "pipeline.not_found",
         "title": "Pipeline not found",
@@ -6179,6 +6446,16 @@
         "retry_class": "ExponentialBackoff",
         "default_next_steps": "Check donor/recipient shard health, then retry or abort the migration; increase the specific migration timeout only if the cluster is healthy but the workload is larger than expected.",
         "doc_anchor": "rs-1030"
+      },
+      {
+        "code": "RS-1201",
+        "key": "numeric.value_out_of_range",
+        "title": "Numeric value out of range or arithmetic overflow",
+        "severity": "ERROR",
+        "sqlstate": "22003",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Check for numeric overflow in arithmetic operations and ensure input values stay within valid ranges.",
+        "doc_anchor": "rs-1201"
       },
       {
         "code": "RS-1512",
@@ -6931,6 +7208,16 @@
         "doc_anchor": "rs-3003"
       },
       {
+        "code": "RS-3004",
+        "key": "exchange.stale_lease_token",
+        "title": "Exchange frame lease token stale or superseded",
+        "severity": "ERROR",
+        "sqlstate": "55000",
+        "retry_class": "AfterLeaderElection",
+        "default_next_steps": "Refresh worker shard lease from control plane before retrying exchange.",
+        "doc_anchor": "rs-3004"
+      },
+      {
         "code": "RS-3005",
         "key": "config.self_fencing_invalid",
         "title": "Self-fencing configuration invalid: self_fence_after constraint violated",
@@ -6939,6 +7226,26 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
         "doc_anchor": "rs-3005"
+      },
+      {
+        "code": "RS-3006",
+        "key": "exchange.frame_oversized",
+        "title": "Exchange frame exceeds max_batch_bytes limit",
+        "severity": "ERROR",
+        "sqlstate": "53200",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Split large record batches into smaller chunks within configured transport budget.",
+        "doc_anchor": "rs-3006"
+      },
+      {
+        "code": "RS-3008",
+        "key": "exchange.conflicting_payload_digest",
+        "title": "Exchange request ID reused with conflicting payload digest",
+        "severity": "ERROR",
+        "sqlstate": "42710",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Ensure idempotent retry uses identical request payload and request ID, or generate a fresh request ID.",
+        "doc_anchor": "rs-3008"
       },
       {
         "code": "RS-3009",
@@ -7831,6 +8138,16 @@
         "doc_anchor": "rs-5036"
       },
       {
+        "code": "RS-5037",
+        "key": "storage.malformed_arrangement_header",
+        "title": "Malformed arrangement catalog header",
+        "severity": "FATAL",
+        "sqlstate": "XX000",
+        "retry_class": "NonRetryable",
+        "default_next_steps": "Inspect the stored arrangement catalog value; the header length does not match the expected wire size.",
+        "doc_anchor": "rs-5037"
+      },
+      {
         "code": "RS-6001",
         "key": "schema.upstream_evolution_detected",
         "title": "Incompatible upstream schema evolution detected",
@@ -7869,6 +8186,16 @@
         "retry_class": "NonRetryable",
         "default_next_steps": "Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore.",
         "doc_anchor": "rs-8003"
+      },
+      {
+        "code": "RS-8004",
+        "key": "frontier.membership_report_rejected",
+        "title": "Membership-aware frontier report or configuration transition was rejected",
+        "severity": "ERROR",
+        "sqlstate": "55000",
+        "retry_class": "Immediate",
+        "default_next_steps": "Refresh the active membership generation and shard incarnation, then retry with a versioned report after durable catch-up.",
+        "doc_anchor": "rs-8004"
       },
       {
         "code": "RS-9001",

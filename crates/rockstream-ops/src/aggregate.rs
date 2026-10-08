@@ -6,8 +6,8 @@
 //! For each incoming row (k, v) with weight w:
 //!   1. Look up old state (sum, count) for group key k.
 //!   2. Compute new_sum = old_sum + v * w, new_count = old_count + w.
-//!   3. If old_count != 0 → retract: emit (k, old_sum, old_count, avg) with weight -1.
-//!   4. If new_count != 0 → insert:  emit (k, new_sum, new_count, avg) with weight +1.
+//!   3. If old_count > 0 → retract: emit (k, old_sum, old_count, avg) with weight -1.
+//!   4. If new_count > 0 → insert:  emit (k, new_sum, new_count, avg) with weight +1.
 //!   5. Update state: remove k if new_count == 0, else store (new_sum, new_count).
 //! ```
 //!
@@ -32,7 +32,7 @@
 //! arrangement.  Call `AggregateOp::load_from_storage(db, op_id)` on restart
 //! to restore state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -47,6 +47,10 @@ use rockstream_plan::virtual_bucket::{
 };
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::arithmetic::{
+    checked_add_i64, checked_i128_to_i64, checked_mul_i64, decode_i64, decode_u64, encode_i64,
+    encode_u64,
+};
 use rockstream_types::laws::sum_count::avg_from_sum_count;
 
 use crate::error::OpError;
@@ -198,6 +202,26 @@ impl Operator for DecimalAggregateFormatOp {
 ///
 /// The arrangement is bounded by the number of distinct group keys in the input
 /// stream.  The fill level is tracked via `entry_count()`.
+fn encode_state_mutation(
+    op_id: OperatorId,
+    group_key: i64,
+    state: Option<(i64, i64)>,
+) -> rockstream_types::state_mutation::StateMutation {
+    let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes());
+    match state {
+        Some((sum, count)) => {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
+            rockstream_types::state_mutation::StateMutation::Put {
+                key,
+                value: bytes::Bytes::copy_from_slice(&value),
+            }
+        }
+        None => rockstream_types::state_mutation::StateMutation::Delete { key },
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AggState {
     /// Group key → (sum_v, count).
@@ -259,29 +283,39 @@ impl AggState {
         w: i64,
     ) -> Result<(Option<(i64, i64)>, Option<(i64, i64)>), OpError> {
         let (old_sum, old_count) = self.entries.get(&k).copied().unwrap_or((0, 0));
-        let old_state = if old_count != 0 {
+        let old_state = if old_count > 0 {
             Some((old_sum, old_count))
         } else {
             None
         };
+        if old_count < 0 || (old_count == 0 && old_sum != 0) {
+            return Err(OpError::invalid_literal(format!(
+                "aggregate group {k} has an invalid existing state"
+            )));
+        }
 
-        // Checked arithmetic for sum to detect overflow.
-        let new_sum = old_sum
-            .checked_add(
-                v.checked_mul(w)
-                    .ok_or_else(|| OpError::aggregate_overflow(k))?,
-            )
-            .ok_or_else(|| OpError::aggregate_overflow(k))?;
-        let new_count = old_count
-            .checked_add(w)
-            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        // Calculate every candidate before changing the arrangement.
+        let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
+        let new_count =
+            checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
         if new_count < 0 {
             return Err(OpError::invalid_multiplicity(k, new_count));
         }
+        let next =
+            rockstream_verified::aggregate::transition(old_sum, old_count, contribution as i128, w)
+                .ok_or_else(|| {
+                    if new_count == 0 {
+                        OpError::invalid_literal(format!(
+                            "aggregate group {k} has zero count with nonzero sum"
+                        ))
+                    } else {
+                        OpError::aggregate_overflow(k)
+                    }
+                })?;
 
-        let new_state = if new_count != 0 {
-            self.entries.insert(k, (new_sum, new_count));
-            Some((new_sum, new_count))
+        let new_state = if new_count > 0 {
+            self.entries.insert(k, next);
+            Some(next)
         } else {
             self.entries.remove(&k);
             None
@@ -298,8 +332,8 @@ impl AggState {
         for (&k, &(sum, count)) in &self.entries {
             let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
             let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&sum.to_be_bytes());
-            value[8..].copy_from_slice(&count.to_be_bytes());
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
             wb.put(&key, &value);
         }
         wb
@@ -311,25 +345,41 @@ impl AggState {
         op_id: OperatorId,
         dirty_keys: &[i64],
     ) -> Vec<rockstream_types::state_mutation::StateMutation> {
-        let mut mutations = Vec::with_capacity(dirty_keys.len());
-        for &k in dirty_keys {
-            let key_bytes =
-                ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
-            if let Some(&(sum, count)) = self.entries.get(&k) {
-                let mut val = [0u8; 16];
-                val[..8].copy_from_slice(&sum.to_be_bytes());
-                val[8..].copy_from_slice(&count.to_be_bytes());
-                mutations.push(rockstream_types::state_mutation::StateMutation::Put {
-                    key: key_bytes,
-                    value: bytes::Bytes::copy_from_slice(&val),
-                });
-            } else {
-                mutations.push(rockstream_types::state_mutation::StateMutation::Delete {
-                    key: key_bytes,
-                });
-            }
+        dirty_keys
+            .iter()
+            .map(|&key| encode_state_mutation(op_id, key, self.entries.get(&key).copied()))
+            .collect()
+    }
+
+    fn decode_persisted_entry(
+        key: &[u8],
+        value: &[u8],
+        op_id: OperatorId,
+        op_prefix: &[u8],
+    ) -> Result<(i64, i64, i64), OpError> {
+        if key.len() != op_prefix.len() + 8 || !key.starts_with(op_prefix) {
+            return Err(OpError::storage_error(
+                "RS-3616: corrupted recovery record: invalid aggregate key",
+            ));
         }
-        mutations
+        if value.len() != 16 {
+            return Err(OpError::storage_error(
+                "RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes",
+            ));
+        }
+        let k = decode_i64(&key[op_prefix.len()..])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate group key"))?;
+        let sum = decode_i64(&value[..8])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate sum"))?;
+        let count = decode_i64(&value[8..])
+            .map_err(|_| OpError::storage_error("RS-3616: corrupted aggregate count"))?;
+        if count <= 0 {
+            return Err(OpError::storage_error(format!(
+                "RS-3616: corrupted recovery record for operator {}: non-positive count",
+                op_id.0
+            )));
+        }
+        Ok((k, sum, count))
     }
 
     /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
@@ -339,37 +389,14 @@ impl AggState {
     pub fn decode_from_entries(
         raw_entries: &[(bytes::Bytes, bytes::Bytes)],
         op_id: OperatorId,
-    ) -> Self {
+    ) -> Result<Self, OpError> {
         let op_prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
         let mut state = AggState::new();
         for (key, value) in raw_entries {
-            // Strip the operator prefix to get the group key bytes.
-            if key.len() < op_prefix.len() + 8 || !key.starts_with(&op_prefix) {
-                continue;
-            }
-            let k_bytes: [u8; 8] = match key[op_prefix.len()..op_prefix.len() + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if value.len() < 16 {
-                continue;
-            }
-            let sum_bytes: [u8; 8] = match value[..8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let count_bytes: [u8; 8] = match value[8..16].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let k = i64::from_be_bytes(k_bytes);
-            let sum = i64::from_be_bytes(sum_bytes);
-            let count = i64::from_be_bytes(count_bytes);
-            if count != 0 {
-                state.entries.insert(k, (sum, count));
-            }
+            let (k, sum, count) = Self::decode_persisted_entry(key, value, op_id, &op_prefix)?;
+            state.entries.insert(k, (sum, count));
         }
-        state
+        Ok(state)
     }
 }
 
@@ -379,7 +406,8 @@ impl AggState {
 pub const MAX_EPOCH_CONSOLIDATION_GROUPS: usize = 1_000_000;
 /// Named upper bound for epoch consolidation staging memory (64 MiB).
 pub const MAX_EPOCH_CONSOLIDATION_BYTES: usize = 64 * 1024 * 1024;
-const MAX_AGGREGATE_RESTORE_BYTES: usize = 64 * 1024 * 1024;
+#[allow(dead_code)]
+pub const MAX_AGGREGATE_RESTORE_BYTES: usize = 64 * 1024 * 1024;
 
 /// In-memory staged accumulator for epoch group input consolidation.
 /// Consolidates inputs per group key `k`, computes net sum/count in i128/i64,
@@ -438,22 +466,29 @@ impl StagedEpochAggregator {
         }
 
         // Per-row multiplication checked strictly upon ingestion
-        let prod = v
-            .checked_mul(w)
-            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        let prod = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
 
         if let Some((sum, count)) = self.entries.get_mut(&k) {
-            *sum = sum
+            let next_sum = sum
                 .checked_add(prod as i128)
                 .ok_or_else(|| OpError::aggregate_overflow(k))?;
-            *count = count
-                .checked_add(w)
-                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            let next_count =
+                checked_add_i64(*count, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            *sum = next_sum;
+            *count = next_count;
         } else {
-            if self.entries.len() >= self.max_groups {
+            let next_groups = self.entries.len().checked_add(1).ok_or_else(|| {
+                OpError::capacity_exceeded(
+                    "epoch consolidation groups",
+                    usize::MAX,
+                    self.max_groups,
+                    "reduce epoch distinct groups or increase MAX_EPOCH_CONSOLIDATION_GROUPS",
+                )
+            })?;
+            if next_groups > self.max_groups {
                 return Err(OpError::capacity_exceeded(
                     "epoch consolidation groups",
-                    self.entries.len() + 1,
+                    next_groups,
                     self.max_groups,
                     "reduce epoch distinct groups or increase MAX_EPOCH_CONSOLIDATION_GROUPS",
                 ));
@@ -461,10 +496,21 @@ impl StagedEpochAggregator {
 
             // Approximate memory: 8 bytes key + 24 bytes (i128, i64) + 8 bytes order + 24 bytes map overhead = 64 bytes
             const ENTRY_ESTIMATED_BYTES: usize = 64;
-            if self.estimated_bytes + ENTRY_ESTIMATED_BYTES > self.max_bytes {
+            let next_bytes = self
+                .estimated_bytes
+                .checked_add(ENTRY_ESTIMATED_BYTES)
+                .ok_or_else(|| {
+                    OpError::capacity_exceeded(
+                        "epoch consolidation bytes",
+                        usize::MAX,
+                        self.max_bytes,
+                        "reduce epoch batch size or increase MAX_EPOCH_CONSOLIDATION_BYTES",
+                    )
+                })?;
+            if next_bytes > self.max_bytes {
                 return Err(OpError::capacity_exceeded(
                     "epoch consolidation bytes",
-                    self.estimated_bytes + ENTRY_ESTIMATED_BYTES,
+                    next_bytes,
                     self.max_bytes,
                     "reduce epoch batch size or increase MAX_EPOCH_CONSOLIDATION_BYTES",
                 ));
@@ -472,7 +518,7 @@ impl StagedEpochAggregator {
 
             self.entries.insert(k, (prod as i128, w));
             self.order.push(k);
-            self.estimated_bytes += ENTRY_ESTIMATED_BYTES;
+            self.estimated_bytes = next_bytes;
         }
 
         Ok(())
@@ -487,6 +533,9 @@ impl Default for StagedEpochAggregator {
 
 // ─── AggregateOp ─────────────────────────────────────────────────────────────
 
+/// Named upper bound for clean LRU capacity in AggregateOp.
+pub const MAX_CLEAN_LRU_CAPACITY: usize = 262_144;
+
 /// Stateful incremental aggregate operator.
 ///
 /// Input:  two Int64 columns `(k, v)`.
@@ -494,11 +543,14 @@ impl Default for StagedEpochAggregator {
 ///
 /// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
 pub struct AggregateOp {
+    db: Mutex<Option<Arc<ShardDb>>>,
     state: Mutex<AggState>,
-    dirty_keys: Mutex<std::collections::HashSet<i64>>,
+    dirty_keys: Mutex<HashSet<i64>>,
+    clean_lru: Mutex<VecDeque<i64>>,
     pub op_id: OperatorId,
     max_groups: AtomicUsize,
     max_bytes: AtomicUsize,
+    max_state_bytes: AtomicUsize,
     last_consolidation_groups: AtomicUsize,
     last_consolidation_bytes: AtomicUsize,
 }
@@ -515,12 +567,16 @@ impl AggregateOp {
 
     /// Create from pre-loaded state (used after loading from storage).
     pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
+        let clean_keys: VecDeque<i64> = state.entries.keys().copied().collect();
         AggregateOp {
+            db: Mutex::new(None),
             state: Mutex::new(state),
-            dirty_keys: Mutex::new(std::collections::HashSet::new()),
+            dirty_keys: Mutex::new(HashSet::new()),
+            clean_lru: Mutex::new(clean_keys),
             op_id,
             max_groups: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_GROUPS),
             max_bytes: AtomicUsize::new(MAX_EPOCH_CONSOLIDATION_BYTES),
+            max_state_bytes: AtomicUsize::new(0),
             last_consolidation_groups: AtomicUsize::new(0),
             last_consolidation_bytes: AtomicUsize::new(0),
         }
@@ -529,14 +585,47 @@ impl AggregateOp {
     /// Create with custom consolidation limits.
     pub fn with_limits(op_id: OperatorId, max_groups: usize, max_bytes: usize) -> Self {
         AggregateOp {
+            db: Mutex::new(None),
             state: Mutex::new(AggState::new()),
-            dirty_keys: Mutex::new(std::collections::HashSet::new()),
+            dirty_keys: Mutex::new(HashSet::new()),
+            clean_lru: Mutex::new(VecDeque::new()),
             op_id,
             max_groups: AtomicUsize::new(max_groups),
             max_bytes: AtomicUsize::new(max_bytes),
+            max_state_bytes: AtomicUsize::new(0),
             last_consolidation_groups: AtomicUsize::new(0),
             last_consolidation_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Attach a ShardDb for transparent spill-to-disk and demand-loading.
+    pub fn with_db(self, db: Arc<ShardDb>) -> Self {
+        *self.db.lock().unwrap() = Some(db);
+        self
+    }
+
+    /// Set a ShardDb for transparent spill-to-disk and demand-loading.
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        *self.db.lock().unwrap() = Some(db);
+    }
+
+    /// Set in-memory state capacity budget in bytes.
+    pub fn with_memory_limit(self, max_bytes: usize) -> Self {
+        self.max_state_bytes.store(max_bytes, Ordering::Relaxed);
+        self
+    }
+
+    /// Set in-memory state capacity budget in bytes dynamically.
+    pub fn set_memory_limit(&self, max_bytes: usize) {
+        self.max_state_bytes.store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// Number of in-memory cached groups.
+    pub fn in_memory_groups(&self) -> usize {
+        self.state
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .entry_count()
     }
 
     /// Set consolidation limits dynamically.
@@ -557,10 +646,39 @@ impl AggregateOp {
 
     /// Mark the current dirty-key set durable after its caller's batch commits.
     pub fn clear_dirty_keys(&self) {
-        self.dirty_keys
+        let mut dirty = self
+            .dirty_keys
             .lock()
-            .expect("AggregateOp dirty-key mutex poisoned")
-            .clear();
+            .expect("AggregateOp dirty-key mutex poisoned");
+        let mut clean_lru = self
+            .clean_lru
+            .lock()
+            .expect("AggregateOp clean_lru mutex poisoned");
+        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+
+        for &k in dirty.iter() {
+            if state.entries.contains_key(&k) {
+                clean_lru.push_back(k);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
+                }
+            }
+        }
+        dirty.clear();
+
+        let limit = self.max_state_bytes.load(Ordering::Relaxed);
+        let has_db = self
+            .db
+            .lock()
+            .expect("AggregateOp db mutex poisoned")
+            .is_some();
+        if limit > 0 && has_db {
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    state.entries.remove(&cold_k);
+                }
+            }
+        }
     }
 
     /// Number of live groups (fill-level metric).
@@ -571,31 +689,66 @@ impl AggregateOp {
             .entry_count()
     }
 
-    /// Encode current state as a `WriteBatch` for persistence.
+    /// Encode dirty state mutations as a `WriteBatch` for persistence.
     ///
+    /// Persists only keys that changed (put) or were removed (delete) during the
+    /// current epoch, ensuring O(|Δ|) write amplification instead of O(|state|).
     /// The caller (usually `ViewSinkOp` or group commit) merges this batch
     /// into the epoch's group-commit `WriteBatch`.
     pub fn state_write_batch(&self) -> WriteBatch {
-        self.state
+        let state = self.state.lock().expect("AggregateOp mutex poisoned");
+        let dirty = self
+            .dirty_keys
             .lock()
-            .expect("AggregateOp mutex poisoned")
-            .encode_as_write_batch(self.op_id)
+            .expect("AggregateOp dirty_keys mutex poisoned");
+        let mut wb = WriteBatch::new();
+        for &k in dirty.iter() {
+            let key = ShardKeyEncoder::encode(ShardPrefix::OpState, self.op_id.0, &k.to_be_bytes());
+            if let Some(&(sum, count)) = state.entries.get(&k) {
+                let mut value = [0u8; 16];
+                value[..8].copy_from_slice(&sum.to_be_bytes());
+                value[8..].copy_from_slice(&count.to_be_bytes());
+                wb.put(&key, &value);
+            } else {
+                wb.delete(&key);
+            }
+        }
+        wb
     }
 
     /// Restore an `AggregateOp` from a `ShardDb` (called at shard startup).
     pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let (entries, truncated) = db
-            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
-            .await
-            .map_err(OpError::storage)?;
-        if truncated {
-            return Err(OpError::internal(format!(
-                "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
-            )));
+        let mut state = AggState::new();
+        let mut next_token: Option<bytes::Bytes> = None;
+        let mut clean_lru = VecDeque::new();
+
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+
+            for (key, value) in &page.rows {
+                let (k, sum, count) = AggState::decode_persisted_entry(key, value, op_id, &prefix)?;
+                state.entries.insert(k, (sum, count));
+                clean_lru.push_back(k);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
+                }
+            }
+
+            if page.is_last_page {
+                break;
+            }
+            next_token = page.next_token;
         }
-        let state = AggState::decode_from_entries(&entries, op_id);
-        Ok(Self::with_state(op_id, state))
+        let op = Self::with_state(op_id, state);
+        *op.db.lock().expect("AggregateOp db mutex poisoned") = Some(Arc::new(db.clone()));
+        *op.clean_lru
+            .lock()
+            .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
+        Ok(op)
     }
 
     /// Load persisted state from `db` into this already-constructed
@@ -606,17 +759,46 @@ impl AggregateOp {
     /// to rebuild the pipeline around a freshly-returned instance).
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
-        let (entries, truncated) = db
-            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
-            .await
-            .map_err(OpError::storage)?;
-        if truncated {
-            return Err(OpError::internal(format!(
-                "aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
-            )));
+        let mut state = AggState::new();
+        let mut next_token: Option<bytes::Bytes> = None;
+        let mut clean_lru = VecDeque::new();
+
+        loop {
+            let page = db
+                .scan_prefix_page(&prefix, next_token.as_deref(), 1024, 1024 * 1024)
+                .await
+                .map_err(OpError::storage)?;
+
+            for (key, value) in &page.rows {
+                let (k, sum, count) =
+                    AggState::decode_persisted_entry(key, value, self.op_id, &prefix)?;
+                state.entries.insert(k, (sum, count));
+                clean_lru.push_back(k);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
+                }
+            }
+
+            if page.is_last_page {
+                break;
+            }
+            next_token = page.next_token;
         }
-        let state = AggState::decode_from_entries(&entries, self.op_id);
+
+        let limit = self.max_state_bytes.load(Ordering::Relaxed);
+        if limit > 0 {
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    state.entries.remove(&cold_k);
+                }
+            }
+        }
         *self.state.lock().expect("AggregateOp mutex poisoned") = state;
+        *self.db.lock().expect("AggregateOp db mutex poisoned") = Some(Arc::new(db.clone()));
+        *self
+            .clean_lru
+            .lock()
+            .expect("AggregateOp clean_lru mutex poisoned") = clean_lru;
         Ok(())
     }
 
@@ -631,6 +813,7 @@ impl AggregateOp {
         delta: ArrowZSet,
     ) -> Result<crate::op::OperatorEpochResult, OpError> {
         let started_at = Instant::now();
+        delta.validate()?;
         if delta.is_empty() {
             return Ok(crate::op::OperatorEpochResult::new(
                 ArrowZSet::empty(output_schema()),
@@ -671,7 +854,7 @@ impl AggregateOp {
                         if arr.is_null(row) {
                             Ok(0)
                         } else {
-                            i64::try_from(arr.value(row)).map_err(|_| {
+                            checked_i128_to_i64(arr.value(row)).map_err(|_| {
                                 OpError::column_type_mismatch(
                                     "Decimal128 fitting Int64",
                                     "Decimal128",
@@ -743,16 +926,64 @@ impl AggregateOp {
 
         let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
         let mut transitions = Vec::with_capacity(staged.order.len());
+        let db_opt = self
+            .db
+            .lock()
+            .expect("AggregateOp db mutex poisoned")
+            .clone();
+        let current_dirty = self
+            .dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned")
+            .clone();
+
+        let mut demand_loaded: HashMap<i64, (i64, i64)> = HashMap::new();
 
         for &k in &staged.order {
             let (delta_sum, delta_count) = staged.entries[&k];
-            let old = state.entries.get(&k).copied();
+            let mut old = state.entries.get(&k).copied();
+
+            if old.is_none() {
+                // If the key was deleted in the current uncommitted epoch, old is None
+                if !current_dirty.contains(&k) {
+                    if let Some(db) = &db_opt {
+                        let key_bytes = ShardKeyEncoder::encode(
+                            ShardPrefix::OpState,
+                            self.op_id.0,
+                            &k.to_be_bytes(),
+                        );
+                        let opt_bytes =
+                            crate::spill::block_on_future(db.get(&key_bytes)).map_err(|e| {
+                                OpError::storage_error(format!(
+                                    "AggregateOp demand load failed: {e}"
+                                ))
+                            })?;
+                        if let Some(bytes) = opt_bytes {
+                            if bytes.len() >= 16 {
+                                let sum = i64::from_be_bytes(bytes[..8].try_into().unwrap());
+                                let count = i64::from_be_bytes(bytes[8..16].try_into().unwrap());
+                                if count > 0 {
+                                    rockstream_types::metrics::inc_spill_faults_total();
+                                    old = Some((sum, count));
+                                    demand_loaded.insert(k, (sum, count));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let (old_sum, old_count) = old.unwrap_or((0, 0));
             let old_state = if old_count > 0 {
                 Some((old_sum, old_count))
             } else {
                 None
             };
+            if old_count < 0 || (old_count == 0 && old_sum != 0) {
+                return Err(OpError::invalid_literal(format!(
+                    "aggregate group {k} has an invalid existing state"
+                )));
+            }
 
             if delta_sum == 0 && delta_count == 0 {
                 transitions.push(GroupTransition {
@@ -764,24 +995,28 @@ impl AggregateOp {
                 continue;
             }
 
-            let new_count = old_count
-                .checked_add(delta_count)
-                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            let new_count = checked_add_i64(old_count, delta_count)
+                .map_err(|_| OpError::aggregate_overflow(k))?;
             if new_count < 0 {
                 return Err(OpError::invalid_multiplicity(k, new_count));
             }
 
-            let new_state = if new_count > 0 {
-                let old_sum_128 = old_sum as i128;
-                let total_sum_128 = old_sum_128
-                    .checked_add(delta_sum)
-                    .ok_or_else(|| OpError::aggregate_overflow(k))?;
-                let new_sum =
-                    i64::try_from(total_sum_128).map_err(|_| OpError::aggregate_overflow(k))?;
-                Some((new_sum, new_count))
-            } else {
-                None
-            };
+            let next = rockstream_verified::aggregate::transition(
+                old_sum,
+                old_count,
+                delta_sum,
+                delta_count,
+            )
+            .ok_or_else(|| {
+                if new_count == 0 {
+                    OpError::invalid_literal(format!(
+                        "aggregate group {k} has zero count with nonzero sum"
+                    ))
+                } else {
+                    OpError::aggregate_overflow(k)
+                }
+            })?;
+            let new_state = (new_count > 0).then_some(next);
 
             let changed = old_state != new_state;
             transitions.push(GroupTransition {
@@ -792,19 +1027,30 @@ impl AggregateOp {
             });
         }
 
+        // If we reached here, no overflow occurred! Commit changes atomically.
+        {
+            let mut clean_lru = self
+                .clean_lru
+                .lock()
+                .expect("AggregateOp clean_lru mutex poisoned");
+            for (dk, dv) in demand_loaded {
+                state.entries.insert(dk, dv);
+                clean_lru.push_back(dk);
+                if clean_lru.len() > MAX_CLEAN_LRU_CAPACITY {
+                    clean_lru.pop_front();
+                }
+            }
+        }
+
         let mut out_k: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_avg: Vec<f64> = Vec::with_capacity(transitions.len() * 2);
         let mut out_weights: Vec<i64> = Vec::with_capacity(transitions.len() * 2);
-        let mut dirty_keys = std::collections::HashSet::new();
-
-        for t in transitions {
+        for t in &transitions {
             if !t.changed {
                 continue;
             }
-
-            dirty_keys.insert(t.key);
 
             // Retract old aggregate row
             if let Some((old_sum, old_count)) = t.old_state {
@@ -818,34 +1064,88 @@ impl AggregateOp {
 
             // Insert new aggregate row
             if let Some((new_sum, new_count)) = t.new_state {
-                state.entries.insert(t.key, (new_sum, new_count));
                 let new_avg = avg_from_sum_count(new_sum, new_count).unwrap_or(0.0);
                 out_k.push(t.key);
                 out_sum.push(new_sum);
                 out_count.push(new_count);
                 out_avg.push(new_avg);
                 out_weights.push(1);
-            } else {
-                state.entries.remove(&t.key);
             }
         }
 
-        let mut dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        let mut dirty_keys_vec: Vec<i64> = transitions
+            .iter()
+            .filter(|transition| transition.changed)
+            .map(|transition| transition.key)
+            .collect();
         dirty_keys_vec.sort_unstable();
-        let mutations = state.encode_mutations_for_keys(self.op_id, &dirty_keys_vec);
+        let mut mutation_states: Vec<(i64, Option<(i64, i64)>)> = transitions
+            .iter()
+            .filter(|transition| transition.changed)
+            .map(|transition| (transition.key, transition.new_state))
+            .collect();
+        mutation_states.sort_unstable_by_key(|(key, _)| *key);
+        let mutations = mutation_states
+            .iter()
+            .map(|&(key, new_state)| encode_state_mutation(self.op_id, key, new_state))
+            .collect::<Vec<_>>();
         let logical_mutation_bytes = mutations.iter().map(|mutation| mutation.size_bytes()).sum();
+
+        // Build the fallible output before installing any planned state.
+        let output_zset = if out_k.is_empty() {
+            ArrowZSet::empty(output_schema())
+        } else {
+            let schema = output_schema();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(out_k)),
+                Arc::new(Int64Array::from(out_sum)),
+                Arc::new(Int64Array::from(out_count)),
+                Arc::new(Float64Array::from(out_avg)),
+            ];
+            let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+            ArrowZSet::try_new(data, out_weights)?
+        };
+
+        for transition in &transitions {
+            if !transition.changed {
+                continue;
+            }
+            if let Some(new_state) = transition.new_state {
+                state.entries.insert(transition.key, new_state);
+            } else {
+                state.entries.remove(&transition.key);
+            }
+        }
         let state_bytes = state.state_bytes() as usize;
 
-        self.dirty_keys
+        let mut dirty_guard = self
+            .dirty_keys
             .lock()
-            .expect("AggregateOp dirty-key mutex poisoned")
-            .extend(dirty_keys_vec.iter().copied());
+            .expect("AggregateOp dirty-key mutex poisoned");
+        dirty_guard.extend(dirty_keys_vec.iter().copied());
 
+        // Evict cold clean entries if over max_state_bytes
+        let limit = self.max_state_bytes.load(Ordering::Relaxed);
+        if limit > 0 && db_opt.is_some() {
+            let mut clean_lru = self
+                .clean_lru
+                .lock()
+                .expect("AggregateOp clean_lru mutex poisoned");
+            while state.state_bytes() as usize > limit && !clean_lru.is_empty() {
+                if let Some(cold_k) = clean_lru.pop_front() {
+                    if !dirty_guard.contains(&cold_k) {
+                        state.entries.remove(&cold_k);
+                    }
+                }
+            }
+        }
+
+        drop(dirty_guard);
         drop(state);
         debug!(
             op_id = self.op_id.0,
             input_rows = n,
-            output_rows = out_k.len(),
+            output_rows = output_zset.num_rows(),
             dirty_keys = dirty_keys_vec.len(),
             "AggregateOp: processed delta"
         );
@@ -865,20 +1165,6 @@ impl AggregateOp {
             started_at.elapsed(),
             0,
         );
-
-        let output_zset = if out_k.is_empty() {
-            ArrowZSet::empty(output_schema())
-        } else {
-            let schema = output_schema();
-            let cols: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from(out_k)),
-                Arc::new(Int64Array::from(out_sum)),
-                Arc::new(Int64Array::from(out_count)),
-                Arc::new(Float64Array::from(out_avg)),
-            ];
-            let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
-            ArrowZSet::new(data, out_weights)
-        };
 
         let metrics = rockstream_types::state_mutation::OperatorEpochMetrics {
             input_records: n,
@@ -938,6 +1224,7 @@ impl Operator for AggregateOp {
 
 /// Aggregate operator that splits one designated hot key into virtual buckets
 /// and combines the partial states back into the unsalted aggregate output.
+#[derive(Debug)]
 pub struct BucketedAggregateOp {
     combined: Mutex<HashMap<i64, (i64, i64)>>,
     partials: Mutex<HashMap<(i64, u16), (i64, i64)>>,
@@ -964,11 +1251,142 @@ impl BucketedAggregateOp {
         route_power_of_two_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
     }
 
+    pub fn live_groups(&self) -> usize {
+        self.combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned")
+            .len()
+    }
+
     pub fn live_partials(&self) -> usize {
         self.partials
             .lock()
             .expect("BucketedAggregateOp mutex poisoned")
             .len()
+    }
+
+    pub fn restore_from_entries(
+        &self,
+        entries: &[(bytes::Bytes, bytes::Bytes)],
+    ) -> Result<(), OpError> {
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
+        let mut local_combined = HashMap::new();
+        let mut local_partials = HashMap::new();
+
+        for (key, value) in entries {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if key.len() != prefix.len() + 8 && key.len() != prefix.len() + 10 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid key length",
+                    self.op_id.0
+                )));
+            }
+            let group_key_bytes: [u8; 8] = key[prefix.len()..prefix.len() + 8]
+                .try_into()
+                .map_err(|_| {
+                    OpError::internal(format!(
+                        "corrupt persisted bucketed aggregate state for operator {}: invalid group key",
+                        self.op_id.0
+                    ))
+                })?;
+            let group_key = decode_i64(&group_key_bytes).map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid group key",
+                    self.op_id.0
+                ))
+            })?;
+            if value.len() != 16 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid value length",
+                    self.op_id.0
+                )));
+            }
+            let sum_bytes: [u8; 8] = value[..8].try_into().map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid sum",
+                    self.op_id.0
+                ))
+            })?;
+            let count_bytes: [u8; 8] = value[8..16].try_into().map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid count",
+                    self.op_id.0
+                ))
+            })?;
+            let sum = decode_i64(&sum_bytes).map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid sum",
+                    self.op_id.0
+                ))
+            })?;
+            let count = decode_i64(&count_bytes).map_err(|_| {
+                OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: invalid count",
+                    self.op_id.0
+                ))
+            })?;
+            if count <= 0 {
+                return Err(OpError::internal(format!(
+                    "corrupt persisted bucketed aggregate state for operator {}: non-positive count",
+                    self.op_id.0
+                )));
+            }
+            if key.len() == prefix.len() + 10 {
+                let bucket_bytes: [u8; 2] = key[prefix.len() + 8..prefix.len() + 10]
+                    .try_into()
+                    .map_err(|_| {
+                        OpError::internal(format!(
+                            "corrupt persisted bucketed aggregate state for operator {}: invalid key length",
+                            self.op_id.0
+                        ))
+                    })?;
+                let bucket = u16::from_be_bytes(bucket_bytes);
+                local_partials.insert((group_key, bucket), (sum, count));
+            } else {
+                local_combined.insert(group_key, (sum, count));
+            }
+        }
+
+        for (&(group_key, _bucket), &(sum, count)) in local_partials.iter() {
+            if let Some((combined_sum, combined_count)) = local_combined.get_mut(&group_key) {
+                if *combined_count == 0 {
+                    *combined_sum = checked_add_i64(*combined_sum, sum)
+                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                    *combined_count = checked_add_i64(*combined_count, count)
+                        .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                    if *combined_count < 0 {
+                        return Err(OpError::invalid_multiplicity(group_key, *combined_count));
+                    }
+                }
+            } else {
+                let entry = local_combined.entry(group_key).or_insert((0, 0));
+                entry.0 = checked_add_i64(entry.0, sum)
+                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                entry.1 = checked_add_i64(entry.1, count)
+                    .map_err(|_| OpError::aggregate_overflow(group_key))?;
+                if entry.1 < 0 {
+                    return Err(OpError::invalid_multiplicity(group_key, entry.1));
+                }
+            }
+        }
+
+        let mut combined = self
+            .combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        let mut partials = self
+            .partials
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        *combined = local_combined;
+        *partials = local_partials;
+        Ok(())
+    }
+
+    pub fn restore(&self, entries: &[(bytes::Bytes, bytes::Bytes)]) -> Result<(), OpError> {
+        self.restore_from_entries(entries)
     }
 
     pub async fn load_from_storage(
@@ -978,59 +1396,17 @@ impl BucketedAggregateOp {
         bucket_count: u16,
     ) -> Result<Self, OpError> {
         let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
-        let (entries, _truncated) = db
-            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+        let (entries, truncated) = db
+            .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
             .await
             .map_err(OpError::storage)?;
+        if truncated {
+            return Err(OpError::internal(format!(
+                "bucketed aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
+            )));
+        }
         let op = Self::new(op_id, hot_key, bucket_count);
-        let mut combined = op
-            .combined
-            .lock()
-            .expect("BucketedAggregateOp mutex poisoned");
-        let mut partials = op
-            .partials
-            .lock()
-            .expect("BucketedAggregateOp mutex poisoned");
-        for (key, value) in &entries {
-            if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) || value.len() < 16 {
-                continue;
-            }
-            let Ok(group_key_bytes) = key[prefix.len()..prefix.len() + 8].try_into() else {
-                continue;
-            };
-            let Ok(sum_bytes) = value[..8].try_into() else {
-                continue;
-            };
-            let Ok(count_bytes) = value[8..16].try_into() else {
-                continue;
-            };
-            let group_key = i64::from_be_bytes(group_key_bytes);
-            let sum = i64::from_be_bytes(sum_bytes);
-            let count = i64::from_be_bytes(count_bytes);
-            if key.len() == prefix.len() + 10 {
-                let Ok(bucket_bytes) = key[prefix.len() + 8..prefix.len() + 10].try_into() else {
-                    continue;
-                };
-                let bucket = u16::from_be_bytes(bucket_bytes);
-                partials.insert((group_key, bucket), (sum, count));
-            } else {
-                combined.insert(group_key, (sum, count));
-            }
-        }
-        for (&(group_key, _bucket), &(sum, count)) in partials.iter() {
-            if let Some((combined_sum, combined_count)) = combined.get_mut(&group_key) {
-                if *combined_count == 0 {
-                    *combined_sum += sum;
-                    *combined_count += count;
-                }
-            } else {
-                let entry = combined.entry(group_key).or_insert((0, 0));
-                entry.0 += sum;
-                entry.1 += count;
-            }
-        }
-        drop(partials);
-        drop(combined);
+        op.restore_from_entries(&entries)?;
         Ok(op)
     }
 }
@@ -1098,28 +1474,26 @@ impl Operator for BucketedAggregateOp {
             }
 
             let (old_sum, old_count) = combined.get(&k).copied().unwrap_or((0, 0));
-            let old_state = (old_count != 0).then_some((old_sum, old_count));
+            let old_state = (old_count > 0).then_some((old_sum, old_count));
 
-            let new_sum = old_sum
-                .checked_add(
-                    v.checked_mul(w)
-                        .ok_or_else(|| OpError::aggregate_overflow(k))?,
-                )
-                .ok_or_else(|| OpError::aggregate_overflow(k))?;
-            let new_count = old_count + w;
+            let contribution = checked_mul_i64(v, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            let new_sum = checked_add_i64(old_sum, contribution)
+                .map_err(|_| OpError::aggregate_overflow(k))?;
+            let new_count =
+                checked_add_i64(old_count, w).map_err(|_| OpError::aggregate_overflow(k))?;
+            if new_count < 0 {
+                return Err(OpError::invalid_multiplicity(k, new_count));
+            }
 
             if k == self.hot_key && self.bucket_count > 1 {
                 let bucket = self.bucket_for(k, v);
                 let partial_key = (k, bucket);
                 let (partial_sum, partial_count) =
                     partials.get(&partial_key).copied().unwrap_or((0, 0));
-                let next_partial_sum = partial_sum
-                    .checked_add(
-                        v.checked_mul(w)
-                            .ok_or_else(|| OpError::aggregate_overflow(k))?,
-                    )
-                    .ok_or_else(|| OpError::aggregate_overflow(k))?;
-                let next_partial_count = partial_count + w;
+                let next_partial_sum = checked_add_i64(partial_sum, contribution)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
+                let next_partial_count = checked_add_i64(partial_count, w)
+                    .map_err(|_| OpError::aggregate_overflow(k))?;
                 if next_partial_count != 0 {
                     partials.insert(partial_key, (next_partial_sum, next_partial_count));
                 } else {
@@ -1127,7 +1501,7 @@ impl Operator for BucketedAggregateOp {
                 }
             }
 
-            let new_state = if new_count != 0 {
+            let new_state = if new_count > 0 {
                 combined.insert(k, (new_sum, new_count));
                 Some((new_sum, new_count))
             } else {
@@ -1196,7 +1570,7 @@ impl Operator for BucketedAggregateOp {
 /// Value: `epoch: u64` as 8 bytes big-endian.
 pub async fn persist_frontier(db: &ShardDb, epoch: u64) -> Result<(), OpError> {
     let key = ShardKeyEncoder::frontier_key();
-    let value = epoch.to_be_bytes();
+    let value = encode_u64(epoch);
     db.put(&key, &value).await.map_err(OpError::storage)
 }
 
@@ -1208,10 +1582,7 @@ pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
     let raw = db.get(&key).await.map_err(OpError::storage)?;
     match raw {
         None => Ok(None),
-        Some(bytes) if bytes.len() == 8 => {
-            let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-            Ok(Some(epoch))
-        }
+        Some(bytes) if bytes.len() == 8 => Ok(decode_u64(&bytes).ok()),
         Some(_) => Ok(None), // malformed — treat as absent
     }
 }
@@ -1266,10 +1637,15 @@ pub async fn persist_bucketed_agg_state(
     op: &BucketedAggregateOp,
 ) -> Result<(), OpError> {
     let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
-    let (existing, _truncated) = db
-        .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+    let (existing, truncated) = db
+        .scan_prefix_bounded(&prefix, MAX_AGGREGATE_RESTORE_BYTES)
         .await
         .map_err(OpError::storage)?;
+    if truncated {
+        return Err(OpError::internal(format!(
+            "bucketed aggregate state exceeds {MAX_AGGREGATE_RESTORE_BYTES} byte restore limit"
+        )));
+    }
 
     let wb = {
         let combined = op
@@ -1299,14 +1675,14 @@ pub async fn persist_bucketed_agg_state(
 
         for (&k, &(sum, count)) in combined.iter() {
             let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&sum.to_be_bytes());
-            value[8..].copy_from_slice(&count.to_be_bytes());
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
             wb.put(&bucketed_combined_key(op.op_id, k), &value);
         }
         for (&(k, bucket), &(sum, count)) in partials.iter() {
             let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&sum.to_be_bytes());
-            value[8..].copy_from_slice(&count.to_be_bytes());
+            value[..8].copy_from_slice(&encode_i64(sum));
+            value[8..].copy_from_slice(&encode_i64(count));
             wb.put(&bucketed_partial_key(op.op_id, k, bucket), &value);
         }
         wb
@@ -1318,11 +1694,11 @@ pub async fn persist_bucketed_agg_state(
     Ok(())
 }
 
-fn bucketed_combined_key(op_id: OperatorId, group_key: i64) -> Vec<u8> {
+pub fn bucketed_combined_key(op_id: OperatorId, group_key: i64) -> Vec<u8> {
     ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes())
 }
 
-fn bucketed_partial_key(op_id: OperatorId, group_key: i64, bucket: u16) -> Vec<u8> {
+pub fn bucketed_partial_key(op_id: OperatorId, group_key: i64, bucket: u16) -> Vec<u8> {
     let mut suffix = Vec::with_capacity(10);
     suffix.extend_from_slice(&group_key.to_be_bytes());
     suffix.extend_from_slice(&bucket.to_be_bytes());
@@ -1582,5 +1958,206 @@ mod tests {
         op.process_delta(make_batch(&[(3, 5, -1), (3, 7, -1)]))
             .unwrap();
         assert_eq!(op.live_groups(), 0);
+    }
+
+    #[test]
+    fn staging_overflow_leaves_the_existing_entry_unchanged() {
+        let mut staged = StagedEpochAggregator::with_limits(4, 256);
+        staged.ingest_delta(7, i64::MAX, 1).unwrap();
+        let before = staged.entries.clone();
+
+        assert!(matches!(
+            staged.ingest_delta(7, 0, i64::MAX),
+            Err(OpError::AggregateOverflow { group_key: 7, .. })
+        ));
+        assert_eq!(staged.entries, before);
+        assert_eq!(staged.order, vec![7]);
+        assert_eq!(staged.estimated_bytes(), 64);
+    }
+
+    #[test]
+    fn persisted_aggregate_corruption_fails_closed() {
+        let op_id = OperatorId(9);
+        let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &1i64.to_be_bytes());
+        let error = AggState::decode_from_entries(
+            &[(bytes::Bytes::from(key), bytes::Bytes::from_static(b"short"))],
+            op_id,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Storage error: key encoding error: RS-3616: corrupted recovery record: aggregate value must be exactly 16 bytes; next_steps: check disk space and object store connectivity"
+        );
+    }
+
+    #[test]
+    fn failed_later_transition_does_not_install_earlier_state() {
+        let mut initial = AggState::new();
+        initial.insert(1, (1, 1));
+        initial.insert(2, (i64::MAX, 1));
+        let op = AggregateOp::with_state(OperatorId(9), initial);
+
+        assert!(matches!(
+            op.process_delta(make_batch(&[(1, 1, 1), (2, 1, 1)])),
+            Err(OpError::AggregateOverflow { group_key: 2, .. })
+        ));
+        assert_eq!(op.live_groups(), 2);
+
+        let output = op.process_delta(make_batch(&[(1, 1, 1)])).unwrap();
+        assert_eq!(
+            extract_rows(&output),
+            vec![(1, 1, 1, 1.0, -1), (1, 2, 2, 1.0, 1)]
+        );
+    }
+
+    fn encode_bucketed_value(sum: i64, count: i64) -> bytes::Bytes {
+        let mut val = [0u8; 16];
+        val[..8].copy_from_slice(&encode_i64(sum));
+        val[8..16].copy_from_slice(&encode_i64(count));
+        bytes::Bytes::copy_from_slice(&val)
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_valid_entry_succeeds() {
+        let op_id = OperatorId(10);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let combined_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let combined_v = encode_bucketed_value(100, 5);
+        let partial_k = bytes::Bytes::from(bucketed_partial_key(op_id, 2, 1));
+        let partial_v = encode_bucketed_value(50, 2);
+
+        let entries = vec![(combined_k, combined_v), (partial_k, partial_v)];
+        op.restore_from_entries(&entries).unwrap();
+
+        assert_eq!(op.live_groups(), 2);
+        assert_eq!(op.live_partials(), 1);
+
+        // Alias check
+        let op2 = BucketedAggregateOp::new(op_id, 2, 4);
+        op2.restore(&entries).unwrap();
+        assert_eq!(op2.live_groups(), 2);
+        assert_eq!(op2.live_partials(), 1);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_one_valid_one_malformed_value_fails_closed() {
+        let op_id = OperatorId(11);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+        let malformed_k = bytes::Bytes::from(bucketed_combined_key(op_id, 2));
+        let malformed_v = bytes::Bytes::from_static(b"short_val");
+
+        let entries = vec![(valid_k, valid_v), (malformed_k, malformed_v)];
+        let error = op.restore_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 11: invalid value length; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_one_valid_one_malformed_key_fails_closed() {
+        let op_id = OperatorId(12);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+        let malformed_k = bytes::Bytes::from([prefix.as_slice(), b"short"].concat());
+        let malformed_v = encode_bucketed_value(50, 2);
+
+        let entries = vec![(valid_k, valid_v), (malformed_k, malformed_v)];
+        let error = op.restore_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 12: invalid key length; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_non_positive_count_fails_closed() {
+        let op_id = OperatorId(13);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+        let zero_count_k = bytes::Bytes::from(bucketed_combined_key(op_id, 2));
+        let zero_count_v = encode_bucketed_value(0, 0);
+
+        let entries = vec![
+            (valid_k.clone(), valid_v.clone()),
+            (zero_count_k.clone(), zero_count_v),
+        ];
+        let error = op.restore_from_entries(&entries).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 13: non-positive count; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+
+        // Negative count test
+        let neg_count_v = encode_bucketed_value(10, -3);
+        let entries_neg = vec![(valid_k, valid_v), (zero_count_k, neg_count_v)];
+        let error_neg = op.restore_from_entries(&entries_neg).unwrap_err();
+        assert_eq!(
+            error_neg.to_string(),
+            "[RS-0001] Internal error: corrupt persisted bucketed aggregate state for operator 13: non-positive count; next_steps: report this issue"
+        );
+        assert_eq!(op.live_groups(), 0);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_unrelated_out_of_namespace_key_ignored() {
+        let op_id = OperatorId(14);
+        let other_op_id = OperatorId(999);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        let valid_k = bytes::Bytes::from(bucketed_combined_key(op_id, 1));
+        let valid_v = encode_bucketed_value(100, 5);
+        let unrelated_k = bytes::Bytes::from(bucketed_combined_key(other_op_id, 99));
+        let unrelated_v = bytes::Bytes::from_static(b"completely_random_foreign_value");
+
+        let entries = vec![(valid_k, valid_v), (unrelated_k, unrelated_v)];
+        op.restore_from_entries(&entries).unwrap();
+
+        assert_eq!(op.live_groups(), 1);
+        assert_eq!(op.live_partials(), 0);
+    }
+
+    #[test]
+    fn bucketed_aggregate_restore_failure_leaves_prior_state_untouched() {
+        let op_id = OperatorId(15);
+        let op = BucketedAggregateOp::new(op_id, 2, 4);
+
+        // Initial valid state via process_delta
+        op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+            .unwrap();
+        assert_eq!(op.live_groups(), 2);
+
+        // Attempt restore with corrupted entry
+        let bad_k = bytes::Bytes::from(bucketed_combined_key(op_id, 3));
+        let bad_v = bytes::Bytes::from_static(b"bad_len");
+        let entries = vec![(bad_k, bad_v)];
+
+        assert!(op.restore_from_entries(&entries).is_err());
+
+        // Prior state must remain untouched
+        assert_eq!(op.live_groups(), 2);
+        let output = op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
+        assert_eq!(extract_rows(&output), vec![(1, 10, 1, 10.0, -1)]);
     }
 }

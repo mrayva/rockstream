@@ -1683,6 +1683,19 @@ fn encode_typed_field(
     datatype: &Type,
     val: Option<&str>,
 ) -> PgWireResult<()> {
+    encode_typed_field_with_format(encoder, datatype, val, None)
+}
+
+fn encode_typed_field_with_format(
+    encoder: &mut DataRowEncoder,
+    datatype: &Type,
+    val: Option<&str>,
+    format: Option<FieldFormat>,
+) -> PgWireResult<()> {
+    if *datatype == Type::NUMERIC && format == Some(FieldFormat::Text) {
+        return encoder.encode_field_with_type_and_format(&val, datatype, FieldFormat::Text);
+    }
+
     let encode_res = match *datatype {
         Type::INT2 => {
             let parsed = val.and_then(|s| s.parse::<i16>().ok());
@@ -1782,6 +1795,108 @@ fn encode_typed_field(
         _ => encoder.encode_field(&val),
     };
     encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))
+}
+
+/// Encode a single cell from an Arrow Array directly into a `DataRowEncoder`
+/// without allocating or splitting strings on the hot path (v0.67 Slice 3).
+fn encode_arrow_cell(
+    encoder: &mut DataRowEncoder,
+    datatype: &Type,
+    array: &arrow::array::ArrayRef,
+    row_idx: usize,
+    format: FieldFormat,
+) -> PgWireResult<()> {
+    if array.is_null(row_idx) {
+        return encode_typed_field_with_format(encoder, datatype, None, Some(format));
+    }
+    use arrow::array::*;
+    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::INT2 => encoder.encode_field(&(v as i16)),
+            Type::INT4 => encoder.encode_field(&(v as i32)),
+            Type::INT8 => encoder.encode_field(&v),
+            Type::FLOAT4 => encoder.encode_field(&(v as f32)),
+            Type::FLOAT8 => encoder.encode_field(&(v as f64)),
+            Type::BOOL => encoder.encode_field(&(v != 0)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::INT2 => encoder.encode_field(&(v as i16)),
+            Type::INT4 => encoder.encode_field(&v),
+            Type::INT8 => encoder.encode_field(&(v as i64)),
+            Type::FLOAT4 => encoder.encode_field(&(v as f32)),
+            Type::FLOAT8 => encoder.encode_field(&(v as f64)),
+            Type::BOOL => encoder.encode_field(&(v != 0)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::FLOAT4 => encoder.encode_field(&(v as f32)),
+            Type::FLOAT8 => encoder.encode_field(&v),
+            Type::INT8 => encoder.encode_field(&(v as i64)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::FLOAT4 => encoder.encode_field(&v),
+            Type::FLOAT8 => encoder.encode_field(&(v as f64)),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        let v = arr.value(row_idx);
+        let encode_res = match *datatype {
+            Type::BOOL => encoder.encode_field(&v),
+            _ => {
+                let s = v.to_string();
+                encoder.encode_field(&Some(s.as_str()))
+            }
+        };
+        return encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        return encode_typed_field_with_format(
+            encoder,
+            datatype,
+            Some(arr.value(row_idx)),
+            Some(format),
+        );
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return encode_typed_field_with_format(
+            encoder,
+            datatype,
+            Some(arr.value(row_idx)),
+            Some(format),
+        );
+    }
+    let s = datafusion::arrow::util::display::array_value_to_string(array.as_ref(), row_idx)
+        .unwrap_or_default();
+    encode_typed_field_with_format(encoder, datatype, Some(&s), Some(format))
 }
 
 #[derive(Debug, Clone)]
@@ -4345,16 +4460,19 @@ impl GatewayHandler {
             rockstream_connectors::PgLsn::from_offset_token(coordinator.runtime.committed_offset())
                 .map_err(source_backfill_error)?;
         let mut batch = rockstream_storage::WriteBatch::new();
+        let recovery_procedure =
+            format!("rockstream source rebuild <src> --table {}", relation.name);
         let blocked = BlockedRelationState {
             code: "RS-1002".to_string(),
             xid,
             relation,
             last_safe_lsn,
+            recovery_procedure: Some(recovery_procedure),
         };
         append_blocked_state(&mut batch, coordinator.connector_id, &blocked)?;
         shard_db.write_batch(batch).await?;
         shard_db.flush().await?;
-        coordinator.blocked_state = Some(blocked);
+        coordinator.block_relation(blocked);
         Err(GatewayError::QueryTimeExecutionFailed {
             detail: "RS-1002: incompatible upstream relation change blocked the pgoutput source"
                 .to_string(),
@@ -5155,6 +5273,14 @@ impl GatewayHandler {
         // Catalog stubs
         if let Some(catalog_resp) = self.catalog.handle_query(q, session_info) {
             return Some(Ok(vec![catalog_resp_to_response(catalog_resp)]));
+        }
+
+        // Unknown rockstream_catalog table returns RS-0002 configuration error
+        if ql.contains("from rockstream_catalog.") {
+            return Some(Ok(vec![diagnostic_error_response(
+                rockstream_types::error_code::RS_0002,
+                vec![("query".to_string(), q.to_string())],
+            )]));
         }
 
         // ── Slice 6: pg_stat_activity virtual table ────────────────────────────
@@ -7417,7 +7543,8 @@ impl GatewayHandler {
             .distributed_data_plane
             .as_ref()
             .filter(|_| self.catalog.get_view(view_name).is_some());
-        let raw_rows: Vec<Vec<u8>> = if let Some(distributed_data_plane) = distributed_data_plane {
+        let batches: Vec<RecordBatch> = if let Some(distributed_data_plane) = distributed_data_plane
+        {
             let snapshot = distributed_data_plane
                 .read_workload(WorkloadId(stable_name_id("workload", view_name)))
                 .await
@@ -7461,7 +7588,7 @@ impl GatewayHandler {
             if let Some(n) = limit {
                 rows.truncate(n);
             }
-            rows
+            stored_rows_to_batches(&self.catalog, view_name, &rows)?
         } else if let Some(shard_db) = &self.shard_db {
             let mut rows: Vec<Vec<u8>> = if let Some(view) = self.catalog.get_view(view_name) {
                 if view.op_id.is_some() {
@@ -7520,28 +7647,55 @@ impl GatewayHandler {
             if let Some(n) = limit {
                 rows.truncate(n);
             }
-            rows
+            stored_rows_to_batches(&self.catalog, view_name, &rows)?
         } else {
-            self.view_reader
-                .read_view(view_name, limit, ViewReadStrategy::HotOnly)
+            let mut batches = self
+                .view_reader
+                .read_view_batches(view_name, ViewReadStrategy::HotOnly)
                 .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            if let Some(n) = limit {
+                let mut remaining = n;
+                let mut truncated = Vec::new();
+                for b in batches {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if b.num_rows() <= remaining {
+                        remaining -= b.num_rows();
+                        truncated.push(b);
+                    } else {
+                        truncated.push(b.slice(0, remaining));
+                        remaining = 0;
+                    }
+                }
+                batches = truncated;
+            }
+            batches
         };
 
         let schema = Arc::new(schema_fields);
         let schema_ref = schema.clone();
-        let data_stream = stream::iter(raw_rows).map(move |raw: Vec<u8>| {
-            let mut encoder = DataRowEncoder::new(schema_ref.clone());
-            let row_str = String::from_utf8_lossy(&raw).into_owned();
-            let col_count = schema_ref.len();
-            let fields: Vec<&str> = row_str.split('\t').collect();
-            for i in 0..col_count {
-                let val = fields.get(i).copied().filter(|value| *value != r"\N");
-                let datatype = schema_ref[i].datatype();
-                encode_typed_field(&mut encoder, datatype, val)?;
+        let mut row_results = Vec::new();
+        for batch in &batches {
+            let num_rows = batch.num_rows();
+            let col_count = schema_ref.len().min(batch.num_columns());
+            for row_idx in 0..num_rows {
+                let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                for c in 0..col_count {
+                    let datatype = schema_ref[c].datatype();
+                    encode_arrow_cell(
+                        &mut encoder,
+                        datatype,
+                        batch.column(c),
+                        row_idx,
+                        schema_ref[c].format(),
+                    )?;
+                }
+                row_results.push(encoder.finish());
             }
-            encoder.finish()
-        });
+        }
+        let data_stream = stream::iter(row_results);
 
         Ok(vec![Response::Query(QueryResponse::new(
             schema,
@@ -8725,12 +8879,12 @@ impl GatewayHandler {
                 })
             {
                 return Ok(vec![create_source_error_response(format!(
-                    "[RS-4013] physical pgoutput slot is already owned by source '{owner}'"
+                    "[RS-4001] physical pgoutput slot is already owned by source '{owner}' [RS-4013]"
                 ))]);
             }
         }
 
-        if !self.catalog.add_source(entry) {
+        if !self.catalog.add_source(entry.clone()) {
             if parsed.if_not_exists {
                 return Ok(vec![Response::Execution(
                     Tag::new("CREATE SOURCE").with_rows(0),
@@ -8756,6 +8910,24 @@ impl GatewayHandler {
                 "create_source",
                 &parsed.name,
             ));
+        }
+
+        if let Some(shard_db) = &self.shard_db {
+            let record = rockstream_storage::catalog::SourceRecordV1::new(
+                rockstream_types::ids::SourceId(rockstream_storage::catalog::stable_name_id(
+                    "source",
+                    &entry.name,
+                )),
+                entry.name.clone(),
+                entry.source_type.clone(),
+                entry.table_name.clone(),
+                entry.options.clone(),
+                entry.format.clone(),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&record) {
+                let key = format!("catalog:source:v1:{}", entry.name);
+                let _ = shard_db.put(key.as_bytes(), &bytes).await;
+            }
         }
 
         Ok(vec![Response::Execution(
@@ -13833,6 +14005,11 @@ fn catalog_field_type(column: &str) -> Type {
 
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     match resp {
+        CatalogResponse::Error { message } => Response::Error(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "0A000".into(),
+            message,
+        ))),
         CatalogResponse::CommandComplete(tag) => Response::Execution(Tag::new(&tag)),
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
@@ -14784,14 +14961,13 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                                     .collect::<String>()
                             }
                         }),
-                    ArrowDataType::Decimal128(_precision, scale) => col
-                        .as_any()
-                        .downcast_ref::<datafusion::arrow::array::Decimal128Array>()
-                        .map(|a| {
-                            let val = a.value(row_idx);
-                            rust_decimal::Decimal::from_i128_with_scale(val, *scale as u32)
-                                .to_string()
-                        }),
+                    ArrowDataType::Decimal128(_, _) | ArrowDataType::Decimal256(_, _) => {
+                        datafusion::arrow::util::display::array_value_to_string(
+                            col.as_ref(),
+                            row_idx,
+                        )
+                        .ok()
+                    }
                     ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => col
                         .as_any()
                         .downcast_ref::<StringArray>()
@@ -14812,7 +14988,12 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
         let mut encoder = DataRowEncoder::new(schema_ref.clone());
         for (col_idx, val) in row_vals.iter().enumerate() {
             let datatype = schema_ref[col_idx].datatype();
-            encode_typed_field(&mut encoder, datatype, val.as_deref())?;
+            encode_typed_field_with_format(
+                &mut encoder,
+                datatype,
+                val.as_deref(),
+                Some(schema_ref[col_idx].format()),
+            )?;
         }
         encoder.finish()
     });
@@ -14856,6 +15037,57 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
         datafusion::arrow::datatypes::DataType::Utf8,
         true,
     )]))
+}
+
+fn stored_rows_to_batches(
+    catalog: &CatalogStubs,
+    relation_name: &str,
+    rows: &[Vec<u8>],
+) -> PgWireResult<Vec<RecordBatch>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns = catalog
+        .get_table(relation_name)
+        .map(|table| table.columns)
+        .or_else(|| catalog.get_view(relation_name).map(|view| view.columns))
+        .unwrap_or_default();
+    let has_decimal = columns
+        .iter()
+        .any(|column| column.data_type.to_ascii_lowercase().starts_with("decimal"));
+    if !has_decimal {
+        return crate::view_reader::tsv_rows_to_record_batches(rows)
+            .map_err(|error| PgWireError::ApiError(Box::new(error)));
+    }
+    let relation_schema = query_time_relation_schema(catalog, relation_name);
+    let schema = if columns
+        .iter()
+        .any(|column| column.data_type.eq_ignore_ascii_case("decimal"))
+    {
+        Arc::new(Schema::new(
+            relation_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let data_type = columns
+                        .get(index)
+                        .filter(|column| column.data_type.eq_ignore_ascii_case("decimal"))
+                        .map(|_| datafusion::arrow::datatypes::DataType::Utf8)
+                        .unwrap_or_else(|| field.data_type().clone());
+                    Field::new(field.name(), data_type, field.is_nullable())
+                })
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        relation_schema
+    };
+    let batch = tsv_to_record_batch(schema, rows).map_err(|error| {
+        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+            detail: format!("decode stored rows for '{relation_name}': {error}"),
+        }))
+    })?;
+    Ok(vec![batch])
 }
 
 fn full_row_pk(column_count: usize) -> Vec<usize> {
@@ -14903,6 +15135,9 @@ fn join_routing_columns(plan: &rockstream_plan::PlanNode) -> Option<BTreeMap<Str
             right_keys,
             ..
         } => {
+            if left_keys.len() != 1 || right_keys.len() != 1 {
+                return None;
+            }
             let left = source_routing_column(left, *left_keys.first()?)?;
             let right = source_routing_column(right, *right_keys.first()?)?;
             Some(BTreeMap::from([left, right]))
@@ -14924,6 +15159,9 @@ fn aggregate_routing(
         PlanNode::Aggregate {
             input, group_by, ..
         } => {
+            if group_by.len() != 1 {
+                return None;
+            }
             let Expr::Column(column) = group_by.first()? else {
                 return None;
             };
@@ -14941,26 +15179,11 @@ fn aggregate_routing(
     }
 }
 
-fn aggregate_merge_keys(plan: &rockstream_plan::PlanNode) -> Option<Vec<usize>> {
-    use rockstream_plan::PlanNode;
-    match plan {
-        PlanNode::Aggregate { group_by, .. } => Some((0..group_by.len()).collect()),
-        PlanNode::Filter { input, .. }
-        | PlanNode::Project { input, .. }
-        | PlanNode::Map { input, .. } => aggregate_merge_keys(input),
-        PlanNode::ViewSink { child, .. } => aggregate_merge_keys(child),
-        _ => None,
-    }
-}
-
 fn deployment_routing(
     plan: &rockstream_plan::PlanNode,
 ) -> Option<(BTreeMap<String, usize>, Vec<usize>)> {
-    if let Some(routing) = join_routing_columns(plan) {
-        Some((routing, aggregate_merge_keys(plan)?))
-    } else {
-        aggregate_routing(plan)
-    }
+    aggregate_routing(plan)
+        .or_else(|| join_routing_columns(plan).map(|routing| (routing, Vec::new())))
 }
 
 fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {
@@ -16357,9 +16580,12 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
         }
     }
 
-    if let Some(CatalogResponse::Rows { columns, .. }) =
-        catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default())
-    {
+    if let Some(columns) = catalog.describe_catalog_query(q).or_else(|| {
+        match catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default()) {
+            Some(CatalogResponse::Rows { columns, .. }) => Some(columns),
+            _ => None,
+        }
+    }) {
         return columns
             .iter()
             .map(|c| {
@@ -17253,7 +17479,7 @@ fn validate_typed_source_options(
     source_type: &str,
     options: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    if source_type != "postgres_cdc" && source_type != "http_webhook" {
+    if source_type != "postgres_cdc" && source_type != "http_webhook" && source_type != "kafka" {
         return Ok(());
     }
     for key in ["password", "token", "api_key", "authorization"] {
@@ -17263,18 +17489,64 @@ fn validate_typed_source_options(
             ));
         }
     }
-    let has_cred_ref = options.get("credential_ref").is_some_and(|s| !s.is_empty())
-        || options.get("secret").is_some_and(|s| !s.is_empty());
-    if !has_cred_ref {
-        return Err(format!(
-            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty secret or credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
-        ));
+    if source_type == "postgres_cdc" || source_type == "http_webhook" {
+        let has_cred_ref = options.get("credential_ref").is_some_and(|s| !s.is_empty())
+            || options.get("secret").is_some_and(|s| !s.is_empty());
+        if !has_cred_ref {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty secret or credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
     }
     if source_type == "postgres_cdc" {
         for key in ["publication", "slot"] {
             if options.get(key).is_none_or(String::is_empty) {
                 return Err(format!(
                     "[RS-4008] CREATE SOURCE type 'postgres_cdc' requires a non-empty {key}. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+        if let Some(policy) = options.get("snapshot_policy") {
+            if !matches!(policy.as_str(), "initial" | "never" | "always") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'snapshot_policy' must be initial|never|always; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+        if let Some(policy) = options.get("schema_policy") {
+            if !matches!(policy.as_str(), "strict" | "evolve" | "error") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'schema_policy' must be strict|evolve|error; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+    }
+    if source_type == "kafka" {
+        let bootstrap = options
+            .get("bootstrap_servers")
+            .or_else(|| options.get("bootstrap.servers"));
+        if bootstrap.is_none_or(String::is_empty) {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type 'kafka' requires a non-empty bootstrap_servers or bootstrap.servers. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
+        let topic = options.get("topic");
+        if topic.is_none_or(String::is_empty) {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type 'kafka' requires a non-empty topic. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
+        if let Some(policy) = options.get("offset_policy") {
+            if !matches!(policy.as_str(), "earliest" | "latest") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'offset_policy' must be earliest|latest; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+        if let Some(policy) = options.get("schema_policy") {
+            if !matches!(policy.as_str(), "strict" | "evolve" | "error") {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE option 'schema_policy' must be strict|evolve|error; found '{policy}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
                 ));
             }
         }

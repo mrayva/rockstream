@@ -21,6 +21,9 @@ use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 use rockstream_types::workload::WorkloadDef;
 use serde::{Deserialize, Serialize};
 
+/// Maximum rows returned by catalog system table scans (v0.71 V071-08 / §4.8).
+pub const MAX_CATALOG_SCAN_ROWS: usize = 1000;
+
 /// Session context passed to catalog query handlers.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -386,6 +389,48 @@ pub struct CatalogCheckpointEntry {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogShardEntry {
+    pub shard_id: u64,
+    pub view_id: String,
+    pub worker_id: String,
+    pub state: String,
+    pub frontier: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogOperationEntry {
+    pub operation_id: String,
+    pub kind: String,
+    pub target: String,
+    pub phase: String,
+    pub progress_pct: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogNamespaceEntry {
+    pub name: String,
+    pub owner: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogTableEntry {
+    pub namespace: String,
+    pub name: String,
+    pub schema: String,
+    pub format: String,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogWorkloadEntry {
+    pub workload_id: String,
+    pub name: String,
+    pub memory_limit: String,
+    pub priority: String,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -417,6 +462,16 @@ struct CatalogStubsInner {
     nodes: Vec<CatalogNodeEntry>,
     /// Recorded checkpoints.
     checkpoints: Vec<CatalogCheckpointEntry>,
+    /// Registered shards.
+    shards: Vec<CatalogShardEntry>,
+    /// Registered operations.
+    operations: Vec<CatalogOperationEntry>,
+    /// Registered namespaces.
+    namespaces: Vec<CatalogNamespaceEntry>,
+    /// Explicit catalog table entries.
+    catalog_table_entries: Vec<CatalogTableEntry>,
+    /// Explicit catalog workload entries.
+    catalog_workload_entries: Vec<CatalogWorkloadEntry>,
 }
 
 use rockstream_types::explain::ArrangementSharingInfo;
@@ -966,6 +1021,142 @@ impl CatalogStubs {
         }
     }
 
+    pub fn add_shard(&self, shard: CatalogShardEntry) {
+        self.inner.write().unwrap().shards.push(shard);
+    }
+
+    pub fn list_shards(&self) -> Vec<CatalogShardEntry> {
+        let shards = self.inner.read().unwrap().shards.clone();
+        if shards.is_empty() {
+            vec![CatalogShardEntry {
+                shard_id: 1,
+                view_id: "default_view".to_string(),
+                worker_id: "worker-0".to_string(),
+                state: "READY".to_string(),
+                frontier: 0,
+            }]
+        } else {
+            shards
+        }
+    }
+
+    pub fn add_operation(&self, operation: CatalogOperationEntry) {
+        self.inner.write().unwrap().operations.push(operation);
+    }
+
+    pub fn list_operations(&self) -> Vec<CatalogOperationEntry> {
+        let ops = self.inner.read().unwrap().operations.clone();
+        if ops.is_empty() {
+            vec![CatalogOperationEntry {
+                operation_id: "op-bootstrap-0".to_string(),
+                kind: "bootstrap".to_string(),
+                target: "system".to_string(),
+                phase: "COMPLETED".to_string(),
+                progress_pct: 100,
+            }]
+        } else {
+            ops
+        }
+    }
+
+    pub fn add_namespace(&self, namespace: CatalogNamespaceEntry) {
+        self.inner.write().unwrap().namespaces.push(namespace);
+    }
+
+    pub fn list_namespaces(&self) -> Vec<CatalogNamespaceEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.namespaces.is_empty() {
+            return inner.namespaces.clone();
+        }
+        let mut res = vec![CatalogNamespaceEntry {
+            name: "public".to_string(),
+            owner: "rockstream".to_string(),
+            created_at: "2026-01-01 00:00:00+00".to_string(),
+        }];
+        for schema in &inner.schemas {
+            if schema != "public" {
+                res.push(CatalogNamespaceEntry {
+                    name: schema.clone(),
+                    owner: "rockstream".to_string(),
+                    created_at: "2026-01-01 00:00:00+00".to_string(),
+                });
+            }
+        }
+        res
+    }
+
+    pub fn add_catalog_table_entry(&self, entry: CatalogTableEntry) {
+        self.inner
+            .write()
+            .unwrap()
+            .catalog_table_entries
+            .push(entry);
+    }
+
+    pub fn list_catalog_table_entries(&self) -> Vec<CatalogTableEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.catalog_table_entries.is_empty() {
+            return inner.catalog_table_entries.clone();
+        }
+        if inner.tables.is_empty() {
+            return vec![CatalogTableEntry {
+                namespace: "public".to_string(),
+                name: "system_info".to_string(),
+                schema: "default".to_string(),
+                format: "row".to_string(),
+                row_count: 0,
+            }];
+        }
+        inner
+            .tables
+            .values()
+            .map(|t| CatalogTableEntry {
+                namespace: "public".to_string(),
+                name: t.name.clone(),
+                schema: "default".to_string(),
+                format: "row".to_string(),
+                row_count: 0,
+            })
+            .collect()
+    }
+
+    pub fn add_catalog_workload_entry(&self, entry: CatalogWorkloadEntry) {
+        self.inner
+            .write()
+            .unwrap()
+            .catalog_workload_entries
+            .push(entry);
+    }
+
+    pub fn list_catalog_workload_entries(&self) -> Vec<CatalogWorkloadEntry> {
+        let inner = self.inner.read().unwrap();
+        if !inner.catalog_workload_entries.is_empty() {
+            return inner.catalog_workload_entries.clone();
+        }
+        if inner.workloads.is_empty() {
+            return vec![CatalogWorkloadEntry {
+                workload_id: "wl_default".to_string(),
+                name: "default".to_string(),
+                memory_limit: "unlimited".to_string(),
+                priority: "Normal".to_string(),
+            }];
+        }
+        inner
+            .workloads
+            .values()
+            .map(|w| CatalogWorkloadEntry {
+                workload_id: format!("wl_{}", w.name),
+                name: w.name.clone(),
+                memory_limit: w
+                    .memory_limit
+                    .as_ref()
+                    .map(|l| format!("{:?}", l))
+                    .unwrap_or_else(|| "unlimited".to_string()),
+                priority: format!("{:?}", w.priority),
+            })
+            .collect()
+    }
+
     pub fn add_workload(&self, workload: WorkloadDef) -> bool {
         let mut inner = self.inner.write().unwrap();
         if inner.workloads.contains_key(&workload.name) {
@@ -1197,13 +1388,18 @@ impl CatalogStubs {
             return false;
         }
         inner.schemas.insert(name.to_string());
+        drop(inner);
+        self.invalidate_projection_caches();
         true
     }
 
     /// Remove a schema from the catalog (DROP SCHEMA).
     pub fn remove_schema(&self, name: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
-        inner.schemas.remove(name)
+        let removed = inner.schemas.remove(name);
+        drop(inner);
+        self.invalidate_projection_caches();
+        removed
     }
 
     /// Check if a schema exists in the catalog.
@@ -2002,6 +2198,20 @@ impl CatalogStubs {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if let Ok(statements) =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, q)
+        {
+            if let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() {
+                if let Some(response) = crate::catalog_query::execute(
+                    query,
+                    &|name| self.pg_catalog_rows(name, session_info),
+                    session_info,
+                ) {
+                    return Some(response);
+                }
+            }
+        }
+
         // Prisma's PostgreSQL probe combines schema existence, server version,
         // and the numeric version setting in one extended query.
         if ql.contains("select exists(")
@@ -2067,63 +2277,6 @@ impl CatalogStubs {
 
         let requested_cols = parse_select_columns(query);
 
-        // pg_catalog queries
-        if ql.contains("pg_attribute") {
-            return Some(self.pg_attribute(&requested_cols));
-        }
-        if ql.contains("pg_constraint") {
-            return Some(self.pg_constraint(&requested_cols));
-        }
-        if ql.contains("pg_index") {
-            return Some(self.pg_index(&requested_cols));
-        }
-        if ql.contains("pg_description") {
-            return Some(self.pg_description(&requested_cols));
-        }
-        if ql.contains("pg_enum") {
-            return Some(self.pg_enum(&requested_cols));
-        }
-        if ql.contains("pg_views") {
-            return Some(self.pg_views(&requested_cols));
-        }
-        if ql.contains("pg_proc") {
-            return Some(self.pg_proc(&requested_cols));
-        }
-        if ql.contains("pg_type") {
-            return Some(self.pg_type(&requested_cols));
-        }
-        if ql.contains("pg_class") {
-            return Some(self.pg_class(&requested_cols));
-        }
-        if ql.contains("pg_roles") {
-            return Some(self.pg_roles(&session_info.principal_name, &requested_cols));
-        }
-        if ql.contains("pg_user") {
-            return Some(self.pg_user(&session_info.principal_name, &requested_cols));
-        }
-        if ql.contains("pg_namespace") {
-            return Some(self.pg_namespace(&requested_cols));
-        }
-        if ql.contains("pg_tables") {
-            return Some(self.pg_tables(&requested_cols));
-        }
-
-        // information_schema
-        if ql.contains("information_schema.tables") {
-            return Some(self.information_schema_tables(&requested_cols));
-        }
-        if ql.contains("information_schema.columns") {
-            return Some(self.information_schema_columns(&requested_cols));
-        }
-        if ql.contains("information_schema.key_column_usage") || ql.contains("key_column_usage") {
-            return Some(self.key_column_usage(&requested_cols));
-        }
-        if ql.contains("information_schema.referential_constraints")
-            || ql.contains("referential_constraints")
-        {
-            return Some(self.referential_constraints(&requested_cols));
-        }
-
         if ql.contains("rockstream_catalog.view_resource_usage") {
             return Some(self.view_resource_usage(&requested_cols));
         }
@@ -2150,6 +2303,21 @@ impl CatalogStubs {
         }
         if ql.contains("rockstream_catalog.checkpoints") {
             return Some(self.catalog_checkpoints_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.shards") {
+            return Some(self.catalog_shards_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.operations") {
+            return Some(self.catalog_operations_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.namespaces") {
+            return Some(self.catalog_namespaces_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.tables") {
+            return Some(self.catalog_tables_response(query, &requested_cols));
+        }
+        if ql.contains("rockstream_catalog.workloads") {
+            return Some(self.catalog_workloads_response(query, &requested_cols));
         }
         if ql.contains("rockstream_catalog.dead_letter_queue")
             || (ql.contains("dead_letter_queue") && !ql.starts_with("alter "))
@@ -2860,6 +3028,94 @@ impl CatalogStubs {
         None
     }
 
+    pub(crate) fn describe_catalog_query(&self, sql: &str) -> Option<Vec<String>> {
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .ok()?;
+        let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() else {
+            return None;
+        };
+        let mut query = query.clone();
+        query.limit_clause = None;
+        let session = SessionInfo::default();
+        let response = crate::catalog_query::execute(
+            &query,
+            &|name| match self.pg_catalog_rows(name, &session)? {
+                CatalogResponse::Rows { columns, .. } => Some(CatalogResponse::Rows {
+                    columns,
+                    rows: vec![],
+                }),
+                _ => None,
+            },
+            &session,
+        )?;
+        match response {
+            CatalogResponse::Rows { columns, .. } => Some(columns),
+            _ => None,
+        }
+    }
+
+    fn pg_catalog_rows(&self, relation: &str, session: &SessionInfo) -> Option<CatalogResponse> {
+        let relation = relation.to_lowercase().replace('"', "");
+        let name = relation.strip_prefix("pg_catalog.").unwrap_or(&relation);
+        let fields = match name {
+            "pg_class" => "oid relname relnamespace relkind relowner relchecks relhasindex relhasrules relhastriggers relrowsecurity relforcerowsecurity relhasoids relispartition reltablespace reloftype relpersistence relreplident relam reltoastrelid relacl definition",
+            "pg_attribute" => "attrelid nspname relname attname atttypid attnotnull atttypmod attlen typtypmod attnum attidentity attgenerated adsrc description typbasetype typtype format_type attisdropped atthasdef attcollation attacl",
+            "pg_namespace" => "oid nspname nspowner",
+            "pg_type" => "oid typname typlen typarray typnamespace typtype typrelid typelem typcollation format_type",
+            "pg_proc" => "oid proname pronamespace prorettype proargtypes prokind",
+            "pg_index" => "indexrelid indrelid indisunique indisprimary indisclustered indisvalid indisreplident indkey indexdef",
+            "pg_roles" => "oid rolname rolsuper rolinherit rolcreaterole rolcreatedb rolcanlogin rolconnlimit rolreplication rolbypassrls rolvaliduntil",
+            "pg_database" => "oid datname datdba encoding datcollate datctype datacl datistemplate datallowconn",
+            "pg_am" => "oid amname",
+            "pg_policy" => "oid polname polrelid polpermissive polroles polqual polwithcheck polcmd",
+            "pg_inherits" => "inhrelid inhparent inhseqno inhdetachpending",
+            "pg_attrdef" => "oid adrelid adnum adbin",
+            "pg_collation" => "oid collname",
+            "pg_auth_members" => "roleid member grantor admin_option",
+            "pg_tables" => return Some(self.pg_tables(&[])),
+            "pg_views" => return Some(self.pg_views(&[])),
+            "pg_constraint" => return Some(self.pg_constraint(&[])),
+            "pg_description" => return Some(self.pg_description(&[])),
+            "pg_enum" => return Some(self.pg_enum(&[])),
+            "pg_user" => return Some(self.pg_user(&session.principal_name, &[])),
+            "information_schema.tables" => return Some(self.information_schema_tables(&[])),
+            "information_schema.columns" => return Some(self.information_schema_columns(&[])),
+            "information_schema.key_column_usage" => return Some(self.key_column_usage(&[])),
+            "information_schema.referential_constraints" => return Some(self.referential_constraints(&[])),
+            "pg_statistic_ext" | "pg_publication" | "pg_publication_rel" | "pg_rewrite" | "pg_tablespace" => "",
+            _ => return None,
+        };
+        let columns: Vec<String> = fields.split_whitespace().map(str::to_string).collect();
+        Some(match name {
+            "pg_class" => self.pg_class(&columns),
+            "pg_attribute" => self.pg_attribute(&columns),
+            "pg_namespace" => self.pg_namespace(&columns),
+            "pg_type" => self.pg_type(&columns),
+            "pg_proc" => self.pg_proc(&columns),
+            "pg_index" => self.pg_index(&columns),
+            "pg_roles" => self.pg_roles(&session.principal_name, &columns),
+            "pg_database" => CatalogResponse::rows(
+                columns,
+                vec![vec![
+                    Some(view_oid("rockstream").to_string()),
+                    Some("rockstream".into()),
+                    Some(view_oid("rockstream").to_string()),
+                    Some("6".into()),
+                    Some("C".into()),
+                    Some("C".into()),
+                    None,
+                    Some("f".into()),
+                    Some("t".into()),
+                ]],
+            ),
+            "pg_am" => {
+                CatalogResponse::rows(columns, vec![vec![Some("2".into()), Some("heap".into())]])
+            }
+            _ => CatalogResponse::rows(columns, vec![]),
+        })
+    }
+
     // ── pg_catalog.pg_tables ──────────────────────────────────────────────────
 
     fn pg_tables(&self, requested_cols: &[String]) -> CatalogResponse {
@@ -2882,13 +3138,21 @@ impl CatalogStubs {
         };
         let mut rows = Vec::new();
         for t in self.list_tables() {
+            let (schema, name) = catalog_relation_name(&t.name, "public");
             let mut row = Vec::new();
             for c in &cols {
                 let val = match c.as_str() {
-                    "schemaname" => Some("public".to_string()),
-                    "tablename" => Some(t.name.clone()),
+                    "schemaname" => Some(schema.clone()),
+                    "tablename" => Some(name.clone()),
                     "tableowner" => Some("rockstream".to_string()),
-                    "hasindexes" => Some("f".to_string()),
+                    "hasindexes" => Some(
+                        if self.list_indexes().iter().any(|i| i.table == t.name) {
+                            "t"
+                        } else {
+                            "f"
+                        }
+                        .into(),
+                    ),
                     "hasrules" => Some("f".to_string()),
                     "hastriggers" => Some("f".to_string()),
                     "rowsecurity" => Some("f".to_string()),
@@ -2925,11 +3189,12 @@ impl CatalogStubs {
         };
         let mut rows = Vec::new();
         for v in self.list_views() {
+            let (schema, name) = catalog_relation_name(&v.name, &v.namespace);
             let mut row = Vec::new();
             for c in &cols {
                 let val = match c.as_str() {
-                    "schemaname" => Some("public".to_string()),
-                    "viewname" => Some(v.name.clone()),
+                    "schemaname" => Some(schema.clone()),
+                    "viewname" => Some(name.clone()),
                     "viewowner" => Some("rockstream".to_string()),
                     "definition" => Some(v.sql.clone()),
                     _ => Some("".to_string()),
@@ -2949,68 +3214,63 @@ impl CatalogStubs {
     // ── pg_catalog.pg_class ───────────────────────────────────────────────────
 
     fn pg_class(&self, requested_cols: &[String]) -> CatalogResponse {
-        let key = ("pg_class".to_string(), requested_cols.to_vec());
-        if let Some(cached) = self.projection_cache.read().unwrap().get(&key) {
-            return cached.clone();
-        }
-        let cols = if requested_cols.is_empty() || requested_cols.iter().any(|c| c == "*") {
-            vec![
-                "oid".to_string(),
-                "relname".to_string(),
-                "relnamespace".to_string(),
-                "relkind".to_string(),
-            ]
-        } else {
-            requested_cols.to_vec()
-        };
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let cols = requested_cols.to_vec();
+        let indexes = self.list_indexes();
         let mut items = Vec::new();
         for t in self.list_tables() {
-            items.push((view_oid(&t.name), t.name.clone(), "r"));
+            items.push((t.name, "r", "public".to_string(), None));
         }
         for v in self.list_views() {
-            items.push((view_oid(&v.name), v.name.clone(), "v"));
+            items.push((v.name, "v", v.namespace, Some(v.sql)));
         }
-        for idx in self.list_indexes() {
-            items.push((view_oid(&idx.name), idx.name.clone(), "i"));
+        for idx in &indexes {
+            let (schema, _) = catalog_relation_name(&idx.table, "public");
+            items.push((idx.name.clone(), "i", schema, None));
         }
-        for (oid, name, kind) in items {
-            let mut row = Vec::new();
-            for c in &cols {
-                let val = match c.as_str() {
-                    "oid" => Some(oid.to_string()),
-                    "relname" => Some(name.clone()),
-                    "table_name" => Some(name.clone()),
-                    "relnamespace" => Some("2200".to_string()),
-                    "namespace" => Some("public".to_string()),
-                    "relkind" => Some(kind.to_string()),
-                    "relhasrules" => Some("f".to_string()),
-                    "relhastriggers" => Some("f".to_string()),
-                    "relispartition" => Some("f".to_string()),
-                    "is_partition" | "has_subclass" | "has_row_level_security" => {
-                        Some("f".to_string())
-                    }
-                    "reloptions" | "description" => None,
-                    _ => {
-                        if c.contains("id") {
-                            Some("0".to_string())
-                        } else if c.contains("has") || c.contains("is") {
-                            Some("f".to_string())
-                        } else {
-                            Some("".to_string())
+        let rows = items
+            .into_iter()
+            .map(|(full_name, kind, namespace, definition)| {
+                let oid = view_oid(&full_name);
+                let (schema, name) = catalog_relation_name(&full_name, &namespace);
+                cols.iter()
+                    .map(|c| match c.as_str() {
+                        "oid" => Some(oid.to_string()),
+                        "relname" | "table_name" => Some(name.clone()),
+                        "relnamespace" => Some(catalog_namespace_oid(&schema).to_string()),
+                        "namespace" | "nspname" => Some(schema.clone()),
+                        "relowner" => Some(view_oid("rockstream").to_string()),
+                        "tableowner" => Some("rockstream".into()),
+                        "relkind" => Some(kind.into()),
+                        "relhasindex" => Some(
+                            if indexes.iter().any(|i| i.table == full_name) {
+                                "t"
+                            } else {
+                                "f"
+                            }
+                            .into(),
+                        ),
+                        "relhasrules"
+                        | "relhastriggers"
+                        | "relispartition"
+                        | "relrowsecurity"
+                        | "relforcerowsecurity"
+                        | "relhasoids"
+                        | "is_partition"
+                        | "has_subclass"
+                        | "has_row_level_security" => Some("f".into()),
+                        "relchecks" | "reltablespace" | "reloftype" | "reltoastrelid" => {
+                            Some("0".into())
                         }
-                    }
-                };
-                row.push(val);
-            }
-            rows.push(row);
-        }
-        let resp = CatalogResponse::rows(cols, rows);
-        self.projection_cache
-            .write()
-            .unwrap()
-            .insert(key, resp.clone());
-        resp
+                        "relam" => Some(if kind == "r" { "2" } else { "0" }.into()),
+                        "relpersistence" => Some("p".into()),
+                        "relreplident" => Some("d".into()),
+                        "definition" => definition.clone(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
     }
 
     // ── pg_catalog.pg_attribute ──────────────────────────────────────────────
@@ -3042,10 +3302,12 @@ impl CatalogStubs {
         let mut items = Vec::new();
         for t in self.list_tables() {
             let oid = view_oid(&t.name);
+            let (schema, name) = catalog_relation_name(&t.name, "public");
             for (i, col) in t.columns.iter().enumerate() {
                 items.push((
                     oid,
-                    t.name.clone(),
+                    name.clone(),
+                    schema.clone(),
                     col.name.clone(),
                     arrow_type_to_pg_oid(&col.data_type),
                     arrow_type_to_pg_data_type(&col.data_type),
@@ -3055,10 +3317,12 @@ impl CatalogStubs {
         }
         for v in self.list_views() {
             let oid = view_oid(&v.name);
+            let (schema, name) = catalog_relation_name(&v.name, &v.namespace);
             for (i, col) in v.columns.iter().enumerate() {
                 items.push((
                     oid,
-                    v.name.clone(),
+                    name.clone(),
+                    schema.clone(),
                     col.name.clone(),
                     arrow_type_to_pg_oid(&col.data_type),
                     arrow_type_to_pg_data_type(&col.data_type),
@@ -3066,7 +3330,7 @@ impl CatalogStubs {
                 ));
             }
         }
-        for (attrelid, relname, attname, atttypid, format_type, attnum) in items {
+        for (attrelid, relname, schema, attname, atttypid, format_type, attnum) in items {
             let mut row = Vec::new();
             for c in &cols {
                 let val = match c.as_str() {
@@ -3077,13 +3341,17 @@ impl CatalogStubs {
                     "format_type" => Some(format_type.to_string()),
                     "attnum" => Some(attnum.to_string()),
                     "attnotnull" | "not_null" => Some("f".to_string()),
-                    "atthasdef" | "default" => None,
-                    "attidentity" | "identity_options" => None,
+                    "atthasdef" => Some("f".into()),
+                    "default" => None,
+                    "attidentity" => Some("".into()),
+                    "identity_options" => None,
                     "attgenerated" | "generated" => Some("".to_string()),
                     "comment" => None,
                     "collation" => None,
                     "is_dropped" | "attisdropped" => Some("f".to_string()),
-                    "nspname" => Some("public".to_string()),
+                    "nspname" => Some(schema.clone()),
+                    "attcollation" => Some("0".into()),
+                    "attacl" => None,
                     "atttypmod" => Some("-1".to_string()),
                     "attlen" => Some("-1".to_string()),
                     "typtypmod" => Some("-1".to_string()),
@@ -3111,22 +3379,34 @@ impl CatalogStubs {
     // ── pg_catalog.pg_namespace ──────────────────────────────────────────────
 
     fn pg_namespace(&self, requested_cols: &[String]) -> CatalogResponse {
-        let cols = if requested_cols.is_empty() {
-            vec!["oid".to_string(), "nspname".to_string()]
-        } else {
-            requested_cols.to_vec()
-        };
-        let mut row = Vec::new();
-        for c in &cols {
-            let val = match c.as_str() {
-                "oid" => Some("2200".to_string()),
-                "nspname" => Some("public".to_string()),
-                "namespace_name" => Some("public".to_string()),
-                _ => Some("".to_string()),
-            };
-            row.push(val);
+        let mut names = std::collections::BTreeSet::from([
+            "public".to_string(),
+            "pg_catalog".to_string(),
+            "information_schema".to_string(),
+        ]);
+        names.extend(self.inner.read().unwrap().schemas.iter().cloned());
+        names.extend(self.list_namespaces().into_iter().map(|n| n.name));
+        for view in self.list_views() {
+            names.insert(catalog_relation_name(&view.name, &view.namespace).0);
         }
-        CatalogResponse::rows(cols, vec![row])
+        for table in self.list_tables() {
+            names.insert(catalog_relation_name(&table.name, "public").0);
+        }
+        let rows = names
+            .into_iter()
+            .map(|name| {
+                requested_cols
+                    .iter()
+                    .map(|c| match c.as_str() {
+                        "oid" => Some(catalog_namespace_oid(&name).to_string()),
+                        "nspname" | "namespace_name" => Some(name.clone()),
+                        "nspowner" => Some(view_oid("rockstream").to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(requested_cols.to_vec(), rows)
     }
 
     // ── pg_catalog.pg_type ───────────────────────────────────────────────────
@@ -3180,6 +3460,42 @@ impl CatalogStubs {
                     "typnamespace" => Some(typnamespace.to_string()),
                     "typtype" => Some(typtype.to_string()),
                     "attype" => Some(name.to_string()),
+                    "typrelid" | "typcollation" => Some("0".into()),
+                    "typelem" => Some(
+                        match name {
+                            "_int4" => PG_OID_INT4,
+                            "_int8" => PG_OID_INT8,
+                            "_text" => PG_OID_TEXT,
+                            "_float8" => PG_OID_FLOAT8,
+                            "_bool" => PG_OID_BOOL,
+                            "_uuid" => PG_OID_UUID,
+                            _ => 0,
+                        }
+                        .to_string(),
+                    ),
+                    "format_type" => Some(
+                        match name {
+                            "int2" => "smallint",
+                            "int4" => "integer",
+                            "int8" => "bigint",
+                            "float4" => "real",
+                            "float8" => "double precision",
+                            "bool" => "boolean",
+                            "varchar" => "character varying",
+                            "bpchar" => "character",
+                            "timestamp" => "timestamp without time zone",
+                            "timestamptz" => "timestamp with time zone",
+                            "time" => "time without time zone",
+                            "_int4" => "integer[]",
+                            "_int8" => "bigint[]",
+                            "_text" => "text[]",
+                            "_float8" => "double precision[]",
+                            "_bool" => "boolean[]",
+                            "_uuid" => "uuid[]",
+                            _ => name,
+                        }
+                        .into(),
+                    ),
                     "typbasetype" => Some("0".to_string()),
                     "typtypmod" => Some("-1".to_string()),
                     _ => {
@@ -3220,17 +3536,17 @@ impl CatalogStubs {
         let mut rows = Vec::new();
         let mut items = Vec::new();
         for t in self.list_tables() {
-            items.push((t.name.clone(), "BASE TABLE"));
+            items.push((catalog_relation_name(&t.name, "public"), "BASE TABLE"));
         }
         for v in self.list_views() {
-            items.push((v.name.clone(), "VIEW"));
+            items.push((catalog_relation_name(&v.name, &v.namespace), "VIEW"));
         }
-        for (name, table_type) in items {
+        for ((schema, name), table_type) in items {
             let mut row = Vec::new();
             for c in &cols {
                 let val = match c.as_str() {
                     "table_catalog" => Some("rockstream".to_string()),
-                    "table_schema" => Some("public".to_string()),
+                    "table_schema" => Some(schema.clone()),
                     "table_name" => Some(name.clone()),
                     "table_type" => Some(table_type.to_string()),
                     _ => Some("".to_string()),
@@ -3274,7 +3590,7 @@ impl CatalogStubs {
         for t in self.list_tables() {
             for (i, col) in t.columns.iter().enumerate() {
                 items.push((
-                    t.name.clone(),
+                    catalog_relation_name(&t.name, "public"),
                     col.name.clone(),
                     i + 1,
                     arrow_type_to_pg_data_type(&col.data_type),
@@ -3284,19 +3600,19 @@ impl CatalogStubs {
         for v in self.list_views() {
             for (i, col) in v.columns.iter().enumerate() {
                 items.push((
-                    v.name.clone(),
+                    catalog_relation_name(&v.name, &v.namespace),
                     col.name.clone(),
                     i + 1,
                     arrow_type_to_pg_data_type(&col.data_type),
                 ));
             }
         }
-        for (table_name, column_name, pos, data_type) in items {
+        for ((schema, table_name), column_name, pos, data_type) in items {
             let mut row = Vec::new();
             for c in &cols {
                 let val = match c.as_str() {
                     "table_catalog" => Some("rockstream".to_string()),
-                    "table_schema" => Some("public".to_string()),
+                    "table_schema" => Some(schema.clone()),
                     "table_name" => Some(table_name.clone()),
                     "column_name" => Some(column_name.clone()),
                     "ordinal_position" => Some(pos.to_string()),
@@ -3419,7 +3735,22 @@ impl CatalogStubs {
                     "indrelid" => Some(indrelid.clone()),
                     "indisunique" => Some("f".to_string()),
                     "indisprimary" => Some("f".to_string()),
+                    "indisclustered" | "indisreplident" => Some("f".into()),
+                    "indisvalid" => Some(
+                        if idx.state == CatalogIndexState::Ready {
+                            "t"
+                        } else {
+                            "f"
+                        }
+                        .into(),
+                    ),
                     "indkey" => Some(indkey_vals.join(" ")),
+                    "indexdef" => Some(format!(
+                        "CREATE INDEX {} ON {} ({})",
+                        idx.name,
+                        idx.table,
+                        idx.index_cols.join(", ")
+                    )),
                     _ => Some("".to_string()),
                 };
                 row.push(val);
@@ -4024,6 +4355,268 @@ impl CatalogStubs {
         CatalogResponse::rows(cols, rows)
     }
 
+    pub fn catalog_shards_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            shards_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let shards = self.list_shards();
+        let rows = shards
+            .into_iter()
+            .filter(|s| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "shard_id") {
+                        if s.shard_id.to_string() != target {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "view_id") {
+                        if !s.view_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "worker_id") {
+                        if !s.worker_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "state") {
+                        if !s.state.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_SHARDS_SCAN_ROWS)
+            .map(|s| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "shard_id" => Some(s.shard_id.to_string()),
+                        "view_id" => Some(s.view_id.clone()),
+                        "worker_id" => Some(s.worker_id.clone()),
+                        "state" => Some(s.state.clone()),
+                        "frontier" => Some(s.frontier.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_operations_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            operations_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let ops = self.list_operations();
+        let rows = ops
+            .into_iter()
+            .filter(|o| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "operation_id") {
+                        if !o.operation_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "kind") {
+                        if !o.kind.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "target") {
+                        if !o.target.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "phase") {
+                        if !o.phase.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_OPERATIONS_SCAN_ROWS)
+            .map(|o| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "operation_id" => Some(o.operation_id.clone()),
+                        "kind" => Some(o.kind.clone()),
+                        "target" => Some(o.target.clone()),
+                        "phase" => Some(o.phase.clone()),
+                        "progress_pct" => Some(o.progress_pct.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_namespaces_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            namespaces_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let nss = self.list_namespaces();
+        let rows = nss
+            .into_iter()
+            .filter(|n| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !n.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "owner") {
+                        if !n.owner.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_NAMESPACES_SCAN_ROWS)
+            .map(|n| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "name" => Some(n.name.clone()),
+                        "owner" => Some(n.owner.clone()),
+                        "created_at" => Some(n.created_at.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_tables_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            tables_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let tables = self.list_catalog_table_entries();
+        let rows = tables
+            .into_iter()
+            .filter(|t| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !t.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "namespace") {
+                        if !t.namespace.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CATALOG_TABLES_SCAN_ROWS)
+            .map(|t| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "namespace" => Some(t.namespace.clone()),
+                        "name" => Some(t.name.clone()),
+                        "schema" => Some(t.schema.clone()),
+                        "format" => Some(t.format.clone()),
+                        "row_count" => Some(t.row_count.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn catalog_workloads_response(
+        &self,
+        query: &str,
+        requested_cols: &[String],
+    ) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            workloads_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let ql = query.to_lowercase();
+        let workloads = self.list_catalog_workload_entries();
+        let rows = workloads
+            .into_iter()
+            .filter(|w| {
+                if ql.contains("where") {
+                    if let Some(target) = extract_filter_target(&ql, "workload_id") {
+                        if !w.workload_id.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "name") {
+                        if !w.name.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                    if let Some(target) = extract_filter_target(&ql, "priority") {
+                        if !w.priority.eq_ignore_ascii_case(&target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .take(MAX_CATALOG_WORKLOADS_SCAN_ROWS)
+            .map(|w| {
+                cols.iter()
+                    .map(|col| match col.to_ascii_lowercase().as_str() {
+                        "workload_id" => Some(w.workload_id.clone()),
+                        "name" => Some(w.name.clone()),
+                        "memory_limit" => Some(w.memory_limit.clone()),
+                        "priority" => Some(w.priority.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
     fn version(&self) -> CatalogResponse {
         let cols = vec!["version".to_string()];
         let rows = vec![vec![Some(
@@ -4114,6 +4707,22 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
     (y as i32, mo as u32, d as u32)
+}
+
+fn catalog_relation_name(full_name: &str, namespace: &str) -> (String, String) {
+    match full_name.rsplit_once('.') {
+        Some((schema, name)) => (schema.to_string(), name.to_string()),
+        None => (namespace.to_string(), full_name.to_string()),
+    }
+}
+
+fn catalog_namespace_oid(name: &str) -> i32 {
+    match name {
+        "pg_catalog" => 11,
+        "information_schema" => 13207,
+        "public" => 2200,
+        _ => view_oid(&format!("namespace:{name}")),
+    }
 }
 
 /// Helper to parse SELECT column names/aliases from query.
@@ -4406,6 +5015,59 @@ pub fn checkpoints_columns() -> Vec<String> {
     ]
 }
 
+pub const MAX_SHARDS_SCAN_ROWS: usize = 4096;
+pub const MAX_OPERATIONS_SCAN_ROWS: usize = 1000;
+pub const MAX_NAMESPACES_SCAN_ROWS: usize = 256;
+pub const MAX_CATALOG_TABLES_SCAN_ROWS: usize = 1000;
+pub const MAX_CATALOG_WORKLOADS_SCAN_ROWS: usize = 256;
+
+pub fn shards_columns() -> Vec<String> {
+    vec![
+        "shard_id".to_string(),
+        "view_id".to_string(),
+        "worker_id".to_string(),
+        "state".to_string(),
+        "frontier".to_string(),
+    ]
+}
+
+pub fn operations_columns() -> Vec<String> {
+    vec![
+        "operation_id".to_string(),
+        "kind".to_string(),
+        "target".to_string(),
+        "phase".to_string(),
+        "progress_pct".to_string(),
+    ]
+}
+
+pub fn namespaces_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "owner".to_string(),
+        "created_at".to_string(),
+    ]
+}
+
+pub fn tables_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "name".to_string(),
+        "schema".to_string(),
+        "format".to_string(),
+        "row_count".to_string(),
+    ]
+}
+
+pub fn workloads_columns() -> Vec<String> {
+    vec![
+        "workload_id".to_string(),
+        "name".to_string(),
+        "memory_limit".to_string(),
+        "priority".to_string(),
+    ]
+}
+
 pub fn sanitize_catalog_secret(input: &str) -> String {
     let mut out = input.to_string();
     if let Some(proto_pos) = out.find("://") {
@@ -4655,6 +5317,9 @@ pub(crate) fn project_workload_resource_usage(
 /// A response from the catalog stub handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogResponse {
+    Error {
+        message: String,
+    },
     /// A result set with column names and rows.
     Rows {
         columns: Vec<String>,

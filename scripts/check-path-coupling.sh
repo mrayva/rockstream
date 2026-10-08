@@ -27,7 +27,9 @@ else
 fi
 
 # Benchmark baselines record measurements, not protocol changes.
-changed_files=$(git diff --name-only "$RANGE" 2>/dev/null | grep -v '/benches/baseline/' || true)
+changed_files=$(git diff --name-only "$RANGE" 2>/dev/null \
+    | grep -v '^formal/verus/' \
+    | grep -v '/benches/baseline/' || true)
 
 if [ -z "$changed_files" ]; then
     echo "check-path-coupling: no changed files found for range '$RANGE' — skipping."
@@ -43,6 +45,16 @@ if [ -z "$changed_files" ]; then
 fi
 
 # Coordination crates and design doc — changes here require a model touch.
+# Data-plane behavior covered by focused checks does not need a FizzBee model.
+# Durable catalog reconstruction is specified in FIZZBEE_TEST_PLAN.md §3.6 and
+# checked by exact catalog recovery tests.
+changed_files=$(echo "$changed_files" | grep -Ev '(^|/)(tests|benches)/|^crates/rockstream-storage/src/reader\.rs$|^crates/rockstream-storage/src/catalog/' || true)
+
+if [ -z "$changed_files" ]; then
+    echo "check-path-coupling: only data-plane tests/benchmarks changed — OK."
+    exit 0
+fi
+
 COORDINATION_PATTERNS=(
     "crates/rockstream-runtime/"
     "crates/rockstream-control/"

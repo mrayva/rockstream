@@ -11,17 +11,17 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 
 ## Subsystem Index
 
-- [0xxx: Internal & General System](#0xxx-internal--general-system) (5 codes)
-- [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (26 codes)
+- [0xxx: Internal & General System](#0xxx-internal--general-system) (6 codes)
+- [1xxx: Pipeline, Plan & Optimization](#1xxx-pipeline-plan--optimization) (27 codes)
 - [17xx: Lease Management & Raft Leadership](#17xx-lease-management--raft-leadership) (4 codes)
 - [2xxx: Gateway, Query Execution & Wire Protocol](#2xxx-gateway-query-execution--wire-protocol) (38 codes)
 - [24xx: Authentication, mTLS & Secrets](#24xx-authentication-mtls--secrets) (18 codes)
 - [25xx-26xx: Extended Query, Cursors & Transactions](#25xx-26xx-extended-query-cursors--transactions) (9 codes)
-- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (53 codes)
+- [3xxx: Storage, Execution, Memory & Shuffle](#3xxx-storage-execution-memory--shuffle) (56 codes)
 - [4xxx: DDL, Catalog, Ingestion & Removed Connectors](#4xxx-ddl-catalog-ingestion--removed-connectors) (23 codes)
-- [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (16 codes)
+- [5xxx: Cluster, Node Lifecycle & Shard Coordination](#5xxx-cluster-node-lifecycle--shard-coordination) (17 codes)
 - [6xxx: Connector Schema Evolution](#6xxx-connector-schema-evolution) (1 codes)
-- [8xxx: Frontier Aggregation](#8xxx-frontier-aggregation) (3 codes)
+- [8xxx: Frontier Aggregation](#8xxx-frontier-aggregation) (4 codes)
 - [9xxx: Admission Control](#9xxx-admission-control) (1 codes)
 
 ---
@@ -35,6 +35,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-0003`](#rs-0003) | `storage.unavailable` | Storage unavailable | `Error` | `53100` | `ExponentialBackoff` |
 | [`RS-0004`](#rs-0004) | `cluster.unreachable` | Cluster control plane unreachable | `Error` | `08006` | `ExponentialBackoff` |
 | [`RS-0005`](#rs-0005) | `cli.confirmation_required` | Destructive command confirmation required | `Error` | `55000` | `NonRetryable` |
+| [`RS-0906`](#rs-0906) | `formal.verus_qualification_failed` | Formal Verus qualification failed | `Error` | `XX000` | `NonRetryable` |
 
 ### <a id="rs-0001"></a> `RS-0001` — Internal error
 
@@ -76,6 +77,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Pass --yes for script execution or answer y at the prompt.
 
+### <a id="rs-0906"></a> `RS-0906` — Formal Verus qualification failed
+
+- **Key**: `formal.verus_qualification_failed`
+- **Severity**: `Error`
+- **SQLSTATE**: `XX000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Inspect the formal verification and qualification evidence; ensure all required proofs and release artifacts pass.
+
 ---
 
 ## 1xxx: Pipeline, Plan & Optimization
@@ -104,6 +113,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-1020`](#rs-1020) | `operator.not_found` | Operator not found in pipeline | `Error` | `42P01` | `NonRetryable` |
 | [`RS-1021`](#rs-1021) | `arrangement.key_decode_failed` | Arrangement key decoding failed or unsupported | `Error` | `22000` | `NonRetryable` |
 | [`RS-1030`](#rs-1030) | `migration.timeout_exceeded` | Migration state exceeded its configured timeout budget | `Error` | `57014` | `ExponentialBackoff` |
+| [`RS-1201`](#rs-1201) | `numeric.value_out_of_range` | Numeric value out of range or arithmetic overflow | `Error` | `22003` | `NonRetryable` |
 | [`RS-1512`](#rs-1512) | `recursion.inner_frontier_stall` | Inner-frontier stall in distributed recursion; per-shard recompute triggered | `Warning` | `55000` | `AfterClusterRecovery` |
 | [`RS-1513`](#rs-1513) | `recursion.max_iteration_exceeded` | Distributed recursion max-iteration cap exceeded without convergence | `Error` | `54000` | `NonRetryable` |
 | [`RS-1601`](#rs-1601) | `lease.rejected` | Lease acquisition rejected: shard already leased or fence token invalid | `Error` | `55000` | `AfterLeaderElection` |
@@ -284,6 +294,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `57014`
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Check donor/recipient shard health, then retry or abort the migration; increase the specific migration timeout only if the cluster is healthy but the workload is larger than expected.
+
+### <a id="rs-1201"></a> `RS-1201` — Numeric value out of range or arithmetic overflow
+
+- **Key**: `numeric.value_out_of_range`
+- **Severity**: `Error`
+- **SQLSTATE**: `22003`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Check for numeric overflow in arithmetic operations and ensure input values stay within valid ranges.
 
 ### <a id="rs-1512"></a> `RS-1512` — Inner-frontier stall in distributed recursion; per-shard recompute triggered
 
@@ -974,7 +992,10 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 |---|---|---|---|---|---|
 | [`RS-3001`](#rs-3001) | `storage.writer_fenced` | Shard writer fenced out: lease lost | `Error` | `55000` | `AfterLeaderElection` |
 | [`RS-3003`](#rs-3003) | `storage.object_store_brownout` | Pipeline blocked: object store brownout, local buffer exhausted | `Error` | `53100` | `ExponentialBackoff` |
+| [`RS-3004`](#rs-3004) | `exchange.stale_lease_token` | Exchange frame lease token stale or superseded | `Error` | `55000` | `AfterLeaderElection` |
 | [`RS-3005`](#rs-3005) | `config.self_fencing_invalid` | Self-fencing configuration invalid: self_fence_after constraint violated | `Error` | `22023` | `NonRetryable` |
+| [`RS-3006`](#rs-3006) | `exchange.frame_oversized` | Exchange frame exceeds max_batch_bytes limit | `Error` | `53200` | `NonRetryable` |
+| [`RS-3008`](#rs-3008) | `exchange.conflicting_payload_digest` | Exchange request ID reused with conflicting payload digest | `Error` | `42710` | `NonRetryable` |
 | [`RS-3009`](#rs-3009) | `storage.merge_operand_malformed` | Merge operand malformed | `Error` | `XX000` | `NonRetryable` |
 | [`RS-3010`](#rs-3010) | `storage.shuffle_io_retired` | Legacy durable shuffle error (retired, use RS-3011..3016) | `Error` | `XX000` | `ExponentialBackoff` |
 | [`RS-3011`](#rs-3011) | `storage.durable_shuffle_rate_limit` | Durable shuffle rate-limit retry budget exhausted | `Error` | `53100` | `ExponentialBackoff` |
@@ -1042,6 +1063,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Retry Class**: `ExponentialBackoff`
 - **Default Next Steps**: Reduce input rate or increase local_buffer_max_epochs; check object store availability.
 
+### <a id="rs-3004"></a> `RS-3004` — Exchange frame lease token stale or superseded
+
+- **Key**: `exchange.stale_lease_token`
+- **Severity**: `Error`
+- **SQLSTATE**: `55000`
+- **Retry Class**: `AfterLeaderElection`
+- **Default Next Steps**: Refresh worker shard lease from control plane before retrying exchange.
+
 ### <a id="rs-3005"></a> `RS-3005` — Self-fencing configuration invalid: self_fence_after constraint violated
 
 - **Key**: `config.self_fencing_invalid`
@@ -1049,6 +1078,22 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `22023`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.
+
+### <a id="rs-3006"></a> `RS-3006` — Exchange frame exceeds max_batch_bytes limit
+
+- **Key**: `exchange.frame_oversized`
+- **Severity**: `Error`
+- **SQLSTATE**: `53200`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Split large record batches into smaller chunks within configured transport budget.
+
+### <a id="rs-3008"></a> `RS-3008` — Exchange request ID reused with conflicting payload digest
+
+- **Key**: `exchange.conflicting_payload_digest`
+- **Severity**: `Error`
+- **SQLSTATE**: `42710`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Ensure idempotent retry uses identical request payload and request ID, or generate a fresh request ID.
 
 ### <a id="rs-3009"></a> `RS-3009` — Merge operand malformed
 
@@ -1686,6 +1731,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-5034`](#rs-5034) | `migration.verification_divergence` | Migration verification divergence detected for key | `Error` | `XX000` | `AfterClusterRecovery` |
 | [`RS-5035`](#rs-5035) | `skew.slo_cannot_be_met` | Skew-bound SLO cannot be met without composable partial-state splitting | `Error` | `54000` | `NonRetryable` |
 | [`RS-5036`](#rs-5036) | `skew.non_composable_hot_key` | Non-composable hot key routed to a single spill shard | `Warning` | `01000` | `NonRetryable` |
+| [`RS-5037`](#rs-5037) | `storage.malformed_arrangement_header` | Malformed arrangement catalog header | `Fatal` | `XX000` | `NonRetryable` |
 
 ### <a id="rs-5001"></a> `RS-5001` — Incompatible storage format
 
@@ -1815,6 +1861,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Keep the hot key on a single spill shard, watch that shard's pressure, and switch to a composable law before enabling virtual-bucket splitting for this workload.
 
+### <a id="rs-5037"></a> `RS-5037` — Malformed arrangement catalog header
+
+- **Key**: `storage.malformed_arrangement_header`
+- **Severity**: `Fatal`
+- **SQLSTATE**: `XX000`
+- **Retry Class**: `NonRetryable`
+- **Default Next Steps**: Inspect the stored arrangement catalog value; the header length does not match the expected wire size.
+
 ---
 
 ## 6xxx: Connector Schema Evolution
@@ -1840,6 +1894,7 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 | [`RS-8001`](#rs-8001) | `frontier.aggregator_registry_full` | Frontier aggregator shard registry is full; new shard reports rejected | `Error` | `53200` | `ExponentialBackoff` |
 | [`RS-8002`](#rs-8002) | `frontier.stale_fence_token` | Stale fencing token on frontier-aggregator publisher-lease CAS or publish | `Error` | `55000` | `AfterLeaderElection` |
 | [`RS-8003`](#rs-8003) | `frontier.sync_flush_violation` | Sync-flush-before-lease-handoff-read violation on frontier publication | `Error` | `XX000` | `NonRetryable` |
+| [`RS-8004`](#rs-8004) | `frontier.membership_report_rejected` | Membership-aware frontier report or configuration transition was rejected | `Error` | `55000` | `Immediate` |
 
 ### <a id="rs-8001"></a> `RS-8001` — Frontier aggregator shard registry is full; new shard reports rejected
 
@@ -1864,6 +1919,14 @@ This document is generated directly from `contracts/errors.toml` with zero manua
 - **SQLSTATE**: `XX000`
 - **Retry Class**: `NonRetryable`
 - **Default Next Steps**: Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore.
+
+### <a id="rs-8004"></a> `RS-8004` — Membership-aware frontier report or configuration transition was rejected
+
+- **Key**: `frontier.membership_report_rejected`
+- **Severity**: `Error`
+- **SQLSTATE**: `55000`
+- **Retry Class**: `Immediate`
+- **Default Next Steps**: Refresh the active membership generation and shard incarnation, then retry with a versioned report after durable catch-up.
 
 ---
 

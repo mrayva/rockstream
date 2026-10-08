@@ -38,13 +38,19 @@ on:
       - "crates/rockstream-storage/**"
       - "crates/rockstream-plan/**"
       - "crates/rockstream-types/**"
+      - "crates/rockstream-verified/**"
       - "crates/rockstream-oracle/**"
       - "crates/rockstream-cli/**"
       - "crates/rockstream-diff/**"
       - "crates/rockstream-docgen/**"
+      - "crates/rockstream-management-proto/**"
       - "crates/rockstream-test-support/**"
       - "formal/edge_*.fizz"
       - "Dockerfile"
+
+concurrency:
+  group: real-cluster-chaos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   chaos:

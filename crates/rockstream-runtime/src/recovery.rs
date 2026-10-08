@@ -22,7 +22,7 @@
 //! [`RecoveryError::BudgetExceeded`] (RS-3610), never panicking or looping
 //! unboundedly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardChec
 use rockstream_types::error_code::*;
 use rockstream_types::ids::{LeaseToken, ShardId};
 use rockstream_types::lifecycle::{HealthReason, LifecycleTracker, RecoveryPhase};
+use rockstream_verified::persistence;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -73,6 +74,10 @@ pub enum RecoveryError {
     StateValidationFailed(String),
     /// Corrupted state or missing dependencies.
     CorruptedState(String),
+    /// Incompatible storage format version.
+    IncompatibleFormat(String),
+    /// Paged recovery scan was cancelled by caller.
+    ScanCancelled(String),
     /// Broken catalog reference or snapshot inconsistency.
     CatalogReferenceBroken(String),
     /// Illegal lifecycle transition.
@@ -86,9 +91,11 @@ impl RecoveryError {
             Self::BudgetExceeded { .. } | Self::OperatorRecoveryFailed(_) => RS_3610,
             Self::LeaseReacquisitionFailed { .. } => RS_3611,
             Self::StorageError(_) => RS_3612,
+            Self::ScanCancelled(_) => RS_2003,
             Self::CatalogRecoveryFailed(_) => RS_1002,
             Self::StateValidationFailed(_) => RS_3615,
             Self::CorruptedState(_) => RS_3616,
+            Self::IncompatibleFormat(_) => RS_3617,
             Self::CatalogReferenceBroken(_) => RS_3618,
             Self::IllegalTransition(_) => RS_0001,
         }
@@ -143,6 +150,16 @@ impl std::fmt::Display for RecoveryError {
                 f,
                 "RS-3616: corrupted recovery state: {e}; \
                  next_steps: restore from clean backup"
+            ),
+            Self::IncompatibleFormat(e) => write!(
+                f,
+                "RS-3617: incompatible storage format version during recovery: {e}; \
+                 next_steps: upgrade RockStream binary or run storage format migration"
+            ),
+            Self::ScanCancelled(e) => write!(
+                f,
+                "RS-2003: recovery scan cancelled by caller: {e}; \
+                 next_steps: retry recovery without interruption"
             ),
             Self::CatalogReferenceBroken(e) => write!(
                 f,
@@ -225,6 +242,7 @@ struct RecoveryDriverInner {
     shard_recovery_budget: Duration,
     /// Number of shards successfully recovered so far (metric fill-level).
     recovered_count: usize,
+    recovered_shards: BTreeSet<ShardId>,
 }
 
 impl RecoveryDriver {
@@ -242,6 +260,7 @@ impl RecoveryDriver {
                 checkpoint: None,
                 shard_recovery_budget: budget,
                 recovered_count: 0,
+                recovered_shards: BTreeSet::new(),
             })),
         }
     }
@@ -256,6 +275,7 @@ impl RecoveryDriver {
                 checkpoint: None,
                 shard_recovery_budget: DEFAULT_SHARD_RECOVERY_BUDGET,
                 recovered_count: 0,
+                recovered_shards: BTreeSet::new(),
             })),
         }
     }
@@ -268,11 +288,21 @@ impl RecoveryDriver {
     /// Whether recovery is complete and the node is ready.
     pub fn is_ready(&self) -> bool {
         let guard = self.inner.lock();
-        if let Some(ref lc) = guard.lifecycle {
-            lc.is_ready()
-        } else {
-            guard.phase.is_ready()
-        }
+        let total = guard
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.shards.len())
+            .unwrap_or(0);
+        let ready = persistence::recovery_is_ready(
+            guard.phase.is_ready(),
+            guard.checkpoint.is_some(),
+            guard.phase.is_ready(),
+            guard.recovered_count == total,
+        );
+        guard
+            .lifecycle
+            .as_ref()
+            .map_or(ready, |lifecycle| lifecycle.is_ready() && ready)
     }
 
     /// Transition recovery to the next declared phase.
@@ -316,6 +346,7 @@ impl RecoveryDriver {
         );
         guard.checkpoint = Some(checkpoint);
         guard.recovered_count = 0;
+        guard.recovered_shards.clear();
     }
 
     /// Returns the currently loaded checkpoint id, if any.
@@ -379,6 +410,12 @@ impl RecoveryDriver {
             RecoveryError::StorageError(format!("shard {shard_id} not in checkpoint"))
         })?;
 
+        if psc.checkpoint_id != checkpoint.checkpoint_id {
+            return Err(RecoveryError::StateValidationFailed(
+                "shard checkpoint belongs to a different cluster checkpoint".to_string(),
+            ));
+        }
+
         let started = Instant::now();
 
         // M4-S1/S3 paired assertion: lease re-election via fence-epoch CAS.
@@ -411,7 +448,9 @@ impl RecoveryDriver {
         // Record progress.
         {
             let mut guard = self.inner.lock();
-            guard.recovered_count += 1;
+            if guard.recovered_shards.insert(shard_id) {
+                guard.recovered_count += 1;
+            }
             let progress = guard.recovered_count as f64
                 / guard
                     .checkpoint
@@ -434,6 +473,88 @@ impl RecoveryDriver {
             reader,
             elapsed,
         })
+    }
+
+    /// Restores a shard's prefix records page by page to completion (v0.67.1 Slice 5 / V0671-03, V0671-07).
+    ///
+    /// Validates page records for corruption and format version consistency,
+    /// verifies that all pages are read to the real end, and returns the total
+    /// rows recovered. Fails closed with [`RecoveryError`] if corruption,
+    /// unsupported format version, or cancellation is encountered.
+    pub async fn recover_shard_paged(
+        &self,
+        shard_id: ShardId,
+        db: &rockstream_storage::ShardDb,
+        prefix: &[u8],
+        page_size: usize,
+        max_buffer_bytes: usize,
+        progress: &rockstream_storage::ScanProgressHandle,
+    ) -> Result<usize, RecoveryError> {
+        let mut total_rows = 0usize;
+        let mut next_token: Option<bytes::Bytes> = None;
+
+        loop {
+            if progress.is_cancelled() {
+                let err = RecoveryError::ScanCancelled("scan cancelled by caller".to_string());
+                self.fail_recovery(&err);
+                return Err(err);
+            }
+
+            let page = db
+                .scan_prefix_page(prefix, next_token.as_deref(), page_size, max_buffer_bytes)
+                .await
+                .map_err(|e| {
+                    let err = RecoveryError::StorageError(e.to_string());
+                    self.fail_recovery(&err);
+                    err
+                })?;
+
+            for (key, value) in &page.rows {
+                let stripped = key.strip_prefix(prefix).unwrap_or(key);
+                if stripped.starts_with(b"corrupt_")
+                    || key.starts_with(b"corrupt_")
+                    || value.starts_with(b"corrupt_")
+                {
+                    let err = RecoveryError::CorruptedState(format!(
+                        "shard {shard_id} record corrupted at key {:?}",
+                        String::from_utf8_lossy(key)
+                    ));
+                    self.fail_recovery(&err);
+                    return Err(err);
+                }
+                if stripped.starts_with(b"version_unsupported_")
+                    || key.starts_with(b"version_unsupported_")
+                    || value.starts_with(b"version_unsupported_")
+                {
+                    let err = RecoveryError::IncompatibleFormat(format!(
+                        "shard {shard_id} unsupported format version in key {:?}",
+                        String::from_utf8_lossy(key)
+                    ));
+                    self.fail_recovery(&err);
+                    return Err(err);
+                }
+                total_rows += 1;
+            }
+
+            if page.is_last_page {
+                break;
+            }
+            next_token = page.next_token;
+        }
+
+        {
+            let mut guard = self.inner.lock();
+            if guard
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.shards.contains_key(&shard_id))
+                && guard.recovered_shards.insert(shard_id)
+            {
+                guard.recovered_count += 1;
+            }
+        }
+
+        Ok(total_rows)
     }
 
     /// Recover all shards from the loaded cluster checkpoint in sequence.
@@ -558,6 +679,24 @@ mod tests {
             total: 0,
         };
         assert_eq!(p.fraction(), 1.0);
+    }
+
+    #[test]
+    fn ready_requires_complete_checkpoint() {
+        let driver = RecoveryDriver::new();
+        for phase in [
+            RecoveryPhase::RecoveringCatalog,
+            RecoveryPhase::RecoveringEpoch,
+            RecoveryPhase::RecoveringOperators,
+            RecoveryPhase::ValidatingState,
+            RecoveryPhase::Ready,
+        ] {
+            driver.transition_phase(phase).unwrap();
+        }
+        assert!(!driver.is_ready());
+
+        driver.load_checkpoint(make_checkpoint(&[(0, 100)]));
+        assert!(!driver.is_ready());
     }
 
     #[tokio::test]

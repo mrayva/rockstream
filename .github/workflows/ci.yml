@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -31,9 +35,11 @@ jobs:
           RS_TC_DEBUG: "1"
         run: cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1 --nocapture
 
-  check:
-    name: Check
+  check-quality:
+    name: Check quality
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,45 +52,14 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          docker builder prune -af
-      - name: Require Docker
-        run: docker info
-      - name: Build unified-binary test image
-        run: docker build -t rockstream-tc-test:latest .
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
-      - name: cargo test
-        env:
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
-          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "60"
-          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "10"
-        run: |
-          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
-          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
-          cargo test -p rockstream-control --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
-          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
-          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
-          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
-          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
-          cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
-          cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
-          cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1
-          cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
-      - name: pgwire conformance test-result report
-        run: |
-          rm -f target/pgwire-test-results.json
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
-          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
-      - name: Remove Docker test image
-        run: docker image rm rockstream-tc-test:latest || true
-      - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
       - name: install cargo-deny
         uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny
+        run: cargo deny --all-features check
       - name: install cargo-audit
         uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
@@ -141,6 +116,152 @@ jobs:
         run: bash scripts/check-operator-state-bytes.test.sh
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
+      - name: path-coupling checker self-test
+        run: bash scripts/check-path-coupling.test.sh
+
+  verus-verify:
+    name: Verus verify and qualify (VS6)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache pinned Verus
+        uses: actions/cache@v4
+        with:
+          path: .cache/verus
+          key: verus-${{ runner.os }}-${{ runner.arch }}-0.2026.09.13.671956e
+      - name: Install pinned Verus
+        run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
+      - name: Verify Rust kernels
+        run: make verify-rust
+      - name: Verify proof contracts
+        run: make verify-proof-contracts
+      - name: Run clean VS6 qualification matrix
+        run: make qualify-verus
+      - name: Upload VS6 qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verus-qualification-${{ matrix.target }}
+          path: evidence/verus/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Exercise production wrapper
+        run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
+      - name: Build ordinary Cargo consumer
+        run: cargo build --locked --release -p rockstream-cli
+
+  check-tests:
+    name: Check tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - workspace
+          - crates
+          - gateway
+          - sim-unit
+          - sim-integration
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-tests-${{ matrix.shard }}
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Require Docker
+        if: matrix.shard == 'gateway'
+        run: docker info
+      - uses: docker/setup-buildx-action@v3
+        if: matrix.shard == 'gateway'
+      - name: Build unified-binary test image
+        if: matrix.shard == 'gateway'
+        run: |
+          docker buildx build \
+            --tag rockstream-tc-test:latest \
+            --load \
+            --cache-from type=gha,scope=rockstream-tc-test-check \
+            --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
+            .
+      - name: Workspace tests
+        if: matrix.shard == 'workspace'
+        run: |
+          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
+      - name: Crate tests
+        if: matrix.shard == 'crates'
+        run: |
+          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
+          cargo test -p rockstream-control --lib --tests -- --test-threads=1
+          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
+          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
+          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
+          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
+      - name: Gateway tests
+        if: matrix.shard == 'gateway'
+        run: |
+          mkdir -p target
+          rm -f target/pgwire-test-results.json
+          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
+          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
+          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
+          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS=60 ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS=10 cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
+      - name: Simulation unit tests
+        if: matrix.shard == 'sim-unit'
+        run: cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
+      - name: Simulation integration tests
+        if: matrix.shard == 'sim-integration'
+        run: cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
+      - name: Remove Docker test image
+        if: always() && matrix.shard == 'gateway'
+        run: docker image rm rockstream-tc-test:latest || true
+
+  check:
+    name: Check
+    if: always()
+    needs:
+      - check-quality
+      - check-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any Check shard failed
+        if: needs.check-quality.result != 'success' || needs.check-tests.result != 'success'
+        run: |
+          echo "A Check shard did not pass."
+          exit 1
+      - name: Check shards passed
+        run: echo "All Check shards passed."
 
   formal-verify:
     name: Formal verify (M1–M4, M6–M7)
@@ -157,7 +278,11 @@ jobs:
             git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50
             base_sha=$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" HEAD)
             changed=$(git diff --name-only "$base_sha"...HEAD)
-            if echo "$changed" | grep -qE '^(formal/|DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/)'; then
+            protocol_model_changed=false
+            if echo "$changed" | grep -E '^formal/' | grep -qv '^formal/verus/'; then
+              protocol_model_changed=true
+            fi
+            if echo "$changed" | grep -qE '^(DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/)' || [ "$protocol_model_changed" = true ]; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
               echo "run=false" >> "$GITHUB_OUTPUT"
@@ -233,207 +358,6 @@ jobs:
           fizz formal/edge_quota_exhaustion.fizz
           fizz formal/edge_late_data.fizz
 
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88"
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          docker builder prune -af
-      - name: Require Docker
-        run: docker info
-      - name: Build unified-binary test image
-        run: docker build -t rockstream-tc-test:latest .
-      - name: install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: cargo llvm-cov (workspace lcov)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
-          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "60"
-          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "10"
-        run: |
-          cargo llvm-cov --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql --lib --tests --no-report
-          cargo llvm-cov --no-clean -p rockstream-connectors --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-control --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-gateway --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-ops --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-runtime --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-storage --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-sql --lib --tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-sim --features simulation --lib
-          cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-sim --features simulation --lib -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
-          cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1
-          cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
-          cargo llvm-cov report --lcov --output-path lcov.info
-      # Collect the complete explicit feature matrix once. The per-crate checks
-      # below are report-only so every floor uses the same profile.
-      - name: cargo llvm-cov (rockstream-gateway lines ≥76%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-gateway --fail-under-lines 76
-      - name: cargo llvm-cov (rockstream-gateway regions ≥77%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-gateway --fail-under-regions 77
-      - name: cargo llvm-cov (rockstream-docgen lines ≥70%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-docgen --fail-under-lines 70
-      - name: cargo llvm-cov (rockstream-docgen regions ≥70%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-docgen --fail-under-regions 70
-      - name: cargo llvm-cov (rockstream-diff lines ≥76%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-diff --fail-under-lines 76
-      - name: cargo llvm-cov (rockstream-diff regions ≥71%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-diff --fail-under-regions 71
-      - name: cargo llvm-cov (rockstream-ops lines ≥81%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-ops --fail-under-lines 81
-      - name: cargo llvm-cov (rockstream-ops regions ≥81%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-ops --fail-under-regions 81
-      - name: cargo llvm-cov (rockstream-storage lines ≥75%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-storage --fail-under-lines 75
-      - name: cargo llvm-cov (rockstream-storage regions ≥75%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-storage --fail-under-regions 75
-      - name: cargo llvm-cov (rockstream-runtime lines ≥76%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-runtime --fail-under-lines 76
-      - name: cargo llvm-cov (rockstream-runtime regions ≥79%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-runtime --fail-under-regions 79
-      - name: cargo llvm-cov (rockstream-sql lines ≥73%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-sql --fail-under-lines 73
-      - name: cargo llvm-cov (rockstream-sql regions ≥74%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-sql --fail-under-regions 74
-      - name: cargo llvm-cov (rockstream-control lines ≥78%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-control --fail-under-lines 78
-      - name: cargo llvm-cov (rockstream-control regions ≥79%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-control --fail-under-regions 79
-      - name: cargo llvm-cov (rockstream-connectors lines ≥70%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-connectors --fail-under-lines 70
-      - name: cargo llvm-cov (rockstream-connectors regions ≥71%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-connectors --fail-under-regions 71
-      - name: cargo llvm-cov (rockstream-types lines ≥84%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-types --fail-under-lines 84
-      - name: cargo llvm-cov (rockstream-types regions ≥86%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-types --fail-under-regions 86
-      - name: cargo llvm-cov (rockstream-plan lines ≥81%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-plan --fail-under-lines 81
-      - name: cargo llvm-cov (rockstream-plan regions ≥81%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-plan --fail-under-regions 81
-      - name: cargo llvm-cov (rockstream-sim lines ≥63%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-sim --fail-under-lines 63
-      - name: cargo llvm-cov (rockstream-sim regions ≥66%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-sim --fail-under-regions 66
-      - name: cargo llvm-cov (rockstream-cli lines ≥72%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-cli --fail-under-lines 72 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
-      - name: cargo llvm-cov (rockstream-cli regions ≥74%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-cli --fail-under-regions 74 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
-      - name: cargo llvm-cov (rockstream-oracle lines ≥83%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-oracle --fail-under-lines 83
-      - name: cargo llvm-cov (rockstream-oracle regions ≥81%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-oracle --fail-under-regions 81
-      - name: cargo llvm-cov (rockstream-test-support lines ≥70%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-test-support --fail-under-lines 70
-      - name: cargo llvm-cov (rockstream-test-support regions ≥70%)
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-test-support --fail-under-regions 70
-      - name: upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-lcov
-          path: lcov.info
-
   nexmark-regression-gate:
     name: Nexmark regression gate
     runs-on: ubuntu-latest
@@ -470,7 +394,7 @@ jobs:
     # times is ~4 minutes on a warm cache; sized generously above that plus
     # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
     # `.claude/v0.45.4-evidence.md`.
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

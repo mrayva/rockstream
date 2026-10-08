@@ -111,12 +111,12 @@ const GROUP_KEY_PACKER_PREFIX: &[u8] = &[0x01, 0x4B, 0x50];
 const UTF8_PACKER_PREFIX: &[u8] = &[0x01, 0x55, 0x50];
 
 fn append_utf8_packer_state(
-    forward: &Mutex<HashMap<String, i64>>,
+    dirty: &Mutex<Vec<(String, i64)>>,
     op_id: OperatorId,
     target: &mut WriteBatch,
 ) {
-    let forward = forward.lock().unwrap();
-    for (value, surrogate) in forward.iter() {
+    let mut dirty = dirty.lock().unwrap();
+    for (value, surrogate) in dirty.drain(..) {
         let mut key = Vec::with_capacity(UTF8_PACKER_PREFIX.len() + 8 + value.len());
         key.extend_from_slice(UTF8_PACKER_PREFIX);
         key.extend_from_slice(&op_id.0.to_be_bytes());
@@ -431,6 +431,7 @@ pub struct GroupKeyPacker {
     reverse: Mutex<HashMap<i64, Vec<i64>>>,
     reverse_slices: Mutex<HashMap<i64, Vec<ArrayRef>>>,
     next_id: Mutex<i64>,
+    dirty: Mutex<Vec<(Vec<u8>, i64)>>,
 }
 
 impl GroupKeyPacker {
@@ -441,6 +442,7 @@ impl GroupKeyPacker {
             reverse: Mutex::new(HashMap::new()),
             reverse_slices: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            dirty: Mutex::new(Vec::new()),
         }
     }
 
@@ -488,7 +490,8 @@ impl GroupKeyPacker {
         let mut next_id = self.next_id.lock().unwrap();
         let id = *next_id;
         *next_id += 1;
-        forward.insert(encoded, id);
+        forward.insert(encoded.clone(), id);
+        self.dirty.lock().unwrap().push((encoded, id));
         self.reverse.lock().unwrap().insert(id, vals.to_vec());
         id
     }
@@ -507,14 +510,14 @@ impl GroupKeyPacker {
         db.write_batch(batch).await.map_err(OpError::storage)
     }
 
-    /// Add the surrogate-key intern table to a caller-owned M3 write.
+    /// Add dirty surrogate-key intern entries to a caller-owned M3 write.
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        let forward = self.forward.lock().unwrap();
-        for (encoded_key, &surrogate) in forward.iter() {
+        let mut dirty = self.dirty.lock().unwrap();
+        for (encoded_key, surrogate) in dirty.drain(..) {
             let mut key = Vec::with_capacity(3 + 8 + encoded_key.len());
             key.extend_from_slice(GROUP_KEY_PACKER_PREFIX);
             key.extend_from_slice(&op_id.0.to_be_bytes());
-            key.extend_from_slice(encoded_key);
+            key.extend_from_slice(&encoded_key);
             target.put(&key, &surrogate.to_be_bytes());
         }
     }
@@ -648,6 +651,7 @@ impl GroupKeyPacker {
         let mut reverse = self.reverse.lock().unwrap();
         let mut reverse_slices = self.reverse_slices.lock().unwrap();
         let mut next_id = self.next_id.lock().unwrap();
+        let mut dirty = self.dirty.lock().unwrap();
 
         for row in 0..delta.num_rows() {
             let mut encoded = Vec::new();
@@ -659,6 +663,7 @@ impl GroupKeyPacker {
             } else {
                 let id = *next_id;
                 *next_id += 1;
+                dirty.push((encoded.clone(), id));
                 forward.insert(encoded, id);
 
                 let key_slices: Vec<ArrayRef> =
@@ -795,6 +800,7 @@ pub struct Utf8KeyPacker {
     forward: Mutex<HashMap<String, i64>>,
     reverse: Mutex<HashMap<i64, String>>,
     next_id: Mutex<i64>,
+    dirty: Mutex<Vec<(String, i64)>>,
 }
 
 impl Utf8KeyPacker {
@@ -803,6 +809,7 @@ impl Utf8KeyPacker {
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            dirty: Mutex::new(Vec::new()),
         }
     }
 
@@ -821,7 +828,7 @@ impl Utf8KeyPacker {
     }
 
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        append_utf8_packer_state(&self.forward, op_id, target);
+        append_utf8_packer_state(&self.dirty, op_id, target);
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -838,6 +845,7 @@ impl Utf8KeyPacker {
         *next_id += 1;
         drop(next_id);
         forward.insert(key.to_string(), id);
+        self.dirty.lock().unwrap().push((key.to_string(), id));
         self.reverse.lock().unwrap().insert(id, key.to_string());
         id
     }
@@ -952,6 +960,7 @@ pub struct Utf8ColumnPacker {
     forward: Mutex<HashMap<String, i64>>,
     reverse: Mutex<HashMap<i64, String>>,
     next_id: Mutex<i64>,
+    dirty: Mutex<Vec<(String, i64)>>,
 }
 
 impl Utf8ColumnPacker {
@@ -960,6 +969,7 @@ impl Utf8ColumnPacker {
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
+            dirty: Mutex::new(Vec::new()),
         }
     }
 
@@ -973,7 +983,7 @@ impl Utf8ColumnPacker {
     }
 
     pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
-        append_utf8_packer_state(&self.forward, op_id, target);
+        append_utf8_packer_state(&self.dirty, op_id, target);
     }
 
     pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
@@ -990,6 +1000,7 @@ impl Utf8ColumnPacker {
         *next_id += 1;
         drop(next_id);
         forward.insert(key.to_string(), id);
+        self.dirty.lock().unwrap().push((key.to_string(), id));
         self.reverse.lock().unwrap().insert(id, key.to_string());
         id
     }
@@ -1468,6 +1479,17 @@ impl JoinKind {
         }
     }
 
+    async fn process_epoch_with_storage(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        match self {
+            JoinKind::Inner(op) => op.process_epoch_with_storage(left, right).await,
+            JoinKind::Outer(_) | JoinKind::Factorized(_) => self.process_epoch(left, right),
+        }
+    }
+
     fn op_id(&self) -> OperatorId {
         match self {
             JoinKind::Inner(op) => op.op_id(),
@@ -1554,6 +1576,12 @@ impl JoinPipeline {
         }
     }
 
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        if let JoinKind::Inner(op) = &self.join {
+            op.set_db(db);
+        }
+    }
+
     pub fn selection_rule_version(&self) -> u32 {
         crate::governor::FACTORIZED_SELECTION_RULE_VERSION
     }
@@ -1570,6 +1598,16 @@ impl JoinPipeline {
         left_delta: ArrowZSet,
         right_delta: ArrowZSet,
     ) -> Result<ArrowZSet, OpError> {
+        let (left, right) = self.process_pre_deltas(left_delta, right_delta)?;
+        let (out, work) = self.join.process_epoch(left, right)?;
+        self.finish_process(out, work)
+    }
+
+    fn process_pre_deltas(
+        &self,
+        left_delta: ArrowZSet,
+        right_delta: ArrowZSet,
+    ) -> Result<(ArrowZSet, ArrowZSet), OpError> {
         let mut left = left_delta;
         for stage in &self.left_pre {
             left = stage.process(left, 0)?;
@@ -1578,7 +1616,14 @@ impl JoinPipeline {
         for stage in &self.right_pre {
             right = stage.process(right, 0)?;
         }
-        let (mut out, work) = self.join.process_epoch(left, right)?;
+        Ok((left, right))
+    }
+
+    fn finish_process(
+        &self,
+        mut out: ArrowZSet,
+        work: crate::governor::DeltaAmplificationCounters,
+    ) -> Result<ArrowZSet, OpError> {
         let classic = !matches!(self.join, JoinKind::Factorized(_));
         let mut flattened_intermediate_tuples = 0;
         let mut counted_intermediates = false;
@@ -1622,6 +1667,16 @@ impl JoinPipeline {
             },
         );
         Ok(out)
+    }
+
+    pub async fn process_async(
+        &self,
+        left_delta: ArrowZSet,
+        right_delta: ArrowZSet,
+    ) -> Result<ArrowZSet, OpError> {
+        let (left, right) = self.process_pre_deltas(left_delta, right_delta)?;
+        let (out, work) = self.join.process_epoch_with_storage(left, right).await?;
+        self.finish_process(out, work)
     }
 
     /// Persist the join's arrangement(s) to `db`. `left_pre`/`right_pre`/

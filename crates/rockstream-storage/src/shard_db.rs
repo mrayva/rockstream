@@ -77,6 +77,19 @@ impl ScanProgressHandle {
     }
 }
 
+/// A single row- and byte-bounded page of key-value pairs (v0.67.1 Slice 2 / V0671-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPage {
+    /// Key-value pairs in this page.
+    pub rows: Vec<(Bytes, Bytes)>,
+    /// Continuation token (last logical key of this page) to resume scanning, or `None` if EOF.
+    pub next_token: Option<Bytes>,
+    /// True if this is the final page of the scan.
+    pub is_last_page: bool,
+    /// Total serialized bytes in this page.
+    pub page_bytes: usize,
+}
+
 /// Fill-level metric: number of rows in the last partial_query call.
 /// Gauge: updated atomically per call to partial_query.
 pub static PARTIAL_AGG_RESULT_ROWS: std::sync::atomic::AtomicUsize =
@@ -102,25 +115,25 @@ use crate::merge_registry::SumCountMergeOperator;
 
 /// Check whether `bytes` is a valid operand for `law`.
 ///
-/// Uses the law's identity element to probe validity: `merge(bytes, identity)`
-/// must succeed. Falls back to `merge(bytes, bytes)` if the law has no
-/// identity (uncommon). For the identity element itself, `is_identity` short-
-/// circuits.
+/// Resolves the operand representation via `resolve_law_operand`.
+/// If raw, validates raw bytes without truncation. If tagged, passes only
+/// the payload to `law`. Rejects incompatible or malformed operands.
 fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
-    let mut bytes = bytes;
-    if !bytes.is_empty() {
-        let tag = bytes[0];
-        if tag == 0x01 || tag == 0x02 || tag == 0x03 || tag == 0x04 || tag == 0x22 || tag == 0x30 {
-            bytes = &bytes[1..];
-        }
-    }
-    if law.is_identity(bytes) {
+    let operand_view = match crate::merge_registry::resolve_law_operand(law, bytes) {
+        Ok(view) => view,
+        Err(_) => return false,
+    };
+    let payload = match operand_view {
+        crate::merge_registry::LawOperandView::Raw(raw) => raw,
+        crate::merge_registry::LawOperandView::Tagged { payload, .. } => payload,
+    };
+    if law.is_identity(payload) {
         return true;
     }
     if let Some(identity) = law.identity() {
-        law.merge(bytes, &identity).is_ok()
+        law.merge(payload, &identity).is_ok()
     } else {
-        law.merge(bytes, bytes).is_ok()
+        law.merge(payload, payload).is_ok()
     }
 }
 
@@ -162,6 +175,8 @@ pub struct ShardDbBuilder {
     concurrency_governor: Option<Arc<crate::concurrency_governor::ConcurrencyGovernor>>,
     disk_cache_dir: Option<std::path::PathBuf>,
     cleanup_on_drop: bool,
+    filter_bits_per_key: Option<u32>,
+    filter_policies: Option<Vec<Arc<dyn slatedb::filter_policy::FilterPolicy>>>,
 }
 
 /// Specification for a partial aggregation query.
@@ -190,6 +205,8 @@ impl ShardDbBuilder {
             concurrency_governor: None,
             disk_cache_dir: None,
             cleanup_on_drop: false,
+            filter_bits_per_key: None,
+            filter_policies: None,
         }
     }
 
@@ -274,16 +291,125 @@ impl ShardDbBuilder {
         self
     }
 
+    /// Configure local NVMe block caching tier for hot SSTable blocks.
+    pub fn with_nvme_cache(self, dir: impl Into<std::path::PathBuf>, max_bytes: usize) -> Self {
+        self.with_nvme_block_cache(dir, max_bytes, 4 * 1024 * 1024)
+    }
+
+    /// Configure local NVMe block caching tier with custom part/block size.
+    pub fn with_nvme_block_cache(
+        mut self,
+        dir: impl Into<std::path::PathBuf>,
+        max_bytes: usize,
+        part_size_bytes: usize,
+    ) -> Self {
+        let dir_path = dir.into();
+        self.settings.object_store_cache_options.root_folder = Some(dir_path.clone());
+        self.settings
+            .object_store_cache_options
+            .max_cache_size_bytes = Some(max_bytes);
+        self.settings.object_store_cache_options.part_size_bytes = part_size_bytes;
+        self.settings.object_store_cache_options.scan_interval =
+            Some(std::time::Duration::from_secs(3600));
+        self.settings
+            .object_store_cache_options
+            .max_open_file_handles = 1000;
+        self.settings.object_store_cache_options.cache_on_flush = true;
+        self.settings.object_store_cache_options.cache_on_compaction = true;
+        self.disk_cache_dir = Some(dir_path);
+        self
+    }
+
+    /// Return whether NVMe / disk cache is configured on this builder.
+    pub fn is_nvme_cache_configured(&self) -> bool {
+        self.settings
+            .object_store_cache_options
+            .root_folder
+            .is_some()
+    }
+
+    /// Configure Bloom filter bits per key for SSTable arrangements.
+    pub fn with_filter_bits_per_key(mut self, bits_per_key: u32) -> Self {
+        self.filter_bits_per_key = Some(bits_per_key);
+        self
+    }
+
+    /// Configure minimum number of keys in an SSTable before a Bloom filter is written.
+    /// Setting this to 0 or 1 ensures even small SSTables generate Bloom filters.
+    pub fn with_min_filter_keys(mut self, min_keys: u32) -> Self {
+        self.settings.min_filter_keys = min_keys;
+        self
+    }
+
+    /// Enable and tune Bloom filter sizing and activation threshold for SlateDB SSTable arrangements.
+    pub fn with_bloom_filter(mut self, bits_per_key: u32, min_filter_keys: u32) -> Self {
+        self.filter_bits_per_key = Some(bits_per_key);
+        self.settings.min_filter_keys = min_filter_keys;
+        self
+    }
+
+    /// Set explicit filter policies for SSTable construction and evaluation.
+    pub fn with_filter_policies(
+        mut self,
+        policies: Vec<Arc<dyn slatedb::filter_policy::FilterPolicy>>,
+    ) -> Self {
+        self.filter_policies = Some(policies);
+        self
+    }
+
+    /// Access the configured Bloom filter bits per key, if any.
+    pub fn bloom_filter_bits(&self) -> Option<u32> {
+        self.filter_bits_per_key
+    }
+
+    /// Access the configured min_filter_keys threshold.
+    pub fn min_filter_keys(&self) -> u32 {
+        self.settings.min_filter_keys
+    }
+
     /// Access the SlateDB object store cache options.
     pub fn object_store_cache_options(&self) -> &slatedb::config::ObjectStoreCacheOptions {
         &self.settings.object_store_cache_options
     }
 
     /// Build and open the shard database.
-    pub async fn build(self) -> Result<ShardDb, StorageError> {
+    pub async fn build(mut self) -> Result<ShardDb, StorageError> {
         let worker_id = self
             .worker_id
+            .clone()
             .unwrap_or_else(|| "worker-unknown".to_string());
+
+        // Inherit NVMe cache from WorkerStorageContext if not explicitly configured
+        if self.disk_cache_dir.is_none() {
+            if let Some(ref ctx) = self.storage_context {
+                if let Some(nvme) = ctx.nvme_config() {
+                    self.settings.object_store_cache_options.root_folder =
+                        Some(nvme.root_folder.clone());
+                    self.settings
+                        .object_store_cache_options
+                        .max_cache_size_bytes = Some(nvme.max_cache_size_bytes);
+                    self.settings.object_store_cache_options.part_size_bytes = nvme.part_size_bytes;
+                    self.settings.object_store_cache_options.scan_interval =
+                        Some(std::time::Duration::from_secs(3600));
+                    self.settings
+                        .object_store_cache_options
+                        .max_open_file_handles = 1000;
+                    self.settings.object_store_cache_options.cache_on_flush = nvme.cache_puts;
+                    self.settings.object_store_cache_options.cache_on_compaction = nvme.cache_puts;
+                    self.disk_cache_dir = Some(nvme.root_folder.clone());
+                }
+            }
+        }
+
+        // Inherit Bloom filter sizing from WorkerStorageContext if not explicitly set
+        if self.filter_bits_per_key.is_none() {
+            if let Some(ref ctx) = self.storage_context {
+                if let Some(bits) = ctx.filter_bits_per_key() {
+                    self.filter_bits_per_key = Some(bits);
+                }
+            }
+        }
+
         let db_cache = if let Some(ref ctx) = self.storage_context {
             ctx.db_cache()
         } else {
@@ -293,6 +419,15 @@ impl ShardDbBuilder {
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
             .with_db_cache(db_cache);
+
+        if let Some(policies) = self.filter_policies {
+            builder = builder.with_filter_policies(policies);
+        } else if let Some(bits) = self.filter_bits_per_key {
+            builder = builder.with_filter_policies(vec![
+                crate::keys::join_arrangement_bloom_filter_policy(bits),
+            ]);
+        }
+
         if let Some(shard_id) = self.metrics_shard_id {
             builder = builder.with_metrics_recorder(
                 crate::slatedb_metrics::instrumented_metrics_recorder(shard_id),
@@ -447,7 +582,7 @@ impl ShardDb {
         } else {
             prefix.to_vec()
         };
-        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
         while let Some(entry) = iter.next().await? {
             let key = if strip_version_prefix {
                 let logical = if self.format_version == 3 {
@@ -483,7 +618,7 @@ impl ShardDb {
         } else {
             prefix.to_vec()
         };
-        let mut iter = self.db.scan_prefix(physical_prefix).await?;
+        let mut iter = self.db.scan_prefix(physical_prefix, ..).await?;
         while let Some(entry) = iter.next().await? {
             let key = if strip_version_prefix {
                 let logical = if self.format_version == 3 {
@@ -584,7 +719,11 @@ impl ShardDb {
             );
             self.last_epoch.store(new_epoch, Ordering::SeqCst);
         }
-        self.db.put(self.physical_key(key), value).await?;
+        self.db
+            .put(self.physical_key(key), value)
+            .await?
+            .await_durable()
+            .await?;
         Ok(())
     }
 
@@ -593,7 +732,11 @@ impl ShardDb {
         if self.migration_pending {
             return Err(StorageError::MigrationInProgress);
         }
-        self.db.delete(self.physical_key(key)).await?;
+        self.db
+            .delete(self.physical_key(key))
+            .await?
+            .await_durable()
+            .await?;
         Ok(())
     }
 
@@ -604,7 +747,11 @@ impl ShardDb {
         if self.migration_pending {
             return Err(StorageError::MigrationInProgress);
         }
-        self.db.merge(self.physical_key(key), value).await?;
+        self.db
+            .merge(self.physical_key(key), value)
+            .await?
+            .await_durable()
+            .await?;
         Ok(())
     }
 
@@ -654,7 +801,7 @@ impl ShardDb {
                 BatchOp::Merge { key, value } => inner.merge(self.physical_key(&key), &value),
             }
         }
-        self.db.write(inner).await?;
+        self.db.write(inner).await?.await_durable().await?;
         Ok(())
     }
 
@@ -681,13 +828,13 @@ impl ShardDb {
         prefix: &[u8],
     ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();
-        let mut old_iter = self.db.scan_prefix(prefix).await?;
+        let mut old_iter = self.db.scan_prefix(prefix, ..).await?;
         while let Some(entry) = old_iter.next().await? {
             if self.db.get(format_v2_key(&entry.key)).await?.is_none() {
                 results.push((entry.key, entry.value));
             }
         }
-        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix)).await?;
+        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix), ..).await?;
         while let Some(entry) = new_iter.next().await? {
             let key = logical_key_from_format_v2(&entry.key)
                 .ok_or_else(|| StorageError::Unsupported("invalid v2 storage key".to_string()))?;
@@ -704,7 +851,7 @@ impl ShardDb {
     ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
         let mut results = Vec::new();
         let mut total_bytes = 0usize;
-        let mut old_iter = self.db.scan_prefix(prefix).await?;
+        let mut old_iter = self.db.scan_prefix(prefix, ..).await?;
         while let Some(entry) = old_iter.next().await? {
             if self.db.get(format_v2_key(&entry.key)).await?.is_some() {
                 continue;
@@ -718,7 +865,7 @@ impl ShardDb {
                 return Ok((results, true));
             }
         }
-        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix)).await?;
+        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix), ..).await?;
         while let Some(entry) = new_iter.next().await? {
             let key =
                 Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(
@@ -829,7 +976,7 @@ impl ShardDb {
             return self.scan_pending_prefix_bounded(prefix, max_bytes).await;
         }
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(prefix).await?;
+        let mut iter = self.db.scan_prefix(prefix, ..).await?;
         let mut total_bytes: usize = 0;
         while let Some(entry) = iter.next().await? {
             total_bytes += entry.key.len() + entry.value.len();
@@ -862,14 +1009,39 @@ impl ShardDb {
         let mut current_page_rows = 0usize;
         let mut pages = 0u64;
 
-        let all_entries = self.scan_prefix(prefix).await?;
-        for (key, val) in all_entries {
+        let strip_version_prefix = (self.format_version == 2 || self.format_version == 3)
+            && prefix.first().copied() != Some(0x06);
+        let physical_prefix = if strip_version_prefix {
+            if self.format_version == 3 {
+                format_v3_prefix(prefix)
+            } else {
+                format_v2_prefix(prefix)
+            }
+        } else {
+            prefix.to_vec()
+        };
+
+        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
+        while let Some(entry) = iter.next().await? {
             if progress.is_cancelled() {
                 return Err(StorageError::Unsupported(
                     "scan cancelled by caller".to_string(),
                 ));
             }
-            let entry_bytes = key.len() + val.len();
+            let key = if strip_version_prefix {
+                let logical = if self.format_version == 3 {
+                    logical_key_from_format_v3(&entry.key)
+                } else {
+                    logical_key_from_format_v2(&entry.key)
+                };
+                Bytes::copy_from_slice(logical.ok_or_else(|| {
+                    StorageError::Unsupported("invalid versioned storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+
+            let entry_bytes = key.len() + entry.value.len();
             if total_bytes + entry_bytes > max_buffer_bytes {
                 return Err(StorageError::ScanBufferLimitExceeded {
                     bytes: total_bytes + entry_bytes,
@@ -878,7 +1050,7 @@ impl ShardDb {
             }
             total_bytes += entry_bytes;
             current_page_rows += 1;
-            results.push((key, val));
+            results.push((key, entry.value));
 
             progress.rows_scanned.fetch_add(1, Ordering::SeqCst);
             progress
@@ -897,6 +1069,94 @@ impl ShardDb {
         }
 
         Ok(results)
+    }
+
+    /// Scan a single bounded page with continuation support (v0.67.1 Slice 2 / V0671-03).
+    ///
+    /// Reads at most `page_size` rows and `max_buffer_bytes`. If more entries
+    /// exist under `prefix`, returns `next_token` with the continuation key
+    /// and `is_last_page = false`.
+    pub async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        continuation_token: Option<&[u8]>,
+        page_size: usize,
+        max_buffer_bytes: usize,
+    ) -> Result<ScanPage, StorageError> {
+        let strip_version_prefix = (self.format_version == 2 || self.format_version == 3)
+            && prefix.first().copied() != Some(0x06);
+        let physical_prefix = if strip_version_prefix {
+            if self.format_version == 3 {
+                format_v3_prefix(prefix)
+            } else {
+                format_v2_prefix(prefix)
+            }
+        } else {
+            prefix.to_vec()
+        };
+
+        let mut iter = self.db.scan_prefix(&physical_prefix, ..).await?;
+        let mut rows = Vec::new();
+        let mut page_bytes = 0usize;
+        let mut is_last_page = true;
+
+        let resume_after: Option<Vec<u8>> = continuation_token.map(|tok| {
+            if strip_version_prefix {
+                if self.format_version == 3 {
+                    format_v3_key(tok)
+                } else {
+                    format_v2_key(tok)
+                }
+            } else {
+                tok.to_vec()
+            }
+        });
+
+        while let Some(entry) = iter.next().await? {
+            if let Some(ref resume) = resume_after {
+                if entry.key.as_ref() <= resume.as_slice() {
+                    continue;
+                }
+            }
+
+            let logical_key = if strip_version_prefix {
+                let logical = if self.format_version == 3 {
+                    logical_key_from_format_v3(&entry.key)
+                } else {
+                    logical_key_from_format_v2(&entry.key)
+                };
+                Bytes::copy_from_slice(logical.ok_or_else(|| {
+                    StorageError::Unsupported("invalid versioned storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+
+            let entry_bytes = logical_key.len() + entry.value.len();
+
+            if rows.len() >= page_size
+                || (page_bytes + entry_bytes > max_buffer_bytes && !rows.is_empty())
+            {
+                is_last_page = false;
+                break;
+            }
+
+            page_bytes += entry_bytes;
+            rows.push((logical_key, entry.value));
+        }
+
+        let next_token = if !is_last_page {
+            rows.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+
+        Ok(ScanPage {
+            rows,
+            next_token,
+            is_last_page,
+            page_bytes,
+        })
     }
 
     /// Flush the WAL to durable storage.
@@ -934,8 +1194,10 @@ impl ShardDb {
         let prefix = ShardKeyEncoder::meta_key(b"law_catalog/");
         let entries = self.scan_prefix(&prefix).await?;
         for (_, value) in entries {
-            if value.len() < ArrangementHeader::WIRE_SIZE {
-                continue; // malformed entry — skip (not a law catalog entry)
+            if value.len() != ArrangementHeader::WIRE_SIZE {
+                return Err(StorageError::MalformedArrangementHeader {
+                    length: value.len(),
+                });
             }
             let buf: [u8; 4] = match value[..4].try_into() {
                 Ok(b) => b,
@@ -1058,6 +1320,7 @@ impl ShardDb {
         let key = ShardKeyEncoder::frontier_key();
         // M1-S2: non-decreasing epoch assertion is enforced inside put().
         self.put(&key, &epoch.to_be_bytes()).await?;
+        self.flush().await?;
         Ok(ShardFrontierReport { shard_id, epoch })
     }
 
@@ -1118,7 +1381,11 @@ impl ShardDb {
         let raw = self.get(key).await?;
         match raw {
             None => Ok(None),
-            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => Ok(None),
+            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => {
+                Err(StorageError::MalformedArrangementHeader {
+                    length: bytes.len(),
+                })
+            }
             Some(bytes) => {
                 let buf: [u8; 4] = match bytes[..4].try_into() {
                     Ok(b) => b,
@@ -1248,6 +1515,17 @@ pub enum BatchOp {
     Merge { key: Vec<u8>, value: Vec<u8> },
 }
 
+impl BatchOp {
+    /// Return the key affected by this operation.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            BatchOp::Put { key, .. } => key,
+            BatchOp::Delete { key } => key,
+            BatchOp::Merge { key, .. } => key,
+        }
+    }
+}
+
 /// Atomic write batch for multiple operations.
 ///
 /// All operations in a batch are committed atomically.
@@ -1304,6 +1582,11 @@ impl WriteBatch {
     /// Returns true if the batch has no operations.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// Returns the operations in the batch.
+    pub fn ops(&self) -> &[BatchOp] {
+        &self.ops
     }
 
     /// Returns the total byte size of keys and values in this batch.

@@ -26,6 +26,8 @@ pub mod config_deriver;
 pub mod freshness;
 pub mod frontier;
 pub mod kek;
+pub mod management;
+pub mod management_store;
 pub mod manifest;
 pub mod migration;
 pub mod namespace;
@@ -60,6 +62,12 @@ pub use freshness::{
 };
 pub use frontier::{AggregatorError, FrontierAggregator};
 pub use kek::{AwsKmsKekProvider, EnvKekProvider, KekError, KekProvider};
+pub use management::{ManagementService, ManagementServiceHandle};
+pub use management_store::{
+    IdempotencyRecord, ManagementOperationStore, OperationKind, OperationLifecycleError,
+    OperationRecord, OperationStatus, OperationStoreError, OperationUpdate,
+    IDEMPOTENCY_KEY_RETENTION_MS, MANAGEMENT_OPERATION_RECORD_VERSION,
+};
 pub use manifest::{
     compute_file_sha256, validate_catalog_reference, verify_backup_payload_files,
     BackupConcurrencyGovernor, BackupFileEntry, BackupManifest, BackupPoint,
@@ -69,12 +77,14 @@ pub use manifest::{
 };
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
-    MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationPersistentStore,
-    MigrationShard, PhaseClocks, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
+    MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationLoadError,
+    MigrationPersistentStore, MigrationRecovery, MigrationShard, PhaseClocks,
+    MAX_ACTIVE_MIGRATIONS, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
 };
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
 pub use qualification_store::QualificationEvidenceStore;
+pub use rockstream_types::migration::MigrationProgress;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
 pub use service::{ControlService, ControlServiceHandle};

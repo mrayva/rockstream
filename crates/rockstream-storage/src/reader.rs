@@ -8,7 +8,7 @@ use bytes::Bytes;
 use object_store::ObjectStore;
 use rockstream_types::compatibility::SupportedStorageFormatRange;
 use slatedb::config::DbReaderOptions;
-use slatedb::DbReader;
+use slatedb::{DbReader, DbReaderMode};
 use tokio::sync::mpsc;
 
 use crate::error::StorageError;
@@ -56,7 +56,7 @@ impl ShardReader {
             ))
         })?;
         let reader = slatedb::DbReader::builder(path.clone(), object_store)
-            .with_checkpoint_id(checkpoint_id)
+            .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
             .build()
             .await?;
         Self::from_reader(path, reader, SupportedStorageFormatRange::v1_through_v2()).await
@@ -75,6 +75,38 @@ impl ShardReader {
             SupportedStorageFormatRange::v1_through_v2(),
         )
         .await
+    }
+
+    /// Open a reader configured with NVMe disk cache and Bloom filter policies.
+    pub async fn open_with_cache_and_filter(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        disk_cache_dir: Option<std::path::PathBuf>,
+        max_cache_bytes: Option<usize>,
+        filter_bits_per_key: Option<u32>,
+    ) -> Result<Self, StorageError> {
+        let path = path.into();
+        let mut options = DbReaderOptions::default();
+        if let Some(dir) = disk_cache_dir {
+            options.object_store_cache_options.root_folder = Some(dir);
+            if let Some(max) = max_cache_bytes {
+                options.object_store_cache_options.max_cache_size_bytes = Some(max);
+            }
+            options.object_store_cache_options.part_size_bytes = 4 * 1024 * 1024;
+            options.object_store_cache_options.cache_on_flush = true;
+            options.object_store_cache_options.cache_on_compaction = true;
+            options.object_store_cache_options.scan_interval =
+                Some(std::time::Duration::from_secs(3600));
+            options.object_store_cache_options.max_open_file_handles = 1000;
+        }
+        let mut builder = DbReader::builder(path.clone(), object_store).with_options(options);
+        if let Some(bits) = filter_bits_per_key {
+            builder = builder.with_filter_policies(vec![
+                crate::keys::join_arrangement_bloom_filter_policy(bits),
+            ]);
+        }
+        let reader = builder.build().await?;
+        Self::from_reader(path, reader, SupportedStorageFormatRange::v1_through_v2()).await
     }
 
     /// Open a reader while enforcing an inclusive storage-format range.
@@ -203,13 +235,16 @@ impl ShardReader {
         prefix: &[u8],
     ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();
-        let mut old_iter = self.reader.scan_prefix(prefix).await?;
+        let mut old_iter = self.reader.scan_prefix(prefix, ..).await?;
         while let Some(entry) = old_iter.next().await? {
             if self.reader.get(format_v2_key(&entry.key)).await?.is_none() {
                 results.push((entry.key, entry.value));
             }
         }
-        let mut new_iter = self.reader.scan_prefix(format_v2_prefix(prefix)).await?;
+        let mut new_iter = self
+            .reader
+            .scan_prefix(format_v2_prefix(prefix), ..)
+            .await?;
         while let Some(entry) = new_iter.next().await? {
             let key = logical_key_from_format_v2(&entry.key)
                 .ok_or_else(|| StorageError::Unsupported("invalid v2 storage key".to_string()))?;
@@ -230,7 +265,7 @@ impl ShardReader {
         } else {
             prefix.to_vec()
         };
-        let mut iter = self.reader.scan_prefix(physical_prefix).await?;
+        let mut iter = self.reader.scan_prefix(physical_prefix, ..).await?;
         while let Some(entry) = iter.next().await? {
             let key = if strip_v2_prefix {
                 Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
@@ -266,7 +301,7 @@ impl ShardReader {
         };
         let mut page = Vec::with_capacity(max_rows);
         let mut page_bytes = 0usize;
-        let mut iter = match self.reader.scan_prefix(physical_prefix).await {
+        let mut iter = match self.reader.scan_prefix(physical_prefix, ..).await {
             Ok(iter) => iter,
             Err(error) => {
                 let _ = sender.send(Err(error.into())).await;
