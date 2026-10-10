@@ -106,7 +106,8 @@ async fn connect_gateway(addr: SocketAddr) -> Client {
 }
 
 async fn wait_for_management(management: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Generous: coverage-instrumented binaries start slowly on shared runners.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(mut client) =
             ManagementServiceClient::connect(format!("http://{management}")).await
