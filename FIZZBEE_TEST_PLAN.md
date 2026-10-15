@@ -636,7 +636,161 @@ reached a green CI-fast result (~5s, comparable to M4's own ~6.6s baseline)
 after five iterative state-space/liveness fixes, documented in the spec's own
 header comments and in `formal/findings.md`.
 
+**M7 persisted-authority startup boundary (issue #104).** The M7 Raft
+model assumes a running node has first restored its durable
+`(current_term, voted_for)` pair. A never-before-created state object is
+initialized to exactly `(0, None)`. On restart, existing valid bytes (for
+example, term 7 and vote A) must be restored without modifying authority.
+Malformed JSON, permission errors, transient object GET errors, and errors
+while reading an object body are **not** equivalent to absence: the real
+`RaftPersistentStore::load` returns an `RS-0003` storage/corruption error
+and `spawn_raft_node` aborts before opening a peer listener or spawning the
+election driver. Every failed startup leaves the persisted bytes untouched
+and emits no vote grants or leadership events. These storage-read failures
+are a *precondition failure outside the running-node election state space*,
+not an M7 leader-election transition; the M7-S1/M7-S2/M7-S3 and M7-L1
+assertions remain unchanged for nodes that successfully start. The
+independent round-trip, fault-injected startup, side-effect, byte-preservation,
+and absent-state cases are exercised by
+`crates/rockstream-control/tests/raft_state_durability_tests.rs`.
+
+**M7 persisted-authority write ordering (issue #105).** An accepted
+`RequestVote`, an observed higher-term `Heartbeat`, or a local election
+must publish the corresponding `(current_term, voted_for)` to durable storage
+*before* acknowledging the RPC or using its new election authority. The M7
+logical actions assume that a completed term/vote change is durably ordered;
+the implementation closes the gap between that model boundary and real
+unconditional object-store PUTs by taking one per-node asynchronous
+`RaftPersistentStore::transition_lock` across both the in-memory transition
+and the subsequent PUT. This covers inbound vote and heartbeat handlers,
+the election self-vote, and higher-term step-down after outbound vote or
+heartbeat RPCs; the lock is **not** held while awaiting peer RPCs. A higher
+term's write cannot overtake a still-in-flight lower-term write, nor can a
+dependent acknowledgement precede its own successful PUT. Unlike conditional
+writes or an external transaction coordinator, this local lock only orders
+writers sharing one `RaftPersistentStore` instance; it does not claim
+cross-process compare-and-swap semantics.
+
+The production-boundary regression tests in
+`crates/rockstream-control/src/raft/persistence_ordering_tests.rs`
+explicitly park a term-7 ObjectStore PUT while polling concurrent higher-term
+vote, heartbeat, and election paths, then release that write. They compare
+the complete ordered write transcript, term-8 recovered vote B (or the
+scenario-specific empty vote), and the exact rejection of a subsequent
+term-8 candidate on the restarted TCP peer listener. These tests cover the
+real async storage interleavings excluded from the abstract M7 transition
+model; no new FizzBee transition or invariant is asserted.
+
 ### 3.6 Cross-Cutting Coverage Assertions
+
+Issue #117 closes an implementation-level liveness gap in exchange flow control.
+`FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
+and the separately reachable row-only `acquire_credit` register their Tokio
+notification future before checking capacity. A release after a failed check but
+before awaiting that future must remain observable; row-only releases also notify
+batch-permit waiters sharing the row budget. Capacity is still checked under the channel lock,
+so one released row admits exactly one acquisition even when multiple waiters wake.
+
+The seven barrier-controlled regressions in
+`crates/rockstream-runtime/src/exchange/credit_wait_tests.rs` pause the real wait
+loops in that gap, drive production sends through a controlled outgoing queue,
+and compare complete frame and completion/accounting transcripts. With budget one,
+one release must complete the next acquisition within a bounded deadline, leaving
+exactly one outstanding row and zero available credit; its release restores zero
+outstanding rows and one available credit. Two waiters require two successive
+releases, send reservations release through matching acknowledgements, and
+batch-permit coverage includes a legacy row-only credit release.
+These tests cover Tokio notification ordering outside the abstract M1–M7 consensus
+state machines; no new FizzBee transition or liveness proof is claimed.
+
+Issue #116 makes worker-local exchange reservation ownership explicit in
+`WorkerStreamMultiplexer::send_frame`: admission reserves rows, batches, bytes,
+and pending requests together. Cancellation or failure before transport enqueue
+releases the reservation. Queue publication transfers ownership without an
+intervening suspension to acknowledgement accounting keyed by channel, epoch,
+and sequence; cancelling the producer after publication cannot release delivered
+work. A matching acknowledgement releases one queued reservation, including each
+overlapping retransmission. Shared-memory completion, durable upload completion,
+and exchange teardown release the corresponding reservations without a later ack.
+Admission registers its wakeup before checking capacity so release cannot be lost.
+The `production_sender_*` tests in
+`crates/rockstream-runtime/src/exchange/multiplexer.rs` exercise the production
+sender through controlled queue and acknowledgement barriers: each non-row limit
+is saturated independently while row credits remain, oversized frames fail
+without delivery or accounting changes, and cancellation before delivery restores
+the complete budget for a subsequent full-budget weighted batch. Post-delivery
+cancellation retains the reservation until acknowledgement; stale acknowledgements,
+overlapping retransmissions, failed sends, durable delivery, and teardown have
+exact accounting and complete batch oracles. These transport budgets and Tokio
+task cancellation are implementation-level concerns absent from the M1–M7
+models; durable epoch acceptance, frontier publication, and fencing transitions
+remain unchanged. The runtime tests supply this coverage without claiming a new
+FizzBee invariant or adding an abstract protocol transition.
+
+Issue #114 adds TopK spill/checkpoint recovery conformance at the M1 storage
+boundary. `ShardDb::set_fail_scans` injects a prefix-scan error before returning
+records; it does not change durable storage or the coordination state machine.
+`topk_storage_failures_leave_full_state_unchanged` in
+`crates/rockstream-ops/src/topk.rs` compares every accepted partition and stored
+spill record after scan, corruption, and atomic write failures.
+`topk_truncated_checkpoint_returns_corruption` rejects a malformed persisted
+record without returning a partial operator. The LFS and MinIO
+`*_topk_spilled_state_recovers_after_close` tests checkpoint actual spilled rows,
+close/reopen the same backend, and compare complete weighted outputs with
+uninterrupted execution. TopK ranking and record decoding remain data-plane
+concerns under §1.2; these tests retain M1's atomic `WriteBatch` assumption and
+add implementation coverage without introducing a new FizzBee transition.
+
+Issue #108 adds a real three-control-process M7/M4 authority-loss oracle in
+`crates/rockstream-sim/tests/control_plane_ha_tests.rs`:
+`three_process_sigkill_rejects_stale_writes_and_recovers_exact_rows`
+(SIGKILL without bootstrap) and
+`three_process_live_isolation_rejects_stale_writes_and_recovers_exact_rows`
+(disconnect old leader from the Raft network while its process stays alive).
+Both use real worker-facing `FenceWrite` authorization before durable shard
+writes, compare the exact pre/post-transition accept/deny transcript,
+reopen persistent storage, and compare the entire row map against the
+independent acknowledged history. This extends M7-S1/S2/S3 and M4-S1/S3
+conformance: a current leader must hold a recent voting quorum, and an
+isolated former leader must fail closed rather than validate a stale lease.
+The older `lease_ha_leader_kill_tests.rs` tests are explicitly relabeled
+as orderly shutdown/fresh bootstrap and forced demotion, respectively; they
+are not automatic leader-death or network-partition evidence.
+
+
+
+Issue #107 makes control startup reconcile persisted M6 migrations instead of
+dropping the recovered records. Restart from Copying, FencingOld and Verifying
+requires a live driver and therefore surfaces a typed blocked outcome without
+advancing the M6 state machine or altering lease ownership and bucket contents.
+GcEligible may resume donor cleanup only when cleanup intent was durably recorded
+before the interruption, a cutover epoch and completed verification are recorded,
+recipient lease ownership exists, and the donor database is explicitly available.
+Cleanup uses idempotent per-key deletion; a persisted Done record with cleanup
+intent is archived even if history was already written. An unsupported replay
+remains blocked with its complete active record intact. These startup choices
+preserve the existing M6-S1 single-authority and M6-S3 cutover/frontier rules
+rather than introducing any new model state or migration ownership policy.
+The production startup regressions in
+`crates/rockstream-control/tests/migration_startup_recovery_tests.rs`
+assert exact blocked states and intact records for the four phases, partial
+cleanup completion, both terminal archive interruption windows, complete
+donor/recipient maps, unchanged authoritative leases and unrelated buckets,
+and idempotent second startup. The abstract M6 FizzBee model remains unchanged.
+
+
+Issue #106 tightens the changelog checkpoint coordinator's final-confirmation
+snapshot: after each shard records its durable contribution, the last shard
+confirmation must commit a complete manifest and matching contributions map
+from the same completed round. Confirmations may interleave in either order;
+a per-shard map snapshot taken before final confirmation is not a valid commit
+oracle. This is an implementation-level atomicity boundary within the M1-S1
+all-shard checkpoint completion rule, not a new FizzBee transition. The
+sequential and both barrier-synchronized concurrent schedules are asserted by
+`changelog_manifest_waits_for_every_durable_shard_contribution` and
+`concurrent_changelog_confirmations_commit_complete_contributions_in_either_order`
+in `crates/rockstream-control/src/checkpoint.rs`: exactly one complete callback,
+matching latest committed manifest, and zero remaining alignment credits.
 
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the

@@ -14,7 +14,7 @@ use super::envelope::compute_checksum;
 use super::{
     CatalogDatabase, CatalogError, CatalogIndexEntry, CatalogInlineView, CatalogNamespace,
     CatalogRoleEntry, CatalogSinkEntry, CatalogSourceEntry, CatalogTable, CatalogView,
-    CompiledPlanRecord, ViewDependency,
+    CatalogWorkloadEntry, CompiledPlanRecord, ViewDependency,
 };
 use rockstream_types::ids::{
     CompiledPlanId, IndexId, PrincipalId, SinkId, SourceId, TableId, ViewId, WorkloadId,
@@ -36,10 +36,15 @@ pub enum CatalogMutation {
     PutInlineView(CatalogInlineView),
     DeleteInlineView(ViewId),
     PutViewDependency(ViewDependency),
-    DeleteViewDependency { parent_id: u64, child_id: u64 },
+    DeleteViewDependency {
+        parent_id: u64,
+        child_id: u64,
+    },
     PutIndex(CatalogIndexEntry),
     DeleteIndex(IndexId),
     PutWorkload(WorkloadDef),
+    /// Explicit identity recorded on commit; used for replay without allocation.
+    PutWorkloadWithId(CatalogWorkloadEntry),
     DeleteWorkload(WorkloadId),
     PutSource(CatalogSourceEntry),
     DeleteSource(SourceId),

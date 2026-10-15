@@ -37,7 +37,7 @@ use parking_lot::RwLock;
 use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 use rockstream_types::raft::{
     HeartbeatRequest, HeartbeatResponse, RaftNodeId, RaftRpcRequest, RaftRpcResponse,
@@ -81,6 +81,8 @@ pub struct RaftPersistentState {
 pub struct RaftPersistentStore {
     store: Arc<dyn ObjectStore>,
     path: Path,
+    /// Serialize each authority transition with its durable PUT.
+    transition_lock: Mutex<()>,
 }
 
 impl RaftPersistentStore {
@@ -88,19 +90,30 @@ impl RaftPersistentStore {
         Self {
             store,
             path: Path::from("control/raft/state.json"),
+            transition_lock: Mutex::new(()),
         }
     }
 
-    /// Load the persisted state, or the zero-value default if nothing has
-    /// been persisted yet (first-ever boot of this control node).
-    pub async fn load(&self) -> RaftPersistentState {
-        match self.store.get(&self.path).await {
-            Ok(result) => match result.bytes().await {
-                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                Err(_) => RaftPersistentState::default(),
-            },
-            Err(_) => RaftPersistentState::default(),
-        }
+    /// Load persisted authority. Only a genuinely missing object represents
+    /// first boot; corruption or an unreadable object must abort startup.
+    pub async fn load(&self) -> io::Result<RaftPersistentState> {
+        let result = match self.store.get(&self.path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Ok(RaftPersistentState::default());
+            }
+            Err(error) => return Err(raft_load_error("failed to get", error)),
+        };
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|error| raft_load_error("failed to read body of", error))?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RS-0003: malformed Raft term/vote state: {error}"),
+            )
+        })
     }
 
     /// Persist state. Term/vote MUST be durable before the caller acts on
@@ -118,12 +131,38 @@ impl RaftPersistentStore {
     }
 }
 
+/// Preserve an underlying filesystem error kind when the object store
+/// wraps it, while retaining the storage error code and its original cause.
+fn raft_load_error(action: &str, error: object_store::Error) -> io::Error {
+    let kind = match &error {
+        object_store::Error::Generic { source, .. } => source
+            .downcast_ref::<io::Error>()
+            .map_or(io::ErrorKind::Other, io::Error::kind),
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(
+        kind,
+        format!("RS-0003: {action} Raft term/vote state: {error}"),
+    )
+}
+
 struct RaftInner {
     node_id: RaftNodeId,
     persistent: RaftPersistentState,
     role: RaftRole,
     current_leader: Option<RaftNodeId>,
     last_contact: Instant,
+    /// Last majority-backed confirmation of this node's leadership.
+    last_quorum_contact: Instant,
+    /// Strictly shorter than a follower's earliest election timeout.
+    leader_quorum_timeout: Duration,
+}
+
+/// Reject stale leadership even before the background heartbeat task demotes
+/// a process that has lost contact with its voting majority.
+fn has_live_leader_quorum(guard: &RaftInner) -> bool {
+    guard.role == RaftRole::Leader
+        && guard.last_quorum_contact.elapsed() < guard.leader_quorum_timeout
 }
 
 /// Handle to a running Raft node's election state. Cheap to clone; safe to
@@ -162,7 +201,7 @@ impl RaftHandle {
     }
 
     pub fn is_leader(&self) -> bool {
-        self.inner.read().role == RaftRole::Leader
+        has_live_leader_quorum(&self.inner.read())
     }
 
     pub fn current_term(&self) -> u64 {
@@ -180,7 +219,7 @@ impl RaftHandle {
     /// with the write.
     pub fn require_leader(&self) -> Result<u64, NotLeader> {
         let guard = self.inner.read();
-        if guard.role == RaftRole::Leader {
+        if has_live_leader_quorum(&guard) {
             assert_write_requires_leadership(guard.role, true);
             Ok(guard.persistent.current_term)
         } else {
@@ -192,7 +231,7 @@ impl RaftHandle {
     /// derived from, or `None` if this node is not currently leader.
     pub fn leader_epoch(&self) -> Option<u64> {
         let guard = self.inner.read();
-        if guard.role == RaftRole::Leader {
+        if has_live_leader_quorum(&guard) {
             Some(control_leader_epoch(
                 guard.persistent.current_term,
                 guard.node_id,
@@ -377,13 +416,20 @@ pub async fn spawn_raft_node(
     object_store: Arc<dyn ObjectStore>,
 ) -> io::Result<RaftNodeHandleFull> {
     let store = Arc::new(RaftPersistentStore::new(object_store));
-    let initial = store.load().await;
+    let initial = store.load().await?;
     let inner = Arc::new(RwLock::new(RaftInner {
         node_id: config.node_id,
         persistent: initial,
         role: RaftRole::Follower,
         current_leader: None,
         last_contact: Instant::now(),
+        last_quorum_contact: Instant::now(),
+        // Expire stale authority before surviving followers can elect a new
+        // leader. Every majority heartbeat round renews this lease.
+        leader_quorum_timeout: config
+            .election_timeout_min
+            .saturating_sub(config.heartbeat_interval / 2)
+            .max(config.heartbeat_interval),
     }));
 
     let listener = TcpListener::bind(bind_addr).await?;
@@ -469,6 +515,7 @@ async fn handle_request_vote(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) -> RequestVoteResponse {
+    let _transition = store.transition_lock.lock().await;
     let (grant, response_term, snapshot) = {
         let mut guard = inner.write();
         if req.term > guard.persistent.current_term {
@@ -497,6 +544,7 @@ async fn handle_heartbeat(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) -> HeartbeatResponse {
+    let _transition = store.transition_lock.lock().await;
     let mut to_persist = None;
     let response_term = {
         let mut guard = inner.write();
@@ -630,19 +678,21 @@ async fn start_election(
     inner: &Arc<RwLock<RaftInner>>,
     store: &RaftPersistentStore,
 ) {
-    let (term, node_id, snapshot) = {
-        let mut guard = inner.write();
-        guard.role = RaftRole::Candidate;
-        guard.persistent.current_term += 1;
-        guard.persistent.voted_for = Some(config.node_id);
-        guard.last_contact = Instant::now();
-        (
-            guard.persistent.current_term,
-            config.node_id,
-            guard.persistent,
-        )
+    // Persist the self-vote before sending any RPCs. Never hold this lock
+    // across peer network calls, which can themselves lead to transitions.
+    let (term, node_id) = {
+        let _transition = store.transition_lock.lock().await;
+        let (term, snapshot) = {
+            let mut guard = inner.write();
+            guard.role = RaftRole::Candidate;
+            guard.persistent.current_term += 1;
+            guard.persistent.voted_for = Some(config.node_id);
+            guard.last_contact = Instant::now();
+            (guard.persistent.current_term, guard.persistent)
+        };
+        store.save(&snapshot).await;
+        (term, config.node_id)
     };
-    store.save(&snapshot).await;
 
     let mut votes = 1usize; // vote for self
     let majority = config.peers.len().div_ceil(2) + 1;
@@ -666,6 +716,7 @@ async fn start_election(
     // `.await` below — required for the containing future to remain `Send`
     // (a lock guard held live across an `.await` point is not `Send`, even
     // if it is logically dropped on every path before reaching that point).
+    let _transition = store.transition_lock.lock().await;
     let step_down_snapshot: Option<RaftPersistentState> = {
         let mut guard = inner.write();
         // Drop this outcome if a concurrent RPC already moved us past the
@@ -682,6 +733,7 @@ async fn start_election(
             if votes >= majority {
                 guard.role = RaftRole::Leader;
                 guard.current_leader = Some(node_id);
+                guard.last_quorum_contact = Instant::now();
                 // node_role is ephemeral (not persisted) — matches the
                 // FizzBee spec's `@state(ephemeral=["node_role", ...])`
                 // annotation.
@@ -711,12 +763,18 @@ async fn send_heartbeats(
         .iter()
         .map(|(_, addr)| send_heartbeat(addr, term, node_id, config.rpc_timeout));
     let mut highest = term;
+    let mut acknowledgements = 1usize; // the leader itself
     for resp in join_all(futures).await.into_iter().flatten() {
         if resp.term > highest {
             highest = resp.term;
         }
+        if resp.term == term {
+            acknowledgements += 1;
+        }
     }
+    let majority = config.peers.len().div_ceil(2) + 1;
     if highest > term {
+        let _transition = store.transition_lock.lock().await;
         // See `start_election`'s comment: the guard's scope must end at
         // this block's closing brace, before the `.await` below.
         let step_down_snapshot: Option<RaftPersistentState> = {
@@ -733,6 +791,18 @@ async fn send_heartbeats(
         };
         if let Some(snapshot) = step_down_snapshot {
             store.save(&snapshot).await;
+        }
+    } else {
+        let mut guard = inner.write();
+        if guard.role == RaftRole::Leader && guard.persistent.current_term == term {
+            if acknowledgements >= majority {
+                guard.last_quorum_contact = Instant::now();
+            } else if !has_live_leader_quorum(&guard) {
+                // Loss of majority is an ephemeral demotion; no durable term
+                // or vote changes. The isolated process cannot grant leases.
+                guard.role = RaftRole::Follower;
+                guard.current_leader = None;
+            }
         }
     }
 }
@@ -802,7 +872,7 @@ mod tests {
     #[tokio::test]
     async fn persistent_store_roundtrips_through_object_store() {
         let store = RaftPersistentStore::new(mem_store());
-        let loaded = store.load().await;
+        let loaded = store.load().await.unwrap();
         assert_eq!(loaded, RaftPersistentState::default());
 
         let state = RaftPersistentState {
@@ -810,7 +880,7 @@ mod tests {
             voted_for: Some(2),
         };
         store.save(&state).await;
-        let reloaded = store.load().await;
+        let reloaded = store.load().await.unwrap();
         assert_eq!(reloaded, state);
     }
 
@@ -875,3 +945,6 @@ mod tests {
         n2.shutdown();
     }
 }
+
+#[cfg(test)]
+mod persistence_ordering_tests;
