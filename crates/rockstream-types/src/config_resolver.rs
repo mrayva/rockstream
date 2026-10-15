@@ -815,7 +815,10 @@ fn apply_env_vars(
                 }
             }
             ["EXECUTION", "JOIN_STRATEGY"] => {
-                if let Ok(val) = toml::from_str::<crate::config::JoinStrategy>(&format!("\"{v}\""))
+                // A bare quoted string is not a TOML document, so `toml::from_str` could never
+                // parse it and this variable was silently ignored; deserialize from a value.
+                if let Ok(val) =
+                    toml::Value::String(v.clone()).try_into::<crate::config::JoinStrategy>()
                 {
                     config.execution.join_strategy = val;
                     origins.insert(
