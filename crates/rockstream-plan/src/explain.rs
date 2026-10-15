@@ -312,4 +312,213 @@ mod tests {
         assert_eq!(row_s.operator_kind, "Source[events]");
         assert_eq!(row_k.operator_kind, "Sink[output_view]");
     }
+
+    // ── explain_op_node: every operator kind ──────────────────────────────
+
+    fn node_of(kind: OpKind) -> OpNode {
+        OpNode {
+            id: OperatorId(9),
+            kind,
+            merge_law: None,
+            not_merge_safe_reason: None,
+            inputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_operator_kind_renders_its_label() {
+        use crate::{ExchangeKind, LateDataPolicy, LateralFunc, OuterJoinKind, WindowStrategy};
+
+        let cases: Vec<(OpKind, &str)> = vec![
+            (
+                OpKind::Source {
+                    name: "orders".into(),
+                },
+                "Source[orders]",
+            ),
+            (OpKind::Filter, "Filter"),
+            (OpKind::Project, "Project"),
+            (OpKind::Map, "Map"),
+            (OpKind::Aggregate, "Aggregate"),
+            (
+                OpKind::VirtualBucketSplit {
+                    bucket_count: 16,
+                    key_prefix_len: 2,
+                },
+                "VirtualBucketSplit[buckets=16,prefix=2]",
+            ),
+            (
+                OpKind::VirtualBucketCombine {
+                    source: OperatorId(4),
+                },
+                "VirtualBucketCombine[source=op-4]",
+            ),
+            (OpKind::Join, "Join"),
+            (OpKind::Union, "Union"),
+            (OpKind::Sink { name: "out".into() }, "Sink[out]"),
+            (
+                OpKind::Window {
+                    strategy: WindowStrategy::SlidingAggregate,
+                },
+                "Window[SlidingAggregate]",
+            ),
+            (
+                OpKind::TumbleWindow {
+                    window_size_ms: 1000,
+                    late_data_policy: LateDataPolicy::Drop,
+                },
+                "TumbleWindow[1000ms,Drop]",
+            ),
+            (
+                OpKind::HopWindow {
+                    window_size_ms: 1000,
+                    slide_ms: 250,
+                    late_data_policy: LateDataPolicy::Update,
+                },
+                "HopWindow[1000ms/250ms,Update]",
+            ),
+            (
+                OpKind::SessionWindow {
+                    gap_ms: 30_000,
+                    late_data_policy: LateDataPolicy::RouteToSink {
+                        sink_name: "late".into(),
+                    },
+                },
+                "SessionWindow[30000ms,RouteToSink { sink_name: \"late\" }]",
+            ),
+            (
+                OpKind::TopK {
+                    k: 3,
+                    rank_col: 1,
+                    partition_by: vec![0, 2],
+                },
+                "TopK[k=3,rank=1,partitions=[0, 2]]",
+            ),
+            (
+                OpKind::Recursion {
+                    max_iterations: 10,
+                    monotone: true,
+                },
+                "Recursion[max_iter=10,monotone=true]",
+            ),
+            (
+                OpKind::Snapshot {
+                    source_name: "orders".into(),
+                    batch_size: 500,
+                },
+                "Snapshot[orders,batch=500]",
+            ),
+            (
+                OpKind::ViewRef {
+                    view_name: "mv".into(),
+                },
+                "ViewRef[mv]",
+            ),
+            (
+                OpKind::Lateral {
+                    func: LateralFunc::Unnest { col: 2 },
+                },
+                "Lateral[Unnest { col: 2 }]",
+            ),
+            (
+                OpKind::ViewSink {
+                    view_name: "mv".into(),
+                    pk: vec![0],
+                },
+                "ViewSink[mv,pk=[0]]",
+            ),
+            (
+                OpKind::Exchange {
+                    kind: ExchangeKind::Hash,
+                },
+                "Exchange[Hash]",
+            ),
+            (
+                OpKind::OuterJoin {
+                    kind: OuterJoinKind::Left,
+                    left_keys: vec![0],
+                    right_keys: vec![0],
+                },
+                "OuterJoin[Left]  dual_arrangement+unmatched",
+            ),
+            (
+                OpKind::Distinct,
+                "Distinct  merge_law=WeightAdd/v1  zero_crossing",
+            ),
+            (
+                OpKind::Intersect { all: true },
+                "Intersect[ALL]  dual_arrangement  min_weight",
+            ),
+            (
+                OpKind::Intersect { all: false },
+                "Intersect[SET]  dual_arrangement  min_weight",
+            ),
+            (
+                OpKind::Except { all: true },
+                "Except[ALL]  dual_arrangement  subtract_weight",
+            ),
+            (
+                OpKind::Except { all: false },
+                "Except[SET]  dual_arrangement  subtract_weight",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let row = explain_op_node(&node_of(kind), 2, ExplainLevel::Default);
+            assert_eq!(row.operator_kind, expected);
+            assert_eq!(row.depth, 2, "{expected}");
+            assert!(
+                row.shard_info.is_none() && row.operator_stats.is_none(),
+                "{expected}: default level is bare"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_levels_add_shard_info_then_runtime_stats() {
+        let node = node_of(OpKind::Join);
+        let default = explain_op_node(&node, 0, ExplainLevel::Default);
+        let verbose = explain_op_node(&node, 0, ExplainLevel::Verbose);
+        let analyze = explain_op_node(&node, 0, ExplainLevel::Analyze);
+
+        assert!(default.shard_info.is_none() && default.operator_stats.is_none());
+        let shards = verbose.shard_info.expect("verbose carries shard info");
+        assert_eq!(
+            (
+                shards.shard_count,
+                shards.parallelism,
+                shards.frontier_epoch
+            ),
+            (1, 1, 0)
+        );
+        assert!(verbose.operator_stats.is_none(), "stats are Analyze-only");
+        assert!(analyze.shard_info.is_some());
+        let stats = analyze
+            .operator_stats
+            .expect("analyze carries runtime stats");
+        assert_eq!((stats.state_reads, stats.dlq_entries), (120, 0));
+    }
+
+    #[test]
+    fn format_explain_text_joins_one_line_per_row() {
+        let rows = vec![
+            explain_op_node(
+                &node_of(OpKind::Sink { name: "out".into() }),
+                0,
+                ExplainLevel::Default,
+            ),
+            explain_op_node(&node_of(OpKind::Distinct), 1, ExplainLevel::Default),
+        ];
+        let text = format_explain_text(&rows, ExplainLevel::Default);
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].contains("Sink[out]") && !lines[0].starts_with(' '),
+            "{text}"
+        );
+        assert!(
+            lines[1].starts_with("  ") && lines[1].contains("Distinct"),
+            "{text}"
+        );
+        assert_eq!(format_explain_text(&[], ExplainLevel::Default), "");
+    }
 }

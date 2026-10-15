@@ -75,169 +75,204 @@ jobs:
           cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
+      # Every gate below runs even when an earlier one failed (`!cancelled()`), so one run lists all the
+      # crates under their floor instead of stopping at the first; the job still fails if any gate fails.
       # Collect the complete explicit feature matrix once. The per-crate checks
       # below are report-only so every floor uses the same profile.
       - name: cargo llvm-cov (rockstream-gateway lines ≥76%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-gateway --fail-under-lines 76
       - name: cargo llvm-cov (rockstream-gateway regions ≥77%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-gateway --fail-under-regions 77
       - name: cargo llvm-cov (rockstream-docgen lines ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-docgen --fail-under-lines 70
       - name: cargo llvm-cov (rockstream-docgen regions ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-docgen --fail-under-regions 70
       - name: cargo llvm-cov (rockstream-management-proto lines ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-management-proto --fail-under-lines 70
       - name: cargo llvm-cov (rockstream-management-proto regions ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-management-proto --fail-under-regions 70
       - name: cargo llvm-cov (rockstream-diff lines ≥76%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-diff --fail-under-lines 76
       - name: cargo llvm-cov (rockstream-diff regions ≥71%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-diff --fail-under-regions 71
       - name: cargo llvm-cov (rockstream-ops lines ≥81%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-ops --fail-under-lines 81
       - name: cargo llvm-cov (rockstream-ops regions ≥81%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-ops --fail-under-regions 81
       - name: cargo llvm-cov (rockstream-storage lines ≥75%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-storage --fail-under-lines 75
       - name: cargo llvm-cov (rockstream-storage regions ≥75%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-storage --fail-under-regions 75
       - name: cargo llvm-cov (rockstream-runtime lines ≥76%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-runtime --fail-under-lines 76
       - name: cargo llvm-cov (rockstream-runtime regions ≥79%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-runtime --fail-under-regions 79
       - name: cargo llvm-cov (rockstream-sql lines ≥73%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-sql --fail-under-lines 73
       - name: cargo llvm-cov (rockstream-sql regions ≥74%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-sql --fail-under-regions 74
       - name: cargo llvm-cov (rockstream-control lines ≥76%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-control --fail-under-lines 76
       - name: cargo llvm-cov (rockstream-control regions ≥77%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-control --fail-under-regions 77
       - name: cargo llvm-cov (rockstream-connectors lines ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-connectors --fail-under-lines 70
       - name: cargo llvm-cov (rockstream-connectors regions ≥71%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-connectors --fail-under-regions 71
       - name: cargo llvm-cov (rockstream-types lines ≥84%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-types --fail-under-lines 84
       - name: cargo llvm-cov (rockstream-types regions ≥86%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-types --fail-under-regions 86
       - name: cargo llvm-cov (rockstream-plan lines ≥81%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-plan --fail-under-lines 81
       - name: cargo llvm-cov (rockstream-plan regions ≥81%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-plan --fail-under-regions 81
       - name: cargo llvm-cov (rockstream-sim lines ≥63%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-sim --fail-under-lines 63
       - name: cargo llvm-cov (rockstream-sim regions ≥66%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-sim --fail-under-regions 66
       - name: cargo llvm-cov (rockstream-cli lines ≥72%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-cli --fail-under-lines 72 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
       - name: cargo llvm-cov (rockstream-cli regions ≥73%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-cli --fail-under-regions 73 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
       - name: cargo llvm-cov (rockstream-oracle lines ≥83%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-oracle --fail-under-lines 83
       - name: cargo llvm-cov (rockstream-oracle regions ≥81%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-oracle --fail-under-regions 81
       - name: cargo llvm-cov (rockstream-test-support lines ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-test-support --fail-under-lines 70
       - name: cargo llvm-cov (rockstream-test-support regions ≥70%)
+        if: ${{ !cancelled() }}
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-test-support --fail-under-regions 70
       - name: upload coverage artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
