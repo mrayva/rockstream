@@ -147,6 +147,8 @@ jobs:
         run: bash scripts/check-path-coupling.sh
       - name: path-coupling checker self-test
         run: bash scripts/check-path-coupling.test.sh
+      - name: qualification execution gate self-tests
+        run: bash scripts/check-qualification-mutations.test.sh
 
   verus-verify:
     name: Verus verify and qualify (VS6)
@@ -263,6 +265,16 @@ jobs:
       - name: Record all ordinary simulation integration cases
         if: matrix.shard == 'sim-integration'
         run: python3 scripts/ci-test-inventory.py run --job pr-sim
+      - name: Qualification helper checks (not release evidence)
+        if: matrix.shard == 'sim-integration'
+        run: bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
+      - name: Upload qualification helper results
+        if: always() && matrix.shard == 'sim-integration'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-helpers
+          path: target/qualification-helpers.json
+          if-no-files-found: error
       - name: Upload exact test execution evidence
         if: always()
         uses: actions/upload-artifact@v4
