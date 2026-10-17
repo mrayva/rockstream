@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod capture;
 pub mod cluster;
 pub mod comparisons;
 pub mod corpus;
