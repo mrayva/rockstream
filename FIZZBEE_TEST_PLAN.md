@@ -1268,3 +1268,34 @@ Model refinement obligations:
 The source-level decision and live-expiration regressions are in
 `crates/rockstream-runtime/tests/v072_adaptive_epoch_tests.rs`. They validate
 this local transition, **not** the full #134 durable/fair scheduling contract.
+
+## v0.72 worker-budget admission and cancellation ownership (issue #133)
+
+The worker quota changes refine the resource-ownership transition used by
+the control/data-plane models. They do not change the durable epoch or
+lease-fencing protocol, and this note is **not** a formal proof or v0.72
+acceptance verdict.
+
+The resource ledger abstraction for future FizzBee refinement is:
+
+- **Admit:** under the worker hard bound (including documented allocator
+  overhead), reserve one global byte total atomically before publishing
+  category ownership. Admission must reject rather than wrap arithmetic or
+  consume protected foreground capacity for background work.
+- **Release:** each acquired permit releases exactly its charged category and
+  workload *generation*. A stale permit may not decrement a replacement
+  workload that happens to reuse its identifier.
+- **Waiter:** increment the bounded waiter count before waiting; cancellation,
+  disconnect, timeout and success drop the same owning guard exactly once.
+  A rejected waiter does not own a decrement.
+- **Shared cache:** charge at most once after successful reservation; a failed
+  reservation leaves initialization retryable.
+- **Safety oracle:** after every quiescent transition, the global reserved total
+  equals the sum of category reservations, no counter underflows, all admitted
+  bytes fit the hard envelope, and cancelled work holds no waiter reservation.
+
+These transitions are exercised by
+`crates/rockstream-types/tests/v072_worker_budget_tests.rs` and
+`crates/rockstream-runtime/tests/v072_quota_lifecycle.rs`. Subsequent
+modeling must include shard-removal/restart cleanup, quota propagation, and
+fair competing-workload liveness before v0.72 can claim integrated proof.
