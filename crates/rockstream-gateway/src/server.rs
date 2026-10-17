@@ -443,6 +443,31 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResul
         }
     }
 
+    // ANY($n) requires an array parameter regardless of whether the table
+    // name is schema-qualified. In particular, Prisma introspection queries
+    // against unqualified pg_namespace use ANY($1) in joins/subqueries that
+    // the top-level AST visitor does not traverse. Preserve explicit casts.
+    {
+        if let Ok(any_array_param) = regex::Regex::new(
+            r"(?i)\bany\s*\(\s*\$([1-9][0-9]*)(?:::(text|int2|int4|int8|uuid)\[\])?\s*\)",
+        ) {
+            for matched in any_array_param.captures_iter(sql) {
+                if let Ok(index) = matched[1].parse::<usize>() {
+                    if index <= max_idx && !explicit_casts.contains_key(&index) {
+                        let cast = matched.get(2).map(|m| m.as_str().to_ascii_lowercase());
+                        inferred_types[index - 1] = match cast.as_deref() {
+                            Some("int2") => Type::INT2_ARRAY,
+                            Some("int4") => Type::INT4_ARRAY,
+                            Some("int8") => Type::INT8_ARRAY,
+                            Some("uuid") => Type::UUID_ARRAY,
+                            _ => Type::TEXT_ARRAY,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
     for view in catalog.list_views() {
@@ -19918,5 +19943,43 @@ mod source_batch_tests {
             ),
             ("10.25".to_string(), "5.50".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_array_parameter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prisma_nested_catalog_any_bind_is_text_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT info.column_name FROM information_schema.columns info JOIN (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname = ANY($1)) schemas ON schemas.nspname = info.table_schema";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn unqualified_catalog_any_bind_is_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT namespace.nspname FROM pg_namespace AS namespace WHERE namespace.nspname = ANY($1) ORDER BY namespace.nspname";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn explicitly_cast_catalog_any_bind_keeps_declared_type() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = ANY($1::int4[])";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::INT4_ARRAY]);
     }
 }
