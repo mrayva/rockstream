@@ -4,21 +4,24 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import importlib.util
+
+_SCOPE = Path(__file__).with_name("ci-scope.py")
+_SPEC = importlib.util.spec_from_file_location("ci_scope", _SCOPE)
+_SCOPE_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_SCOPE_MODULE)
 
 
 def selection(paths: list[str], event: str) -> dict:
-    docs_only = bool(paths) and all(
-        path in ("README.md", "CHANGELOG.md")
-        or (path.startswith("docs/") and path.endswith(".md"))
-        for path in paths
-    )
-    excluded = event == "pull_request" and docs_only
+    # One conservative allowlist is shared with the required-check gate.
+    scope = _SCOPE_MODULE.scope_for_paths(paths) if event == "pull_request" else "full"
+    excluded = scope == "prose"
     return {
         "expensive": not excluded,
-        "reason": "documentation-only PR" if excluded else "full qualification required",
+        "scope": scope,
+        "reason": "prose-only PR" if excluded else "full qualification required",
         "paths": paths,
     }
-
 
 def main() -> None:
     event = os.environ["GITHUB_EVENT_NAME"]
@@ -36,6 +39,7 @@ def main() -> None:
     Path("target/ci-selection.json").write_text(json.dumps(result, indent=2) + "\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"expensive={str(result['expensive']).lower()}\n")
+        output.write(f"scope={result['scope']}\n")
     print(json.dumps(result))
 
 

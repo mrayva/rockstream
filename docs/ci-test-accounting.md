@@ -67,6 +67,34 @@ fuzz-runner self-test (from #196) continues on PRs, but full fuzz engine soaks
 remain scheduled/manual. PR HA executes once through the existing `pr-ha`
 case-accounting runner, preserving the per-case transcript and debug setting.
 
+### Explicit prose-only CI scope (partial CI-cost optimization)
+
+`ci-policy` now shares the conservative path allowlist in `scripts/ci-scope.py`.
+Only a pull request whose **every** changed file is allowlisted prose can use
+lightweight CI: `AGENTS.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`,
+`ROADMAP.md`, `NEW_ROADMAP.md`, `.github/copilot-instructions.md`, or
+Markdown files under `.github/prompts/`, `.github/skills/`,
+`docs/agents/`, `docs/implementation-plans/`, and `sign-offs/`.
+Empty/unknown/mixed changes, ordinary documentation with executable examples,
+all source, checker and CI file edits, and non-PR events select full CI.
+
+For prose only, `Check quality` still runs documentation, policy, link,
+sign-off, admission and checker self-tests; Rust compilation, Cargo inventory,
+gateway/HA/Docker/Postgres, and mandatory execution suites are excluded.
+The two required Verus platform jobs and the Nexmark/performance jobs report
+explicit exclusion rather than a fabricated verification result. The `Check`
+aggregator reads the complete dependency results and the selected lane:
+only the named prose exclusions may be skipped; a failed, cancelled, missing,
+or unexpectedly skipped job always fails. `CI scope: prose` reports
+**no execution or release qualification evidence** for excluded jobs.
+The original `ci-policy` candidate revision artifact and fail-closed
+source classification remain in place.
+
+Reproduce the negative gates with
+`python3 -B scripts/ci-scope.test.py` and
+`python3 scripts/ci-policy.test.py`. This does not relax branch protection
+or the frozen release-process qualification required for #132.
+
 **Separate scheduled/release safety reports:** `Test Accounting — Expensive Suites` (`Nightly seeded simulation accounting`, `Nightly Docker test accounting`, `Release rolling-upgrade test accounting`); `Simulation Soak`; `Long-Duration Resource Soak`; `Real Cluster Chaos Soak`; `Coverage`; `Scheduled Fuzz Soak`. These may not run on every PR and are **not implied** by green PR checks. Their own red conclusions block any safety or release claim requiring them; record their run URLs and evidence artifacts explicitly in release sign-off. The issue does not authorize claiming formal, HA, or release proof from absent/skipped jobs.
 
 ## Boundaries

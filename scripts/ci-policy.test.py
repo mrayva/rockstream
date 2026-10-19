@@ -25,21 +25,25 @@ class PolicyTests(unittest.TestCase):
                 root = Path(tmp)
                 event = root / "event.json"
                 event.write_text(json.dumps({"pull_request": {"base": {"sha": "base"}}}))
+                changed = "docs/implementation-plans/plan.md\0sign-offs/progress.md\0"
                 with patch.dict(os.environ, {"GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": str(event),
                                              "GITHUB_SHA": "candidate", "GITHUB_OUTPUT": str(root / "output")}), \
                      patch.object(selection.subprocess, "run", return_value=subprocess.CompletedProcess(
-                         [], 0, "README.md\0docs/guide.md\0", "")) as run, \
+                         [], 0, changed, "")) as run, \
                      contextlib.chdir(root), contextlib.redirect_stdout(io.StringIO()):
                     selection.main()
-                expensive = event_name != "pull_request"
+                prose = event_name == "pull_request"
+                lane = "prose" if prose else "full"
                 self.assertEqual(json.loads((root / "target/ci-selection.json").read_text()), {
-                    "revision": "candidate", "expensive": expensive,
-                    "reason": "full qualification required" if expensive else "documentation-only PR",
-                    "paths": [] if expensive else ["README.md", "docs/guide.md"],
+                    "revision": "candidate", "expensive": not prose, "scope": lane,
+                    "reason": "prose-only PR" if prose else "full qualification required",
+                    "paths": ["docs/implementation-plans/plan.md", "sign-offs/progress.md"] if prose else [],
                 })
-                self.assertEqual((root / "output").read_text(), f"expensive={str(expensive).lower()}\n")
-                if event_name == "pull_request":
-                    self.assertEqual(run.call_args.args, (["git", "diff", "--name-only", "--no-renames", "-z", "base", "candidate"],))
+                self.assertEqual((root / "output").read_text(),
+                                 f"expensive={str(not prose).lower()}\nscope={lane}\n")
+                if prose:
+                    self.assertEqual(run.call_args.args,
+                                     (["git", "diff", "--name-only", "--no-renames", "-z", "base", "candidate"],))
                 else:
                     run.assert_not_called()
 
@@ -48,18 +52,13 @@ class PolicyTests(unittest.TestCase):
         blocks = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S))
         check = blocks["check"]
         dependencies = re.findall(r"^      - ([\w-]+)$", check, re.M)
-        self.assertEqual(dependencies, ["ci-policy", "check-quality", "check-tests", "gateway",
-                                       "postgres-differential", "control-plane-ha", "formal-verify",
-                                       "verus-verify", "nexmark-regression-gate", "benchmark", "docker-build"])
-        condition = re.search(r"if: \$\{\{ (.*?) \}\}", check)[1]
-        self.assertEqual(condition, " || ".join(f"needs.{job}.result != 'success'" for job in dependencies))
-        # Exercise the actual gate expression for each non-success dependency result.
-        for job in dependencies:
-            for outcome in ("success", "failure", "cancelled", "skipped", ""):
-                expression = condition
-                for dep in dependencies:
-                    expression = expression.replace(f"needs.{dep}.result", repr(outcome if dep == job else "success"))
-                self.assertEqual(eval(expression.replace("||", "or"), {"__builtins__": {}}), outcome != "success")
+        self.assertEqual(dependencies, [
+            "ci-policy", "check-quality", "check-tests", "gateway",
+            "postgres-differential", "control-plane-ha", "formal-verify",
+            "verus-verify", "nexmark-regression-gate", "benchmark", "docker-build",
+        ])
+        self.assertIn("run: python3 scripts/ci-scope.py check", check)
+        self.assertIn("CI_NEEDS: ${{ toJSON(needs) }}", check)
         for job in ("verus-verify", "nexmark-regression-gate", "benchmark"):
             block = blocks[job]
             self.assertIn("    needs: ci-policy\n", block)
@@ -68,28 +67,32 @@ class PolicyTests(unittest.TestCase):
             for step in steps[1:-1]:
                 self.assertRegex(step, r"if: (always\(\) && )?needs.ci-policy.outputs.expensive == 'true'")
             self.assertIn("if: needs.ci-policy.outputs.expensive == 'false'", steps[-1])
+        for job in ("check-tests", "postgres-differential", "formal-verify", "docker-build"):
+            self.assertIn("needs: ci-policy", blocks[job])
+            self.assertIn("if: needs.ci-policy.outputs.scope == 'full'", blocks[job])
+        for job in ("gateway", "control-plane-ha"):
+            self.assertIn("needs: docker-build", blocks[job])
 
     def test_lane_policy(self):
-        for event, paths, expensive in (
-            ("pull_request", ["docs/ci-test-accounting.md", "README.md"], False),
-            ("pull_request", ["crates/rockstream-gateway/src/lib.rs"], True),
-            ("pull_request", ["crates/rockstream-storage/src/lib.rs"], True),
-            ("pull_request", ["formal/verus/routing.rs"], True),
-            ("pull_request", ["Cargo.lock"], True),
-            ("pull_request", ["crates/rockstream-ops/benches/nexmark.rs"], True),
-            ("pull_request", [".github/workflows/ci.yml"], True),
-            ("pull_request", ["new/unknown"], True),
-            ("pull_request", ["docs/new-script.py"], True),
-            ("pull_request", ["README.md", "old-code.rs"], True),
-            ("pull_request", [], True),
-            ("schedule", ["README.md"], True),
-            ("workflow_dispatch", ["README.md"], True),
-            ("push", ["README.md"], True),
-        ):
+        cases = [
+            ("pull_request", ["docs/implementation-plans/plan.md", "sign-offs/review.md"], "prose"),
+            ("pull_request", ["ROADMAP.md"], "prose"),
+            ("pull_request", ["docs/ci-test-accounting.md"], "full"),
+            ("pull_request", ["README.md", "docs/guide.md"], "full"),
+            ("pull_request", ["crates/rockstream-gateway/src/lib.rs"], "full"),
+            ("pull_request", ["Cargo.lock"], "full"),
+            ("pull_request", ["formal/verus/routing.rs"], "full"),
+            ("pull_request", [".github/workflows/ci.yml"], "full"),
+            ("pull_request", [], "full"),
+            ("push", ["ROADMAP.md"], "full"),
+            ("workflow_dispatch", ["sign-offs/notes.md"], "full"),
+        ]
+        for event, paths, scope in cases:
             with self.subTest(event=event, paths=paths):
+                prose = scope == "prose"
                 self.assertEqual(selection.selection(paths, event), {
-                    "expensive": expensive, "paths": paths,
-                    "reason": "full qualification required" if expensive else "documentation-only PR",
+                    "expensive": not prose, "scope": scope, "paths": paths,
+                    "reason": "prose-only PR" if prose else "full qualification required",
                 })
 
     def test_diff_failure_cannot_become_a_docs_exclusion(self):
