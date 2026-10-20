@@ -1246,6 +1246,21 @@ impl CatalogStubs {
         true
     }
 
+    /// Preserve all live view allocations on a single workload quota owner.
+    fn reconfigure_workload_budget(
+        &self,
+        workload: &WorkloadDef,
+    ) -> Result<(), rockstream_types::state_budget::StateBudgetError> {
+        if let Some(owner) = self.workload_budgets.read().unwrap().get(&workload.name) {
+            let limit = workload
+                .memory_limit
+                .map(|limit| limit.bytes)
+                .unwrap_or(u64::MAX);
+            owner.reconfigure_max_bytes(limit)?;
+        }
+        Ok(())
+    }
+
     pub fn update_workload(&self, mut workload: WorkloadDef) -> bool {
         let mut inner = self.inner.write().unwrap();
         let Some(current) = inner.workloads.get(&workload.name) else {
@@ -1254,19 +1269,16 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return false;
         };
-        // A priority/freshness/parallelism edit must not reset live bytes.
-        // Existing StateBudget objects still own their WorkloadBudget Arc.
-        let preserve_budget = current.memory_limit == workload.memory_limit;
+        // Keep the existing owner; an edited cap must reach existing views.
+        if current.memory_limit != workload.memory_limit
+            && self.reconfigure_workload_budget(&workload).is_err()
+        {
+            return false;
+        }
         workload.revision = next_revision;
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
-        if !preserve_budget {
-            self.workload_budgets
-                .write()
-                .unwrap()
-                .remove(&workload.name);
-        }
         drop(inner);
         self.invalidate_projection_caches();
         self.persist_mutations(vec![
@@ -1296,30 +1308,23 @@ impl CatalogStubs {
         let Some(next_revision) = current.revision.checked_add(1) else {
             return WorkloadRevisionOutcome::RevisionExhausted;
         };
-        // The existing ledger and each view's StateBudget keep the same
-        // Arc when resource limits have not changed.
-        let preserve_budget = current.memory_limit == workload.memory_limit;
-        if let Some(limit) = workload.memory_limit {
-            if let Some(budget) = self.workload_budgets.read().unwrap().get(&workload.name) {
-                let allocated = budget.current_bytes();
-                if allocated > limit.bytes {
-                    return WorkloadRevisionOutcome::BelowLiveUse {
-                        requested: limit.bytes,
-                        allocated,
-                    };
-                }
+        // Guard a live owner while changing its cap, keeping existing views
+        // charged to the owner rather than creating an empty replacement.
+        if current.memory_limit != workload.memory_limit {
+            if let Err(error) = self.reconfigure_workload_budget(&workload) {
+                return WorkloadRevisionOutcome::BelowLiveUse {
+                    requested: workload
+                        .memory_limit
+                        .map(|limit| limit.bytes)
+                        .unwrap_or(u64::MAX),
+                    allocated: error.current_bytes,
+                };
             }
         }
         workload.revision = next_revision;
         inner
             .workloads
             .insert(workload.name.clone(), workload.clone());
-        if !preserve_budget {
-            self.workload_budgets
-                .write()
-                .unwrap()
-                .remove(&workload.name);
-        }
         drop(inner);
         self.invalidate_projection_caches();
         self.persist_mutations(vec![
@@ -1363,19 +1368,16 @@ impl CatalogStubs {
     }
 
     pub async fn update_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
-        let _edit = self.workload_edit_lock.lock().await;
         let Some(current) = self.get_workload(&workload.name) else {
             return Ok(false);
         };
-        let Some(next_revision) = current.revision.checked_add(1) else {
-            return Ok(false);
-        };
-        let mut updated = workload.clone();
-        updated.revision = next_revision;
-        if let Some(catalog) = &self.workload_catalog {
-            catalog.update_workload(&updated).await?;
-        }
-        Ok(self.update_workload(workload))
+        // Reuse the same fenced revision and live-budget path as explicit CAS
+        // mutations; the compatibility API must not persist an ineffective cap.
+        Ok(matches!(
+            self.update_workload_if_revision_async(workload, current.revision)
+                .await?,
+            WorkloadRevisionOutcome::Updated(_)
+        ))
     }
 
     /// Conditional update: never send an outdated policy to durable storage.
@@ -1412,8 +1414,35 @@ impl CatalogStubs {
         }
         let mut updated = workload.clone();
         updated.revision = next_revision;
+        let previous_limit = current
+            .memory_limit
+            .map(|limit| limit.bytes)
+            .unwrap_or(u64::MAX);
+        let next_limit = workload
+            .memory_limit
+            .map(|limit| limit.bytes)
+            .unwrap_or(u64::MAX);
+
+        // A reduction must fence new reservations before awaiting a durable
+        // catalog write; otherwise in-flight admissions may win the race and
+        // leave the persisted policy lower than actual live usage.
+        let reduced = next_limit < previous_limit;
+        if reduced {
+            if let Err(error) = self.reconfigure_workload_budget(&workload) {
+                return Ok(WorkloadRevisionOutcome::BelowLiveUse {
+                    requested: next_limit,
+                    allocated: error.current_bytes,
+                });
+            }
+        }
         if let Some(catalog) = &self.workload_catalog {
-            catalog.update_workload(&updated).await?;
+            if let Err(error) = catalog.update_workload(&updated).await {
+                if reduced {
+                    // Reverting a reduction only widens the original cap.
+                    let _ = self.reconfigure_workload_budget(&current);
+                }
+                return Err(error);
+            }
         }
         Ok(self.update_workload_if_revision(workload, expected_revision))
     }
@@ -3119,9 +3148,12 @@ impl CatalogStubs {
         let Some(workload) = self.get_workload(&workload_name) else {
             return;
         };
-        let Some(memory_limit) = workload.memory_limit.map(|limit| limit.bytes) else {
-            return;
-        };
+        // Charge real state even while unlimited, so a later limit change
+        // cannot start from a misleading empty ledger.
+        let memory_limit = workload
+            .memory_limit
+            .map(|limit| limit.bytes)
+            .unwrap_or(u64::MAX);
 
         let workload_budget = self
             .workload_budgets
@@ -5870,6 +5902,99 @@ mod tests {
         assert_eq!(catalog.view_state("live_b"), ViewState::Running);
         catalog.set_view_state_bytes("live_b", 0, None);
         assert_eq!(original.current_bytes(), 0);
+        reset_all();
+    }
+
+    #[test]
+    fn v072_live_memory_limit_edits_keep_existing_views_on_new_cap() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_state_budget(1_000);
+
+        let catalog = CatalogStubs::new();
+        assert!(
+            catalog.add_workload(WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(100)))
+        );
+        for name in ["live_a", "live_b"] {
+            catalog.add_view_in_namespace(CatalogView {
+                name: name.to_owned(),
+                sql: "SELECT 1".to_owned(),
+                columns: vec![],
+                namespace: "public".to_owned(),
+                op_id: None,
+            });
+            catalog.assign_view_workload(name, "live");
+        }
+        catalog.set_view_state_bytes("live_a", 50, None);
+        let shared = catalog
+            .workload_budgets
+            .read()
+            .unwrap()
+            .get("live")
+            .unwrap()
+            .clone();
+
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(60)),
+                1,
+            ),
+            WorkloadRevisionOutcome::Updated(2)
+        );
+        assert!(Arc::ptr_eq(
+            &shared,
+            catalog
+                .workload_budgets
+                .read()
+                .unwrap()
+                .get("live")
+                .unwrap()
+        ));
+        assert_eq!((shared.current_bytes(), shared.max_bytes()), (50, 60));
+
+        // Both old and newly created view meters charge the original owner.
+        catalog.set_view_state_bytes("live_b", 20, None);
+        assert_eq!(catalog.view_state("live_b"), ViewState::OverBudgetRelaxed);
+        assert_eq!(shared.current_bytes(), 50);
+        catalog.set_view_state_bytes("live_a", 30, None);
+        catalog.set_view_state_bytes("live_b", 20, None);
+        assert_eq!(catalog.view_state("live_b"), ViewState::Running);
+        assert_eq!(shared.current_bytes(), 50);
+
+        // Raising/removing the cap must not reset accounting either.
+        assert_eq!(
+            catalog.update_workload_if_revision(WorkloadDef::new("live"), 2),
+            WorkloadRevisionOutcome::Updated(3)
+        );
+        assert!(Arc::ptr_eq(
+            &shared,
+            catalog
+                .workload_budgets
+                .read()
+                .unwrap()
+                .get("live")
+                .unwrap()
+        ));
+        assert_eq!(shared.max_bytes(), u64::MAX);
+        catalog.set_view_state_bytes("live_b", 100, None);
+        assert_eq!(shared.current_bytes(), 130);
+
+        assert_eq!(
+            catalog.update_workload_if_revision(
+                WorkloadDef::new("live").with_memory_limit(MemoryLimit::new(120)),
+                3,
+            ),
+            WorkloadRevisionOutcome::BelowLiveUse {
+                requested: 120,
+                allocated: 130,
+            }
+        );
+        assert_eq!(catalog.get_workload("live").unwrap().revision, 3);
+        assert_eq!(shared.max_bytes(), u64::MAX);
+
+        catalog.set_view_state_bytes("live_a", 0, None);
+        catalog.set_view_state_bytes("live_b", 0, None);
+        assert_eq!(shared.current_bytes(), 0);
         reset_all();
     }
 
