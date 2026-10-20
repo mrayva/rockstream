@@ -276,6 +276,8 @@ async fn submit_backup_request(
     destination: &Path,
     idempotency_key: &str,
 ) -> ManagementOperationInfo {
+    // The management listener can lag the gateway on slow (coverage) runners.
+    wait_for_management(management).await;
     let mut client = ManagementServiceClient::connect(format!("http://{management}"))
         .await
         .expect("connect to management RPC");
