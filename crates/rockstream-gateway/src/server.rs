@@ -2157,6 +2157,8 @@ pub struct GatewayHandler {
     join_strategy: JoinStrategy,
     pub is_draining: Arc<std::sync::atomic::AtomicBool>,
     pub in_flight_queries: Arc<AtomicUsize>,
+    /// Bound concurrent eager cursor producers across all connections.
+    cursor_producer_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl GatewayHandler {
@@ -2344,6 +2346,7 @@ impl GatewayHandler {
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
+            cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -2394,6 +2397,7 @@ impl GatewayHandler {
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
+            cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -10505,33 +10509,162 @@ impl GatewayHandler {
             }
         }
 
-        // Execute the inner query to collect rows
-        let rows: Vec<Vec<u8>> = if let Some(view_name) = extract_view_name_from_select(inner_sql) {
-            if self.catalog.get_view(&view_name).is_some()
-                && !self.catalog.is_backfill_published(&view_name)
-            {
-                return Ok(backfill_not_published_response(&view_name));
+        // Cursors are read-only and must not bypass the SELECT dispatcher ACL.
+        // Parsing exactly one SQL query also blocks statement stacking.
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let valid_query = sqlparser::parser::Parser::parse_sql(&dialect, inner_sql)
+            .ok()
+            .is_some_and(|statements| {
+                statements.len() == 1
+                    && matches!(
+                        statements.first(),
+                        Some(sqlparser::ast::Statement::Query(_))
+                    )
+            });
+        if !valid_query {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "0A000".to_string(),
+                    "DECLARE CURSOR supports one read-only SELECT statement".to_string(),
+                ),
+            )))]);
+        }
+        // Relation-free SELECT (for example SELECT 1 AS n) was accepted by
+        // the pre-v0.72 cursor dispatcher and is used by supported drivers.
+        // Retain that compatibility path; only relation reads need view ACL.
+        let view_name = extract_view_name_from_select(inner_sql);
+        if let Some(name) = view_name.as_deref() {
+            if let Some(denied) = self.select_access_error_response(name, conn_id) {
+                return Ok(denied);
             }
-            if let Some(shard_db) = &self.shard_db {
-                let prefix = format!("view_output/{view_name}/");
-                shard_db
-                    .scan_prefix(prefix.as_bytes())
-                    .await
-                    .map(|kvs| kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
-                    .unwrap_or_default()
-            } else {
-                self.view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
-                    .await
-                    .unwrap_or_default()
+            if self.catalog.get_view(name).is_some() && !self.catalog.is_backfill_published(name) {
+                return Ok(backfill_not_published_response(name));
             }
-        } else {
-            vec![]
-        };
+        }
 
-        // Store in session
+        // An eager cursor is a producer materialization, not a streaming
+        // result. Bound it before session insertion, including wait time,
+        // failed scans and connection-level cumulative retained bytes.
+        const CURSOR_MAX_ROWS: usize = crate::copy_out_budget::MAX_COPY_OUT_ROWS;
+        const CURSOR_MAX_BYTES: usize = crate::copy_out_budget::MAX_COPY_OUT_BYTES;
+        // Fail fast before invoking any producer. The owned permit releases on
+        // success, read failure, deadline expiry or request cancellation.
+        let _producer_slot = match self.cursor_producer_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        "[RS-3006] cursor.producer_busy: too many concurrent cursor reads"
+                            .to_string(),
+                    ),
+                )))]);
+            }
+        };
+        let read = async {
+            if let Some(view_name) = view_name.as_deref() {
+                if let Some(shard_db) = &self.shard_db {
+                    let prefix = format!("view_output/{view_name}/");
+                    let (kvs, truncated) = shard_db
+                        .scan_prefix_bounded(prefix.as_bytes(), CURSOR_MAX_BYTES)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if truncated {
+                        return Err(
+                            "[RS-3006] cursor storage scan exceeded byte budget".to_string()
+                        );
+                    }
+                    Ok::<Vec<Vec<u8>>, String>(kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
+                } else {
+                    self.view_reader
+                        .read_view(
+                            view_name,
+                            Some(CURSOR_MAX_ROWS + 1),
+                            ViewReadStrategy::HotOnly,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            } else {
+                // Maintain the old empty result for relation-free SELECT.
+                Ok::<Vec<Vec<u8>>, String>(Vec::new())
+            }
+        };
+        let rows = match tokio::time::timeout(
+            Duration::from_millis(crate::copy_out_budget::MAX_COPY_OUT_READ_MS),
+            read,
+        )
+        .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        format!("[RS-3006] cursor.read_failed: {error}"),
+                    ),
+                )))]);
+            }
+            Err(_) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "57014".to_string(),
+                        "[RS-9001] cursor.read_timeout: producer read timed out".to_string(),
+                    ),
+                )))]);
+            }
+        };
+        let cursor_bytes = rows
+            .iter()
+            .fold(0usize, |bytes, row| bytes.saturating_add(row.len()));
+        if rows.len() > CURSOR_MAX_ROWS || cursor_bytes > CURSOR_MAX_BYTES {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "54000".to_string(),
+                    format!(
+                        "[RS-3006] cursor.result_budget_exceeded: {} rows / {} bytes (max {} rows / {} bytes)",
+                        rows.len(), cursor_bytes, CURSOR_MAX_ROWS, CURSOR_MAX_BYTES
+                    ),
+                ),
+            )))]);
+        }
+
+        // Enforce a per-connection retained-byte ceiling, not just the
+        // count of cursors. Recheck admission under the session lock because
+        // another concurrent DECLARE may have inserted while we awaited I/O.
         {
             let mut session = self.sessions.entry(conn_id_str.to_string()).or_default();
+            if session.cursors.len() >= MAX_CURSORS_PER_CONNECTION
+                || session.cursors.contains_key(&cursor_name)
+            {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42P03".to_string(),
+                        "[RS-2052] cursor.already_exists: cursor count or name conflict"
+                            .to_string(),
+                    ),
+                )))]);
+            }
+            let retained_bytes = session
+                .cursors
+                .values()
+                .flat_map(|cursor| cursor.rows.iter())
+                .fold(0usize, |sum, row| sum.saturating_add(row.len()));
+            if retained_bytes.saturating_add(cursor_bytes) > CURSOR_MAX_BYTES {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        "[RS-3006] cursor.session_budget_exceeded: close existing cursors before declaring another".to_string(),
+                    ),
+                )))]);
+            }
             session
                 .cursors
                 .insert(cursor_name.clone(), CursorState { rows, position: 0 });
@@ -10596,24 +10729,24 @@ impl GatewayHandler {
             count_str.parse().unwrap_or(0)
         };
 
-        // Get session rows
-        let session_opt = self.sessions.get(conn_id_str);
-        let cursor_data = match &session_opt {
-            Some(session) => session.cursors.get(&cursor_name).map(|c| {
-                let start = c.position;
+        // Fetch and advance under one lock so concurrent cursor operations
+        // cannot duplicate pages or reposition a cursor reopened by CLOSE.
+        let cursor_data = self.sessions.get_mut(conn_id_str).and_then(|mut session| {
+            session.cursors.get_mut(&cursor_name).map(|cursor| {
+                let start = cursor.position.min(cursor.rows.len());
                 let end = if fetch_all {
-                    c.rows.len()
+                    cursor.rows.len()
                 } else {
-                    (c.position + fetch_count).min(c.rows.len())
+                    start.saturating_add(fetch_count).min(cursor.rows.len())
                 };
-                (start, end, c.rows[start..end].to_vec())
-            }),
-            None => None,
-        };
-        drop(session_opt);
+                let rows = cursor.rows[start..end].to_vec();
+                cursor.position = end;
+                rows
+            })
+        });
 
-        let (_start, end, fetched_rows) = match cursor_data {
-            Some(d) => d,
+        let fetched_rows = match cursor_data {
+            Some(rows) => rows,
             None => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
@@ -10621,13 +10754,6 @@ impl GatewayHandler {
                 )))]);
             }
         };
-
-        // Advance position
-        if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
-            if let Some(cursor) = session.cursors.get_mut(&cursor_name) {
-                cursor.position = end;
-            }
-        }
 
         let _n_fetched = fetched_rows.len();
 
@@ -10712,7 +10838,10 @@ impl GatewayHandler {
                 let end = if move_all {
                     cursor.rows.len()
                 } else {
-                    (cursor.position + move_count).min(cursor.rows.len())
+                    cursor
+                        .position
+                        .saturating_add(move_count)
+                        .min(cursor.rows.len())
                 };
                 cursor.position = end;
                 end - start
