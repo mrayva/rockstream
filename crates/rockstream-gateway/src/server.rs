@@ -91,7 +91,7 @@ use crate::auth::{
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
-    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail,
+    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail, WorkloadRevisionOutcome,
 };
 
 use crate::copy_state::{
@@ -106,7 +106,8 @@ use crate::pgoutput_coordinator::{
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::subscribe_handler::{
-    deliver_snapshot, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+    deliver_snapshot_checked, start_from_epoch, SubscribeError, SubscribeRegistry,
+    SubscriberHandle, SUBSCRIBE_SNAPSHOT_MAX_ROWS,
 };
 use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -201,8 +202,13 @@ pub struct PreparedStatementCache {
 impl QueryParser for PreparedStatementCache {
     type Statement = PreparedStatement;
 
-    async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
-        let parameter_types = infer_parameter_types(&self.catalog, sql).await;
+    async fn parse_sql(&self, sql: &str, types: &[Type]) -> PgWireResult<Self::Statement> {
+        let mut parameter_types = infer_parameter_types(&self.catalog, sql).await?;
+        for (inferred, supplied) in parameter_types.iter_mut().zip(types) {
+            if *supplied != Type::UNKNOWN {
+                *inferred = supplied.clone();
+            }
+        }
         Ok(PreparedStatement {
             name: String::new(),
             sql: sql.to_string(),
@@ -212,35 +218,15 @@ impl QueryParser for PreparedStatementCache {
 }
 
 // Helper functions for parameter type inference
-async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
-    let mut indices = std::collections::BTreeSet::new();
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    let mut max_idx = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            i += 1;
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i > start {
-                if let Ok(num_str) = std::str::from_utf8(&bytes[start..i]) {
-                    if let Ok(idx) = num_str.parse::<usize>() {
-                        indices.insert(idx);
-                        if idx > max_idx {
-                            max_idx = idx;
-                        }
-                    }
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
+async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> PgWireResult<Vec<Type>> {
+    let max_idx = parameter_positions(sql)?
+        .iter()
+        .map(|(_, index)| *index)
+        .max()
+        .unwrap_or(0);
 
     if max_idx == 0 {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let mut inferred_types = vec![Type::TEXT; max_idx];
@@ -458,6 +444,31 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
+    // ANY($n) requires an array parameter regardless of whether the table
+    // name is schema-qualified. In particular, Prisma introspection queries
+    // against unqualified pg_namespace use ANY($1) in joins/subqueries that
+    // the top-level AST visitor does not traverse. Preserve explicit casts.
+    {
+        if let Ok(any_array_param) = regex::Regex::new(
+            r"(?i)\bany\s*\(\s*\$([1-9][0-9]*)(?:::(text|int2|int4|int8|uuid)\[\])?\s*\)",
+        ) {
+            for matched in any_array_param.captures_iter(sql) {
+                if let Ok(index) = matched[1].parse::<usize>() {
+                    if index <= max_idx && !explicit_casts.contains_key(&index) {
+                        let cast = matched.get(2).map(|m| m.as_str().to_ascii_lowercase());
+                        inferred_types[index - 1] = match cast.as_deref() {
+                            Some("int2") => Type::INT2_ARRAY,
+                            Some("int4") => Type::INT4_ARRAY,
+                            Some("int8") => Type::INT8_ARRAY,
+                            Some("uuid") => Type::UUID_ARRAY,
+                            _ => Type::TEXT_ARRAY,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     let ctx = SessionContext::new();
     rockstream_sql::frontend::register_session_sql_udf(&ctx);
     for view in catalog.list_views() {
@@ -587,7 +598,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                 }
             }
         }
-        return inferred_types;
+        return Ok(inferred_types);
     }
 
     let mut df_inferred = std::collections::HashMap::new();
@@ -618,7 +629,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
-    inferred_types
+    Ok(inferred_types)
 }
 
 fn find_placeholders_in_expr(expr: &sqlparser::ast::Expr, cb: &mut impl FnMut(usize)) {
@@ -773,7 +784,7 @@ fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType 
         .strip_prefix("Decimal(")
         .or_else(|| dt.strip_prefix("DECIMAL("))
         .and_then(|value| value.strip_suffix(')'))
-        .and_then(|value| value.split_once(','))
+        .map(|value| value.split_once(',').unwrap_or((value, "0")))
         .and_then(|(precision, scale)| {
             Some((precision.trim().parse().ok()?, scale.trim().parse().ok()?))
         })
@@ -1165,6 +1176,15 @@ pub static QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::n
 pub static QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static QUERY_TIME_SCATTER_BATCH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
+/// Safety limits for the standalone DataFusion SELECT fallback (not the
+/// distributed/query-time scatter path). Bounded execution prevents an ad hoc
+/// SELECT without a relation from collecting an unlimited result in memory.
+const FALLBACK_QUERY_MAX_ROWS: usize = 10_000;
+const FALLBACK_QUERY_MAX_ARRAY_BYTES: usize = 8 * 1024 * 1024;
+const FALLBACK_QUERY_MAX_WALL_MS: u64 = 5_000;
+const FALLBACK_QUERY_MAX_CONCURRENT: usize = 16;
+static FALLBACK_QUERY_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(FALLBACK_QUERY_MAX_CONCURRENT);
 static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn query_time_scatter_fill_levels() -> QueryTimeScatterFillLevels {
@@ -2146,6 +2166,8 @@ pub struct GatewayHandler {
     join_strategy: JoinStrategy,
     pub is_draining: Arc<std::sync::atomic::AtomicBool>,
     pub in_flight_queries: Arc<AtomicUsize>,
+    /// Bound concurrent eager cursor producers across all connections.
+    cursor_producer_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl GatewayHandler {
@@ -2333,6 +2355,7 @@ impl GatewayHandler {
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
+            cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -2383,6 +2406,7 @@ impl GatewayHandler {
             join_strategy: JoinStrategy::Auto,
             is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_flight_queries: Arc::new(AtomicUsize::new(0)),
+            cursor_producer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -2771,16 +2795,12 @@ impl GatewayHandler {
         let (rows, truncated) = shard_db
             .scan_prefix_bounded(prefix.as_bytes(), MAX_COMPILED_VIEW_SOURCE_SCAN_BYTES)
             .await?;
-        if truncated || rows.len() > MAX_COMPILED_VIEW_SOURCE_ROWS {
-            return Err(GatewayError::QueryTimeResultSetTooLarge {
-                relation: relation_name.to_string(),
-                row_limit: MAX_COMPILED_VIEW_SOURCE_ROWS,
-            });
-        }
-        Ok(rows
-            .into_iter()
-            .map(|(_, value)| value.to_vec())
-            .collect::<Vec<_>>())
+        checked_complete_storage_scan(
+            relation_name,
+            rows,
+            truncated,
+            MAX_COMPILED_VIEW_SOURCE_ROWS,
+        )
     }
 
     /// Scan `relation_name`'s full current contents and wrap them as a
@@ -5127,16 +5147,56 @@ impl GatewayHandler {
         // COPY OUT: stream CopyData messages directly through the client sink.
         if ql.starts_with("copy ") && ql.contains(" to stdout") {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                // COPY OUT must use the same ACL and namespace checks as SELECT.
+                // Do not read rows or emit a COPY frame before checking access.
+                if let Some(denied) = self.select_access_error_response(&view_name, Some(conn_id)) {
+                    return Ok(denied);
+                }
                 if self.catalog.get_view(&view_name).is_some()
                     && !self.catalog.is_backfill_published(&view_name)
                 {
                     return Ok(backfill_not_published_response(&view_name));
                 }
-                let rows = self
-                    .view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                // The frozen v0.72 interactive wall budget is 5 seconds.
+                // Bound the producer read before *any* COPY response frame:
+                // a timeout must never leave a syntactically valid partial
+                // COPY stream or an in-flight reader owned by this future.
+                let read = self.view_reader.read_view(
+                    &view_name,
+                    Some(crate::copy_out_budget::MAX_COPY_OUT_ROWS + 1),
+                    ViewReadStrategy::HotOnly,
+                );
+                let rows = match crate::copy_out_budget::read_with_deadline(
+                    Duration::from_millis(crate::copy_out_budget::MAX_COPY_OUT_READ_MS),
+                    read,
+                )
+                .await
+                {
+                    Ok(Ok(rows)) => rows,
+                    Ok(Err(error)) => return Err(PgWireError::ApiError(Box::new(error))),
+                    Err(_) => {
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "57014".to_owned(),
+                            format!(
+                                "[RS-9001] copy_out.read_timeout: producer read exceeded {}ms. Next steps: narrow the query or use bounded result pages.",
+                                crate::copy_out_budget::MAX_COPY_OUT_READ_MS
+                            ),
+                        )))]);
+                    }
+                };
+                // Error before any CopyOutResponse or CopyData. The reader's
+                // current materialization implementation remains unbounded;
+                // this is a wire-output guard, not yet full producer admission.
+                if let Err(error) = crate::copy_out_budget::check_copy_out_bounds(&rows) {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "54000".to_owned(),
+                        format!(
+                            "[RS-9001] copy_out.limit_exceeded: {error}. Next steps: narrow the query or use a bounded result page."
+                        ),
+                    )))]);
+                }
                 let row_count = rows.len();
 
                 let col_count = self
@@ -5452,7 +5512,11 @@ impl GatewayHandler {
         None
     }
 
-    async fn handle_subscribe(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_subscribe(
+        &self,
+        query: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let request = match parse_subscribe(query) {
             Ok(request) => request,
             Err(error) => {
@@ -5467,6 +5531,12 @@ impl GatewayHandler {
                 )))]);
             }
         };
+
+        // Authorize reads before exposing retention metadata, scanning
+        // a snapshot or reserving a stream slot.
+        if let Some(denied) = self.select_access_error_response(&request.view_name, conn_id) {
+            return Ok(denied);
+        }
 
         let catalog_columns = self
             .catalog
@@ -5496,12 +5566,30 @@ impl GatewayHandler {
             )))]);
         }
 
+        // A drop-owned slot lives inside the returned stream. Reject before
+        // scanning the snapshot rather than accepting unlimited subscriptions.
+        let stream_slot = match self.subscribe_registry.acquire_stream() {
+            Ok(slot) => slot,
+            Err(error) => return Ok(vec![subscribe_error_response(error)]),
+        };
         let col_names = request.projection.clone().unwrap_or_else(|| {
             catalog_columns
                 .iter()
                 .map(|column| column.name.clone())
                 .collect()
         });
+        // Local snapshot and its epoch token must be read from the same
+        // commit boundary. Without this lock a concurrent COMMIT could
+        // advance the token while the snapshot scans an older frontier (or
+        // modify rows while an already-captured token is being scanned).
+        // Distributed view-reader tokens require separate owner-side fencing.
+        let local_snapshot_guard = if matches!(&request.start, SubscribeStart::NowWithSnapshot)
+            && self.shard_db.is_some()
+        {
+            Some(self.shard_commit_lock.lock().await)
+        } else {
+            None
+        };
         let start_epoch = match &request.start {
             SubscribeStart::NowWithSnapshot => self
                 .shard_db
@@ -5514,9 +5602,14 @@ impl GatewayHandler {
         let mut pending = std::collections::VecDeque::new();
         let handle = match &request.start {
             SubscribeStart::NowWithSnapshot => {
+                // Preflight the producer at one row beyond the exact bound.
                 let snapshot = self
                     .view_reader
-                    .read_view(&request.view_name, None, ViewReadStrategy::HotOnly)
+                    .read_view(
+                        &request.view_name,
+                        Some(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1),
+                        ViewReadStrategy::HotOnly,
+                    )
                     .await
                     .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
                 let snapshot = snapshot
@@ -5525,12 +5618,12 @@ impl GatewayHandler {
                     .map(|(index, row)| (Bytes::from(index.to_string()), Bytes::from(row)))
                     .collect();
                 let column_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
-                pending.extend(deliver_snapshot(
-                    snapshot,
-                    start_epoch,
-                    &request,
-                    &column_refs,
-                ));
+                let snapshot_rows =
+                    match deliver_snapshot_checked(snapshot, start_epoch, &request, &column_refs) {
+                        Ok(rows) => rows,
+                        Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                    };
+                pending.extend(snapshot_rows);
                 SubscriberHandle::new(
                     request.view_name.clone(),
                     start_epoch,
@@ -5556,6 +5649,10 @@ impl GatewayHandler {
             }
         };
 
+        // Release the producer read boundary before creating a potentially
+        // long-lived stream; only snapshot construction is serialized.
+        drop(local_snapshot_guard);
+
         let mut fields: Vec<FieldInfo> = col_names
             .iter()
             .map(|name| FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text))
@@ -5578,8 +5675,8 @@ impl GatewayHandler {
         let stream_schema = schema.clone();
         let registry = self.subscribe_registry.clone();
         let data_stream = Box::pin(stream::unfold(
-            (registry, handle, pending, stream_schema, false),
-            |(registry, mut handle, mut pending, schema, failed)| async move {
+            (registry, handle, pending, stream_schema, false, stream_slot),
+            |(registry, mut handle, mut pending, schema, failed, stream_slot)| async move {
                 if failed {
                     return None;
                 }
@@ -5590,28 +5687,37 @@ impl GatewayHandler {
                             if let Err(error) = encoder.encode_field(&Some(value)) {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         }
                         let timestamp = row.mz_timestamp.to_string();
                         if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let diff = row.mz_diff.to_string();
                         if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
-                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                            return Some((
+                                Err(error),
+                                (registry, handle, pending, schema, true, stream_slot),
+                            ));
                         }
                         let encoded = match encoder.finish() {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 return Some((
                                     Err(error),
-                                    (registry, handle, pending, schema, true),
+                                    (registry, handle, pending, schema, true, stream_slot),
                                 ));
                             }
                         };
-                        return Some((Ok(encoded), (registry, handle, pending, schema, false)));
+                        return Some((
+                            Ok(encoded),
+                            (registry, handle, pending, schema, false, stream_slot),
+                        ));
                     }
                     match handle.poll(&registry) {
                         Ok(rows) if !rows.is_empty() => pending.extend(rows),
@@ -5619,7 +5725,7 @@ impl GatewayHandler {
                         Err(error) => {
                             return Some((
                                 Err(PgWireError::ApiError(Box::new(error))),
-                                (registry, handle, pending, schema, true),
+                                (registry, handle, pending, schema, true, stream_slot),
                             ));
                         }
                     }
@@ -5643,10 +5749,6 @@ impl GatewayHandler {
 
         if let Some(response) = self.authorize_mutation(q, conn_id) {
             return Ok(response);
-        }
-
-        if ql == "subscribe" || ql.starts_with("subscribe ") {
-            return self.handle_subscribe(q).await;
         }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
@@ -5676,6 +5778,11 @@ impl GatewayHandler {
             if ql.starts_with("mark index ") {
                 return self.handle_mark_index_ready(q).await;
             }
+        }
+
+        // SUBSCRIBE must obey the same failed-transaction fence as SELECT.
+        if ql == "subscribe" || ql.starts_with("subscribe ") {
+            return self.handle_subscribe(q, conn_id).await;
         }
 
         // ── BEGIN — with idempotency (already in transaction → silent succeed) ──
@@ -6566,6 +6673,50 @@ impl GatewayHandler {
                 self.catalog.view_resource_usage(&[]),
             )]);
         }
+        if ql.starts_with("show workload application for ") {
+            let workload_name = q["show workload application for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            let Some(status) = self.catalog.workload_application_status(workload_name) else {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42704".to_owned(),
+                        format!(
+                            "[RS-1005] workload.not_found: workload '{}' does not exist.",
+                            workload_name
+                        ),
+                    ),
+                )))]);
+            };
+            return Ok(vec![catalog_resp_to_response(status)]);
+        }
+        if ql.starts_with("show workload revision for ") {
+            let workload_name = q["show workload revision for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            let Some(workload) = self.catalog.get_workload(workload_name) else {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42704".to_owned(),
+                        format!(
+                            "[RS-1005] workload.not_found: workload '{}' does not exist.",
+                            workload_name
+                        ),
+                    ),
+                )))]);
+            };
+            return Ok(vec![catalog_resp_to_response(CatalogResponse::Rows {
+                columns: vec!["workload_name".to_owned(), "requested_revision".to_owned()],
+                rows: vec![vec![
+                    Some(workload.name),
+                    Some(workload.revision.to_string()),
+                ]],
+            })]);
+        }
         if ql.trim_end_matches(';') == "show workload status" {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.workload_status(),
@@ -7051,9 +7202,7 @@ impl GatewayHandler {
                     data_stream,
                 )))]);
             }
-            if let Some(responses) = self.try_datafusion_select(q).await {
-                return Ok(responses);
-            }
+            return Ok(self.try_datafusion_select(q).await);
         }
 
         Ok(vec![promote_response(Response::Execution(Tag::new("OK")))])
@@ -7063,9 +7212,20 @@ impl GatewayHandler {
     /// any catalog view/table (or references tables we can register as empty
     /// MemTables so DataFusion can resolve column types).
     ///
-    /// Returns `Some(responses)` on success, `None` if DataFusion cannot execute
-    /// the query (caller falls through to the `Tag::new("OK")` response).
-    async fn try_datafusion_select(&self, q: &str) -> Option<Vec<Response<'static>>> {
+    /// Return execution failures through the same error path as relation queries.
+    async fn try_datafusion_select(&self, q: &str) -> Vec<Response<'static>> {
+        // Reserve execution capacity prospectively. Dropping this function
+        // on timeout, cancellation or disconnect drops the permit and stream.
+        let _permit = match FALLBACK_QUERY_PERMITS.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: "ad hoc SELECT concurrency budget exceeded".to_string(),
+                });
+            }
+        };
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(FALLBACK_QUERY_MAX_WALL_MS);
         // Build a DataFusion session and register catalog objects as empty MemTables
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
@@ -7105,20 +7265,70 @@ impl GatewayHandler {
             }
         }
 
-        let df = match ctx.sql(q).await {
-            Ok(df) => df,
-            Err(_) => return None,
+        let df = match tokio::time::timeout_at(deadline, ctx.sql(q)).await {
+            Ok(Ok(df)) => df,
+            Ok(Err(error)) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("plan: {error}"),
+                });
+            }
+            Err(_) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: "ad hoc SELECT planning timed out".to_string(),
+                });
+            }
         };
 
         let output_schema = Arc::new(df.schema().as_arrow().clone());
-        let mut batches = match df.collect().await {
-            Ok(b) => b,
-            Err(_) => return None,
+        // collect() can retain every output batch before checking any limit.
+        // Pull batches incrementally, rejecting excess rows/array bytes before
+        // adding another batch to the retained response.
+        let mut stream = match tokio::time::timeout_at(deadline, df.execute_stream()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("execute: {error}"),
+                });
+            }
+            Err(_) => {
+                return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                    detail: "ad hoc SELECT execution timed out".to_string(),
+                });
+            }
         };
+        let mut batches = Vec::new();
+        let mut retained_rows = 0usize;
+        let mut retained_bytes = 0usize;
+        loop {
+            let next = match tokio::time::timeout_at(deadline, stream.try_next()).await {
+                Ok(Ok(next)) => next,
+                Ok(Err(error)) => {
+                    return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("stream: {error}"),
+                    });
+                }
+                Err(_) => {
+                    return query_time_error_response(GatewayError::QueryTimeExecutionFailed {
+                        detail: "ad hoc SELECT stream timed out".to_string(),
+                    });
+                }
+            };
+            let Some(batch) = next else {
+                break;
+            };
+            match account_fallback_query_batch(retained_rows, retained_bytes, &batch) {
+                Ok((rows, bytes)) => {
+                    retained_rows = rows;
+                    retained_bytes = bytes;
+                }
+                Err(error) => return query_time_error_response(error),
+            }
+            batches.push(batch);
+        }
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(output_schema));
         }
-        Some(datafusion_batches_to_query_response(&batches))
+        datafusion_batches_to_query_response(&batches)
     }
 
     /// Try to serve a SELECT via an index arrangement point lookup.
@@ -7596,18 +7806,14 @@ impl GatewayHandler {
                         .await
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?
                 } else {
-                    let prefix = format!("view_output/{view_name}/");
-                    let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
-                        PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                    })?;
-                    kvs.into_iter().map(|(_, v)| v.to_vec()).collect()
+                    self.scan_relation_rows_bounded(view_name, shard_db)
+                        .await
+                        .map_err(|error| PgWireError::ApiError(Box::new(error)))?
                 }
             } else {
-                let prefix = format!("view_output/{view_name}/");
-                let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
-                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                })?;
-                kvs.into_iter().map(|(_, v)| v.to_vec()).collect()
+                self.scan_relation_rows_bounded(view_name, shard_db)
+                    .await
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?
             };
             // Apply ORDER BY if specified
             if !order_by.is_empty() {
@@ -8228,7 +8434,7 @@ impl GatewayHandler {
     }
 
     async fn handle_alter_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
-        let Some((workload_name, changes)) = parse_alter_workload(q) else {
+        let Some((workload_name, expected_revision, changes)) = parse_alter_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42601".to_owned(),
@@ -8246,11 +8452,48 @@ impl GatewayHandler {
             )))]);
         };
         apply_workload_settings(&mut workload, &changes);
-        let updated = self
+        // Legacy SQL retains its syntax, but never bypasses live-use admission
+        // or race detection. A request without IF REVISION uses the revision
+        // observed when this producer read its policy; a competing edit must
+        // return a retryable conflict rather than overwrite the winner.
+        let expected = expected_revision.unwrap_or(workload.revision);
+        let updated = match self
             .catalog
-            .update_workload_async(workload.clone())
+            .update_workload_if_revision_async(workload.clone(), expected)
             .await
-            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?
+        {
+            WorkloadRevisionOutcome::Updated(_) => true,
+            WorkloadRevisionOutcome::NotFound => false,
+            WorkloadRevisionOutcome::Conflict { expected, actual } => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "40001".to_owned(),
+                    format!(
+                        "[RS-1006] workload.revision_conflict: expected revision {expected}, actual revision {actual}. Next steps: read the current workload revision and retry the edit."
+                    ),
+                )))]);
+            }
+            WorkloadRevisionOutcome::BelowLiveUse {
+                requested,
+                allocated,
+            } => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    format!(
+                        "[RS-1006] workload.memory_below_live_use: requested limit {requested} bytes is below {allocated} bytes of live reservations. Next steps: reclaim the live state before reducing the limit."
+                    ),
+                )))]);
+            }
+            WorkloadRevisionOutcome::RevisionExhausted => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    "[RS-1006] workload.revision_exhausted: revision counter cannot advance. Next steps: contact the operator.".to_owned(),
+                )))]);
+            }
+        };
         if !updated {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -8424,6 +8667,23 @@ impl GatewayHandler {
 
         // Parse column list: content between outermost parentheses.
         let parsed = parse_create_table_columns(after);
+
+        for column in &parsed.columns {
+            if column.data_type.starts_with("Decimal(") {
+                let valid = matches!(
+                    string_to_arrow_datatype(&column.data_type),
+                    datafusion::arrow::datatypes::DataType::Decimal128(p, s)
+                        if (1..=38).contains(&p) && s >= 0 && s as u8 <= p
+                );
+                if !valid {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-1012] Invalid decimal precision or scale".to_owned(),
+                    )))]);
+                }
+            }
+        }
 
         self.catalog.add_table(CatalogTable {
             name: table_name.clone(),
@@ -9907,8 +10167,11 @@ impl GatewayHandler {
 
         let ops = entry.drain();
         drop(entry); // release DashMap entry guard before await
-        let (epoch, ops) = {
-            let _commit_guard = self.shard_commit_lock.lock().await;
+                     // Serialize the entire local commit through materialized-view refresh,
+                     // durable flush and subscription publication. Releasing this guard
+                     // before flushing allowed a later epoch to publish out of order.
+        let _commit_guard = self.shard_commit_lock.lock().await;
+        let (epoch, ops, changes) = {
             let ops = committed_dml_ops(shard_db, ops).await.map_err(|e| {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
@@ -9965,6 +10228,12 @@ impl GatewayHandler {
                 }
             }
 
+            // Publish a complete committed epoch per table under one registry
+            // lock. Readers cannot poll half an UPDATE or half an epoch.
+            let mut changes: std::collections::HashMap<
+                String,
+                Vec<crate::change_log::ChangeEntry>,
+            > = std::collections::HashMap::new();
             for op in &ops {
                 let (table, row_key, mz_diff, encoded_row) = match op {
                     DmlOp::Insert {
@@ -9990,8 +10259,7 @@ impl GatewayHandler {
                         new_row_key,
                         new_tsv,
                     } => {
-                        self.subscribe_registry.push(
-                            table,
+                        changes.entry(table.clone()).or_default().push(
                             crate::change_log::ChangeEntry {
                                 epoch,
                                 row_key: Bytes::from(old_row_key.clone()),
@@ -10002,17 +10270,19 @@ impl GatewayHandler {
                         (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
                     }
                 };
-                self.subscribe_registry.push(
-                    &table,
-                    crate::change_log::ChangeEntry {
+                changes
+                    .entry(table)
+                    .or_default()
+                    .push(crate::change_log::ChangeEntry {
                         epoch,
                         row_key: Bytes::from(row_key),
                         mz_diff,
                         encoded_row: Bytes::from(encoded_row),
-                    },
-                );
+                    });
             }
-            (epoch, ops)
+            // Do not expose this epoch yet. The table write is staged, but
+            // dependent materialized view writes and the durable flush follow.
+            (epoch, ops, changes)
         };
         let affected = ops.len();
 
@@ -10091,6 +10361,19 @@ impl GatewayHandler {
                 PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
             })?;
         }
+
+        // Only successfully flushed commits may become visible in the
+        // bounded subscription replay log. Publish the entire epoch per
+        // table while holding the same shard commit lock that protected the
+        // write and refresh, preserving ordering against concurrent commits.
+        for (table, batch) in changes {
+            if let Err(error) = self.subscribe_registry.push_epoch(&table, batch) {
+                // Persistence already succeeded. Invalidate bounded replay,
+                // requiring resnapshot; never roll back a durable transaction.
+                tracing::warn!(%table, %epoch, %error, "subscription replay requires resnapshot");
+            }
+        }
+        drop(_commit_guard);
 
         let table_name = ops
             .iter()
@@ -10308,33 +10591,162 @@ impl GatewayHandler {
             }
         }
 
-        // Execute the inner query to collect rows
-        let rows: Vec<Vec<u8>> = if let Some(view_name) = extract_view_name_from_select(inner_sql) {
-            if self.catalog.get_view(&view_name).is_some()
-                && !self.catalog.is_backfill_published(&view_name)
-            {
-                return Ok(backfill_not_published_response(&view_name));
+        // Cursors are read-only and must not bypass the SELECT dispatcher ACL.
+        // Parsing exactly one SQL query also blocks statement stacking.
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let valid_query = sqlparser::parser::Parser::parse_sql(&dialect, inner_sql)
+            .ok()
+            .is_some_and(|statements| {
+                statements.len() == 1
+                    && matches!(
+                        statements.first(),
+                        Some(sqlparser::ast::Statement::Query(_))
+                    )
+            });
+        if !valid_query {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "0A000".to_string(),
+                    "DECLARE CURSOR supports one read-only SELECT statement".to_string(),
+                ),
+            )))]);
+        }
+        // Relation-free SELECT (for example SELECT 1 AS n) was accepted by
+        // the pre-v0.72 cursor dispatcher and is used by supported drivers.
+        // Retain that compatibility path; only relation reads need view ACL.
+        let view_name = extract_view_name_from_select(inner_sql);
+        if let Some(name) = view_name.as_deref() {
+            if let Some(denied) = self.select_access_error_response(name, conn_id) {
+                return Ok(denied);
             }
-            if let Some(shard_db) = &self.shard_db {
-                let prefix = format!("view_output/{view_name}/");
-                shard_db
-                    .scan_prefix(prefix.as_bytes())
-                    .await
-                    .map(|kvs| kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
-                    .unwrap_or_default()
-            } else {
-                self.view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
-                    .await
-                    .unwrap_or_default()
+            if self.catalog.get_view(name).is_some() && !self.catalog.is_backfill_published(name) {
+                return Ok(backfill_not_published_response(name));
             }
-        } else {
-            vec![]
-        };
+        }
 
-        // Store in session
+        // An eager cursor is a producer materialization, not a streaming
+        // result. Bound it before session insertion, including wait time,
+        // failed scans and connection-level cumulative retained bytes.
+        const CURSOR_MAX_ROWS: usize = crate::copy_out_budget::MAX_COPY_OUT_ROWS;
+        const CURSOR_MAX_BYTES: usize = crate::copy_out_budget::MAX_COPY_OUT_BYTES;
+        // Fail fast before invoking any producer. The owned permit releases on
+        // success, read failure, deadline expiry or request cancellation.
+        let _producer_slot = match self.cursor_producer_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        "[RS-3006] cursor.producer_busy: too many concurrent cursor reads"
+                            .to_string(),
+                    ),
+                )))]);
+            }
+        };
+        let read = async {
+            if let Some(view_name) = view_name.as_deref() {
+                if let Some(shard_db) = &self.shard_db {
+                    let prefix = format!("view_output/{view_name}/");
+                    let (kvs, truncated) = shard_db
+                        .scan_prefix_bounded(prefix.as_bytes(), CURSOR_MAX_BYTES)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if truncated {
+                        return Err(
+                            "[RS-3006] cursor storage scan exceeded byte budget".to_string()
+                        );
+                    }
+                    Ok::<Vec<Vec<u8>>, String>(kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
+                } else {
+                    self.view_reader
+                        .read_view(
+                            view_name,
+                            Some(CURSOR_MAX_ROWS + 1),
+                            ViewReadStrategy::HotOnly,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            } else {
+                // Maintain the old empty result for relation-free SELECT.
+                Ok::<Vec<Vec<u8>>, String>(Vec::new())
+            }
+        };
+        let rows = match tokio::time::timeout(
+            Duration::from_millis(crate::copy_out_budget::MAX_COPY_OUT_READ_MS),
+            read,
+        )
+        .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        format!("[RS-3006] cursor.read_failed: {error}"),
+                    ),
+                )))]);
+            }
+            Err(_) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "57014".to_string(),
+                        "[RS-9001] cursor.read_timeout: producer read timed out".to_string(),
+                    ),
+                )))]);
+            }
+        };
+        let cursor_bytes = rows
+            .iter()
+            .fold(0usize, |bytes, row| bytes.saturating_add(row.len()));
+        if rows.len() > CURSOR_MAX_ROWS || cursor_bytes > CURSOR_MAX_BYTES {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "54000".to_string(),
+                    format!(
+                        "[RS-3006] cursor.result_budget_exceeded: {} rows / {} bytes (max {} rows / {} bytes)",
+                        rows.len(), cursor_bytes, CURSOR_MAX_ROWS, CURSOR_MAX_BYTES
+                    ),
+                ),
+            )))]);
+        }
+
+        // Enforce a per-connection retained-byte ceiling, not just the
+        // count of cursors. Recheck admission under the session lock because
+        // another concurrent DECLARE may have inserted while we awaited I/O.
         {
             let mut session = self.sessions.entry(conn_id_str.to_string()).or_default();
+            if session.cursors.len() >= MAX_CURSORS_PER_CONNECTION
+                || session.cursors.contains_key(&cursor_name)
+            {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42P03".to_string(),
+                        "[RS-2052] cursor.already_exists: cursor count or name conflict"
+                            .to_string(),
+                    ),
+                )))]);
+            }
+            let retained_bytes = session
+                .cursors
+                .values()
+                .flat_map(|cursor| cursor.rows.iter())
+                .fold(0usize, |sum, row| sum.saturating_add(row.len()));
+            if retained_bytes.saturating_add(cursor_bytes) > CURSOR_MAX_BYTES {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "54000".to_string(),
+                        "[RS-3006] cursor.session_budget_exceeded: close existing cursors before declaring another".to_string(),
+                    ),
+                )))]);
+            }
             session
                 .cursors
                 .insert(cursor_name.clone(), CursorState { rows, position: 0 });
@@ -10399,24 +10811,24 @@ impl GatewayHandler {
             count_str.parse().unwrap_or(0)
         };
 
-        // Get session rows
-        let session_opt = self.sessions.get(conn_id_str);
-        let cursor_data = match &session_opt {
-            Some(session) => session.cursors.get(&cursor_name).map(|c| {
-                let start = c.position;
+        // Fetch and advance under one lock so concurrent cursor operations
+        // cannot duplicate pages or reposition a cursor reopened by CLOSE.
+        let cursor_data = self.sessions.get_mut(conn_id_str).and_then(|mut session| {
+            session.cursors.get_mut(&cursor_name).map(|cursor| {
+                let start = cursor.position.min(cursor.rows.len());
                 let end = if fetch_all {
-                    c.rows.len()
+                    cursor.rows.len()
                 } else {
-                    (c.position + fetch_count).min(c.rows.len())
+                    start.saturating_add(fetch_count).min(cursor.rows.len())
                 };
-                (start, end, c.rows[start..end].to_vec())
-            }),
-            None => None,
-        };
-        drop(session_opt);
+                let rows = cursor.rows[start..end].to_vec();
+                cursor.position = end;
+                rows
+            })
+        });
 
-        let (_start, end, fetched_rows) = match cursor_data {
-            Some(d) => d,
+        let fetched_rows = match cursor_data {
+            Some(rows) => rows,
             None => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
@@ -10424,13 +10836,6 @@ impl GatewayHandler {
                 )))]);
             }
         };
-
-        // Advance position
-        if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
-            if let Some(cursor) = session.cursors.get_mut(&cursor_name) {
-                cursor.position = end;
-            }
-        }
 
         let _n_fetched = fetched_rows.len();
 
@@ -10515,7 +10920,10 @@ impl GatewayHandler {
                 let end = if move_all {
                     cursor.rows.len()
                 } else {
-                    (cursor.position + move_count).min(cursor.rows.len())
+                    cursor
+                        .position
+                        .saturating_add(move_count)
+                        .min(cursor.rows.len())
                 };
                 cursor.position = end;
                 end - start
@@ -10597,6 +11005,8 @@ impl GatewayHandler {
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        use datafusion::arrow::datatypes::DataType;
+
         // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]* [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
         let (table, cols, rows) = match parse_insert(q) {
@@ -10650,6 +11060,17 @@ impl GatewayHandler {
             .get(&table)
             .map(|entry| entry.value().clone());
 
+        let decimal_columns: Vec<_> = self
+            .catalog
+            .get_table(&table)
+            .into_iter()
+            .flat_map(|table| table.columns)
+            .filter_map(|column| {
+                let datatype = string_to_arrow_datatype(&column.data_type);
+                matches!(datatype, DataType::Decimal128(_, _)).then_some((column.name, datatype))
+            })
+            .collect();
+
         let pk_cols = self
             .catalog
             .get_table(&table)
@@ -10682,6 +11103,26 @@ impl GatewayHandler {
                             .to_string(),
                     };
                     value_map.insert(column.clone(), generated);
+                }
+            }
+
+            // Validate every decimal before buffering any row from this statement.
+            for (column, datatype) in &decimal_columns {
+                if let Some(value) = value_map.get_mut(column).filter(|v| v.as_str() != r"\N") {
+                    use rockstream_sql::dml::{DmlLiteral, DmlScalarExpr};
+                    match DmlScalarExpr::Literal(DmlLiteral::String(value.clone()))
+                        .evaluate_assignment(&HashMap::new(), &HashMap::new(), datatype)
+                    {
+                        Ok(Some(formatted)) => *value = formatted,
+                        Ok(None) => *value = r"\N".to_owned(),
+                        Err(error) => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "22003".to_owned(),
+                                error.to_string(),
+                            ))));
+                        }
+                    }
                 }
             }
 
@@ -10867,6 +11308,7 @@ impl GatewayHandler {
     fn build_returning_response(
         &self,
         table: &str,
+        command: &str,
         table_columns: &[String],
         returning_cols: &[String],
         rows: Vec<Vec<String>>,
@@ -10924,13 +11366,20 @@ impl GatewayHandler {
                     .get(i)
                     .map(|f| f.datatype())
                     .unwrap_or(&Type::TEXT);
-                encode_typed_field(&mut encoder, dt, Some(v.as_str()))
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                encode_typed_field_with_format(
+                    &mut encoder,
+                    dt,
+                    Some(v.as_str()).filter(|v| *v != r"\N"),
+                    Some(schema_ref[i].format()),
+                )
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
         });
         let stream = Box::pin(data_stream);
-        promote_response(Response::Query(QueryResponse::new(schema, stream)))
+        let mut response = QueryResponse::new(schema, stream);
+        response.set_command_tag(command);
+        promote_response(Response::Query(response))
     }
 
     async fn check_pk_exists(
@@ -10993,6 +11442,21 @@ impl GatewayHandler {
         predicate: Option<&rockstream_sql::dml::DmlPredicate>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<(String, Vec<String>)>> {
+        let column_types: HashMap<_, _> = self
+            .catalog
+            .get_table(table)
+            .map(|ct| {
+                ct.columns
+                    .into_iter()
+                    .map(|c| {
+                        (
+                            c.name.to_lowercase(),
+                            string_to_arrow_datatype(&c.data_type),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut live_rows: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         if let Some(shard_db) = &self.shard_db {
@@ -11064,7 +11528,7 @@ impl GatewayHandler {
                     row_map.insert(col.clone(), val_opt);
                 }
 
-                match pred.evaluate(&row_map) {
+                match pred.evaluate(&row_map, &column_types) {
                     Ok(tri) => {
                         if tri.is_true() {
                             matched.push((row_key, fields));
@@ -11075,7 +11539,11 @@ impl GatewayHandler {
                         let sqlstate = if err_str.contains("RS-1013") {
                             "0A000"
                         } else if err_str.contains("RS-1016") {
-                            "22012"
+                            if err_str.contains("division by zero") {
+                                "22012"
+                            } else {
+                                "22003"
+                            }
                         } else {
                             "42804"
                         };
@@ -11194,6 +11662,20 @@ impl GatewayHandler {
             .as_ref()
             .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_else(|| assignments.iter().map(|(c, _)| c.clone()).collect());
+        let column_types: HashMap<_, _> = table_entry
+            .as_ref()
+            .map(|ct| {
+                ct.columns
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.name.to_lowercase(),
+                            string_to_arrow_datatype(&c.data_type),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let pk_cols = table_entry.map(|ct| ct.pk_cols).unwrap_or_default();
 
         let matched_rows = match self
@@ -11225,6 +11707,7 @@ impl GatewayHandler {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
+                    "UPDATE",
                     &table_columns,
                     returning_cols,
                     Vec::new(),
@@ -11251,22 +11734,36 @@ impl GatewayHandler {
             }
 
             for (col_name, scalar_expr) in &assignments {
-                let new_val = match scalar_expr.evaluate(&row_map) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        let sqlstate = if err_str.contains("RS-1016") {
-                            "22012"
-                        } else if err_str.contains("RS-1013") {
-                            "0A000"
-                        } else {
-                            "42601"
-                        };
-                        return Ok(vec![promote_response(Response::Error(Box::new(
-                            ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
-                        )))]);
-                    }
+                let Some(target_type) = column_types.get(col_name) else {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42703".to_owned(),
+                            format!("[RS-1002] Unknown column: {col_name}"),
+                        ),
+                    )))]);
                 };
+                let new_val =
+                    match scalar_expr.evaluate_assignment(&row_map, &column_types, target_type) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            let sqlstate = if err_str.contains("RS-1016") {
+                                if err_str.contains("division by zero") {
+                                    "22012"
+                                } else {
+                                    "22003"
+                                }
+                            } else if err_str.contains("RS-1013") {
+                                "0A000"
+                            } else {
+                                "42601"
+                            };
+                            return Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), err_str),
+                            )))]);
+                        }
+                    };
                 row_map.insert(col_name.clone(), new_val);
             }
 
@@ -11356,6 +11853,7 @@ impl GatewayHandler {
         if let Some(returning_cols) = &returning_cols {
             return Ok(vec![self.build_returning_response(
                 &table,
+                "UPDATE",
                 &table_columns,
                 returning_cols,
                 result_rows,
@@ -11478,13 +11976,14 @@ impl GatewayHandler {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
+                    "DELETE",
                     &table_columns,
                     returning_cols,
                     Vec::new(),
                 )]);
             }
             return Ok(vec![promote_response(Response::Execution(
-                Tag::new("DELETE 0").with_rows(0),
+                Tag::new("DELETE").with_rows(0),
             ))]);
         }
 
@@ -11530,6 +12029,7 @@ impl GatewayHandler {
         if let Some(returning_cols) = &returning_cols {
             return Ok(vec![self.build_returning_response(
                 &table,
+                "DELETE",
                 &table_columns,
                 returning_cols,
                 captured_rows,
@@ -11538,7 +12038,7 @@ impl GatewayHandler {
 
         let count = captured_rows.len();
         Ok(vec![promote_response(Response::Execution(
-            Tag::new(&format!("DELETE {count}")).with_rows(count),
+            Tag::new("DELETE").with_rows(count),
         ))])
     }
 
@@ -12394,7 +12894,7 @@ impl ExtendedQueryHandler for GatewayHandler {
             .map(|oid| Type::from_oid(*oid).unwrap_or(Type::UNKNOWN))
             .collect::<Vec<Type>>();
         let parsed_stmt = parser.parse_sql(&message.query, &types).await?;
-
+        let types = parsed_stmt.parameter_types.clone();
         let stmt = StoredStatement::new(
             message
                 .name
@@ -12434,6 +12934,37 @@ impl ExtendedQueryHandler for GatewayHandler {
             .unwrap_or_else(|| "unknown".to_string());
         let portal_name = message.portal_name.clone().unwrap_or_default();
 
+        let statement_name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+        let statement = client
+            .portal_store()
+            .get_statement(statement_name)
+            .ok_or_else(|| PgWireError::StatementNotFound(statement_name.to_owned()))?;
+        if message.parameters.len() != statement.parameter_types.len()
+            || (message.parameter_format_codes.len() > 1
+                && message.parameter_format_codes.len() != message.parameters.len())
+            || message
+                .parameter_format_codes
+                .iter()
+                .any(|code| !matches!(code, 0 | 1))
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "08P01".to_string(),
+                "invalid Bind parameter count or format codes".to_string(),
+            ))));
+        }
+        let portal = Portal::try_new(&message, statement)?;
+        for (i, value) in portal.parameters.iter().enumerate() {
+            if portal.parameter_format.is_binary(i) {
+                if let Some(value) = value {
+                    decode_param_bytes(value, portal.statement.parameter_types.get(i))?;
+                }
+            }
+        }
+
         // Bound portals per connection with LRU eviction (v0.51.6 Slice 1)
         // instead of hard-erroring at the cap.
         {
@@ -12462,11 +12993,6 @@ impl ExtendedQueryHandler for GatewayHandler {
             }
         }
 
-        let statement_name = message
-            .statement_name
-            .as_deref()
-            .unwrap_or(pgwire::api::DEFAULT_NAME);
-
         // Binding a portal to a statement counts as use of that statement —
         // promote it to most-recently-used so it isn't evicted while a live
         // portal still depends on it (v0.51.6 Slice 1).
@@ -12474,18 +13000,13 @@ impl ExtendedQueryHandler for GatewayHandler {
             stmts.get(statement_name);
         }
 
-        if let Some(statement) = client.portal_store().get_statement(statement_name) {
-            let portal = Portal::try_new(&message, statement)?;
-            client.portal_store().put_portal(Arc::new(portal));
-            self.portal_states
-                .remove(&(conn_id.clone(), portal_name.clone()));
-            client
-                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
-                .await?;
-            Ok(())
-        } else {
-            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
-        }
+        client.portal_store().put_portal(Arc::new(portal));
+        self.portal_states
+            .remove(&(conn_id.clone(), portal_name.clone()));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
     }
 
     async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
@@ -12733,7 +13254,12 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = describe_fields_for_query(&self.catalog, &target.statement.sql);
+        let fields = describe_fields_for_query(
+            &self.catalog,
+            &target.statement.sql,
+            &target.statement.parameter_types,
+        )
+        .await;
         Ok(DescribeStatementResponse::new(
             target.statement.parameter_types.clone(),
             fields,
@@ -12752,7 +13278,12 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = describe_fields_for_query(&self.catalog, &target.statement.statement.sql);
+        let fields = describe_fields_for_query(
+            &self.catalog,
+            &target.statement.statement.sql,
+            &target.statement.parameter_types,
+        )
+        .await;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -12827,7 +13358,8 @@ impl ExtendedQueryHandler for GatewayHandler {
                 query,
                 &portal.parameters,
                 &portal.statement.parameter_types,
-            );
+                &portal.parameter_format,
+            )?;
             &effective_query
         } else {
             query
@@ -14831,6 +15363,30 @@ fn backfill_not_published_response(view_name: &str) -> Vec<Response<'static>> {
     ))))]
 }
 
+/// Refuse a complete output batch before retaining it, using the Arrow
+/// array footprint as a conservative producer-side memory measure.
+fn account_fallback_query_batch(
+    previous_rows: usize,
+    previous_bytes: usize,
+    batch: &RecordBatch,
+) -> Result<(usize, usize), GatewayError> {
+    let rows = previous_rows
+        .checked_add(batch.num_rows())
+        .unwrap_or(usize::MAX);
+    let bytes = previous_bytes
+        .checked_add(batch.get_array_memory_size())
+        .unwrap_or(usize::MAX);
+    if rows > FALLBACK_QUERY_MAX_ROWS || bytes > FALLBACK_QUERY_MAX_ARRAY_BYTES {
+        return Err(GatewayError::QueryTimeExecutionFailed {
+            detail: format!(
+                "ad hoc SELECT result budget exceeded: {rows} rows/{bytes} bytes (max {} rows/{} bytes)",
+                FALLBACK_QUERY_MAX_ROWS, FALLBACK_QUERY_MAX_ARRAY_BYTES
+            ),
+        });
+    }
+    Ok((rows, bytes))
+}
+
 fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
     use chrono::TimeZone;
     use datafusion::arrow::array::{
@@ -14970,10 +15526,13 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                         )
                         .ok()
                     }
-                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => col
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+                        datafusion::arrow::util::display::array_value_to_string(
+                            col.as_ref(),
+                            row_idx,
+                        )
+                        .ok()
+                    }
                     _ => col
                         .as_any()
                         .downcast_ref::<StringArray>()
@@ -15315,8 +15874,8 @@ fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, 
 /// logic.)
 fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryBuilder, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryBuilder, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
@@ -15378,21 +15937,15 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         .collect();
                     Arc::new(Float64Array::from(vals)) as ArrayRef
                 }
-                DataType::Decimal128(precision, scale) => {
-                    let vals: Vec<Option<i128>> = col_strs[i]
-                        .iter()
-                        .map(|s| {
-                            let mut value = s.as_deref()?.parse::<rust_decimal::Decimal>().ok()?;
-                            value.rescale((*scale).try_into().ok()?);
-                            Some(value.mantissa())
-                        })
-                        .collect();
-                    Arc::new(
-                        Decimal128Array::from(vals)
-                            .with_precision_and_scale(*precision, *scale)
-                            .map_err(|error| error.to_string())?,
-                    ) as ArrayRef
-                }
+                DataType::Decimal128(_, _) => datafusion::arrow::compute::cast_with_options(
+                    &StringArray::from(col_strs[i].clone()),
+                    field.data_type(),
+                    &datafusion::arrow::compute::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?,
                 DataType::Boolean => {
                     let vals: Vec<Option<bool>> = col_strs[i]
                         .iter()
@@ -16130,7 +16683,8 @@ impl PartitionStream for QueryTimeScatterPartition {
                         reader
                             .scan_prefix_pages(
                                 &prefix,
-                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS,
+                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS
+                                    .min(rockstream_storage::ShardReader::MAX_SCAN_PAGE_ROWS),
                                 QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES,
                                 sender,
                             )
@@ -16262,6 +16816,23 @@ fn extract_after_fence_token(q: &str) -> Option<FreshnessToken> {
 }
 
 /// Extract the view name from a simple `SELECT … FROM <name> [LIMIT n]` query.
+/// Reject over-budget producer scans before exposing rows to a PGWire
+/// response. A scan marked as truncated is never a valid partial result.
+fn checked_complete_storage_scan(
+    relation: &str,
+    rows: Vec<(Bytes, Bytes)>,
+    truncated: bool,
+    max_rows: usize,
+) -> Result<Vec<Vec<u8>>, GatewayError> {
+    if truncated || rows.len() > max_rows {
+        return Err(GatewayError::QueryTimeResultSetTooLarge {
+            relation: relation.to_string(),
+            row_limit: max_rows,
+        });
+    }
+    Ok(rows.into_iter().map(|(_, value)| value.to_vec()).collect())
+}
+
 fn extract_view_name_from_select(q: &str) -> Option<String> {
     let ql = q.to_lowercase();
     let from_pos = ql.find(" from ")?;
@@ -16556,7 +17127,11 @@ fn describe_returning_fields(
 }
 
 /// Build FieldInfo list for a query (for DESCRIBE).
-fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
+async fn describe_fields_for_query(
+    catalog: &CatalogStubs,
+    q: &str,
+    param_types: &[Type],
+) -> Vec<FieldInfo> {
     let ql = q.trim().to_lowercase();
     if let Some(Ok(CatalogResponse::Rows { columns, .. })) = diagnostic_catalog_response(q) {
         return columns
@@ -16646,6 +17221,32 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
     // when try_datafusion_select executes the query.
     let ql = q.trim().to_lowercase();
     if ql.starts_with("select ") {
+        let params = vec![None; param_types.len()];
+        if let Ok(sql) = substitute_params_typed(
+            q,
+            &params,
+            param_types,
+            &pgwire::api::portal::Format::UnifiedText,
+        ) {
+            let ctx = SessionContext::new();
+            rockstream_sql::frontend::register_session_sql_udf(&ctx);
+            if let Ok(df) = ctx.sql(&sql).await {
+                return df
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        FieldInfo::new(
+                            field.name().clone(),
+                            None,
+                            None,
+                            pg_type_from_arrow_datatype(field.data_type()),
+                            FieldFormat::Text,
+                        )
+                    })
+                    .collect();
+            }
+        }
         let cols = infer_select_columns(q);
         if !cols.is_empty() {
             return cols
@@ -16830,7 +17431,7 @@ fn connector_removed_error_response() -> Response<'static> {
     Response::Error(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
         "0A000".to_owned(),
-        "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.".to_string(),
+        "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks. Kafka sink row export is currently unsupported.".to_string(),
     )))
 }
 
@@ -18052,7 +18653,7 @@ fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
     Some(workload)
 }
 
-fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
+fn parse_alter_workload(q: &str) -> Option<(String, Option<u64>, WorkloadSettings)> {
     let after = q
         .trim()
         .strip_prefix("ALTER WORKLOAD ")
@@ -18062,13 +18663,30 @@ fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
     let (name_part, settings_part) = after
         .split_once(" SET ")
         .or_else(|| after.split_once(" set "))?;
-    let workload_name = name_part.trim().trim_matches('"');
+    let name_part = name_part.trim();
+    let upper = name_part.to_ascii_uppercase();
+    let (workload_name, expected_revision) = if let Some(index) = upper.find(" IF REVISION ") {
+        let version = name_part.get(index + " IF REVISION ".len()..)?.trim();
+        (
+            name_part.get(..index)?.trim().trim_matches('"'),
+            Some(version.parse::<u64>().ok()?),
+        )
+    } else {
+        (name_part.trim_matches('"'), None)
+    };
+    if workload_name.is_empty() {
+        return None;
+    }
     let body = settings_part
         .trim()
         .strip_prefix('(')?
         .strip_suffix(')')?
         .trim();
-    Some((workload_name.to_string(), parse_workload_settings(body)?))
+    Some((
+        workload_name.to_string(),
+        expected_revision,
+        parse_workload_settings(body)?,
+    ))
 }
 
 fn parse_drop_workload(q: &str) -> Option<String> {
@@ -18195,187 +18813,206 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
     deps
 }
 
+fn parameter_positions(sql: &str) -> PgWireResult<Vec<(std::ops::Range<usize>, usize)>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                format!("{error} (RS-2056)"),
+            )))
+        })?;
+    let mut positions = Vec::new();
+    let mut chars = sql.char_indices();
+    let (mut line, mut column) = (1, 1);
+    for token in tokens {
+        if let Token::Placeholder(name) = token.token {
+            let index = name
+                .strip_prefix('$')
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|index| (1..=u16::MAX as usize).contains(index))
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42P02".to_owned(),
+                        format!("invalid parameter {name} (RS-2056)"),
+                    )))
+                })?;
+            for (offset, ch) in chars.by_ref() {
+                let location = (line, column);
+                if ch == '\n' {
+                    line += 1;
+                    column = 1;
+                } else {
+                    column += 1;
+                }
+                if location == (token.span.start.line, token.span.start.column) {
+                    positions.push((offset..offset + name.len(), index));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(positions)
+}
+
 fn substitute_params_typed(
     sql: &str,
     params: &[Option<bytes::Bytes>],
     param_types: &[Type],
-) -> String {
-    let mut result = sql.to_string();
-    // Work from the highest index downward so that replacing `$10` before `$1`
-    // doesn't corrupt earlier replacements.
-    for (i, param) in params.iter().enumerate().rev() {
-        let placeholder = format!("${}", i + 1);
-        let param_type = param_types.get(i);
-        let replacement = match param {
-            None => "NULL".to_string(),
-            Some(bytes) => decode_param_bytes(bytes, param_type),
-        };
-        // Replace `$N::cast_type` as well as bare `$N`.
-        // We do a simple regex-free replacement: find `$N` and strip any
-        // trailing `::identifier` before inserting the replacement.
-        let placeholder_with_cast = format!("{}::", placeholder);
-        // Replace cast variants first (greedy: strip until non-alphanumeric/underscore).
-        let mut new_result = String::with_capacity(result.len());
-        let mut remaining = result.as_str();
-        while let Some(pos) = remaining.find(&placeholder_with_cast) {
-            new_result.push_str(&remaining[..pos]);
-            new_result.push_str(&replacement);
-            let after = &remaining[pos + placeholder_with_cast.len()..];
-            // Skip the cast type name (letters, digits, underscores).
-            let skip = after
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            remaining = &after[skip..];
-        }
-        new_result.push_str(remaining);
-        result = new_result;
-        // Now replace bare `$N` placeholders.
-        result = result.replace(&placeholder, &replacement);
-    }
-
-    // Normalize `= ANY(ARRAY[...])` expressions to `IN (...)`
-    while let Some(pos) = result.find("= ANY(ARRAY[") {
-        if let Some(end_bracket) = result[pos..].find(']') {
-            let close_paren = pos + end_bracket + 1;
-            if close_paren < result.len() && result.as_bytes()[close_paren] == b')' {
-                let inner = &result[pos + "= ANY(ARRAY[".len()..pos + end_bracket];
-                let in_expr = if inner.trim().is_empty() {
-                    "IN (NULL)".to_string()
+    format: &pgwire::api::portal::Format,
+) -> PgWireResult<String> {
+    let mut result = String::with_capacity(sql.len());
+    let mut end = 0;
+    // Copy original source between parameter tokens; inserted values are never scanned.
+    for (range, index) in parameter_positions(sql)? {
+        let i = index - 1;
+        let param = params.get(i).ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P02".to_owned(),
+                format!("missing parameter ${index} (RS-2056)"),
+            )))
+        })?;
+        let ty = param_types.get(i).unwrap_or(&Type::TEXT);
+        let value = match param {
+            None => "NULL".to_owned(),
+            Some(bytes) if format.is_text(i) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22021".to_owned(),
+                        "invalid UTF-8 parameter (RS-2056)".to_owned(),
+                    )))
+                })?;
+                if matches!(ty.kind(), postgres_types::Kind::Array(_)) {
+                    decode_text_param_bytes(bytes)
                 } else {
-                    format!("IN ({})", inner)
-                };
-                result.replace_range(pos..close_paren + 1, &in_expr);
-                continue;
+                    format!("'{}'", text.replace('\'', "''"))
+                }
             }
-        }
-        break;
+            Some(bytes) => decode_param_bytes(bytes, Some(ty))?,
+        };
+        result.push_str(&sql[end..range.start]);
+        result.push_str(&value);
+        end = range.end;
     }
-
-    result
+    result.push_str(&sql[end..]);
+    Ok(result)
 }
 
-fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> String {
-    if bytes.len() >= 12 && bytes[..4] == [0, 0, 0, 1] {
-        // 1D PostgreSQL binary array decoding
-        let elem_type = i32::from_be_bytes(bytes[8..12].try_into().unwrap_or_default());
-        let dim = i32::from_be_bytes(bytes[12..16].try_into().unwrap_or_default());
-        let mut offset = 20;
-        let mut elems = Vec::new();
-        for _ in 0..dim.max(0) {
-            if offset + 4 > bytes.len() {
-                break;
-            }
-            let len = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or_default());
-            offset += 4;
-            if len < 0 {
-                elems.push("NULL".to_string());
-            } else if offset + len as usize <= bytes.len() {
-                let elem_bytes = &bytes[offset..offset + len as usize];
-                offset += len as usize;
-                let formatted = match elem_type {
-                    20 => i64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    23 => i32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    21 => i16::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string(),
-                    16 => {
-                        if !elem_bytes.is_empty() && elem_bytes[0] != 0 {
-                            "true".to_string()
-                        } else {
-                            "false".to_string()
-                        }
-                    }
-                    700 => {
-                        f32::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
-                    }
-                    701 => {
-                        f64::from_be_bytes(elem_bytes.try_into().unwrap_or_default()).to_string()
-                    }
-                    _ => {
-                        if let Ok(s) = std::str::from_utf8(elem_bytes) {
-                            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                                s.to_string()
-                            } else {
-                                format!("'{}'", s.replace('\'', "''"))
-                            }
-                        } else {
-                            "NULL".to_string()
-                        }
-                    }
-                };
-                elems.push(formatted);
-            }
-        }
-        return format!("ARRAY[{}]", elems.join(", "));
-    }
-
+fn decode_param_bytes(bytes: &[u8], param_type: Option<&Type>) -> PgWireResult<String> {
+    let invalid = || {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "22P03".to_string(),
+            format!(
+                "invalid binary representation for type {}",
+                param_type.map_or("unknown", Type::name)
+            ),
+        )))
+    };
     if let Some(ty) = param_type {
-        match *ty {
-            Type::INT8 => {
-                if bytes.len() == 8 {
-                    return i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
-                        .to_string();
-                }
+        if let postgres_types::Kind::Array(element_type) = ty.kind() {
+            let mut remaining = bytes;
+            let read_i32 = |remaining: &mut &[u8]| {
+                let (head, tail) = remaining.split_at_checked(4).ok_or_else(invalid)?;
+                *remaining = tail;
+                Ok::<_, PgWireError>(i32::from_be_bytes(head.try_into().map_err(|_| invalid())?))
+            };
+            let dimensions = read_i32(&mut remaining)?;
+            let flags = read_i32(&mut remaining)?;
+            let oid = read_i32(&mut remaining)? as u32;
+            if !matches!(flags, 0 | 1) || oid != element_type.oid() {
+                return Err(invalid());
             }
-            Type::INT4 => {
-                if bytes.len() == 4 {
-                    return i32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
-                        .to_string();
+            if dimensions == 0 {
+                if !remaining.is_empty() {
+                    return Err(invalid());
                 }
+                return Ok("ARRAY[]".to_string());
             }
-            Type::INT2 => {
-                if bytes.len() == 2 {
-                    return i16::from_be_bytes(bytes[..2].try_into().unwrap_or_default())
-                        .to_string();
-                }
+            if dimensions != 1 {
+                return Err(invalid());
             }
-            Type::FLOAT8 => {
-                if bytes.len() == 8 {
-                    return f64::from_be_bytes(bytes[..8].try_into().unwrap_or_default())
-                        .to_string();
-                }
+            let length = read_i32(&mut remaining)?;
+            let lower_bound = read_i32(&mut remaining)?;
+            if length < 0
+                || (length > 0 && lower_bound.checked_add(length - 1).is_none())
+                || length as usize > remaining.len() / 4
+            {
+                return Err(invalid());
             }
-            Type::FLOAT4 => {
-                if bytes.len() == 4 {
-                    return f32::from_be_bytes(bytes[..4].try_into().unwrap_or_default())
-                        .to_string();
-                }
-            }
-            Type::BOOL => {
-                if bytes.len() == 1 {
-                    return if bytes[0] != 0 { "true" } else { "false" }.to_string();
-                }
-            }
-            Type::UUID => {
-                if bytes.len() == 16 {
-                    return format!(
-                        "'{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5],
-                        bytes[6], bytes[7],
-                        bytes[8], bytes[9],
-                        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            let mut elements = Vec::new();
+            for _ in 0..length {
+                let (head, tail) = remaining.split_at_checked(4).ok_or_else(invalid)?;
+                remaining = tail;
+                let length = i32::from_be_bytes(head.try_into().map_err(|_| invalid())?);
+                if length == -1 {
+                    if flags == 0 {
+                        return Err(invalid());
+                    }
+                    elements.push("NULL".to_string());
+                } else {
+                    let length = usize::try_from(length).map_err(|_| invalid())?;
+                    let (element, tail) = remaining.split_at_checked(length).ok_or_else(invalid)?;
+                    remaining = tail;
+                    elements.push(
+                        decode_param_bytes(element, Some(element_type)).map_err(|_| invalid())?,
                     );
                 }
             }
+            if !remaining.is_empty() {
+                return Err(invalid());
+            }
+            return Ok(format!("ARRAY[{}]", elements.join(", ")));
+        }
+
+        macro_rules! number {
+            ($rust_type:ty) => {
+                Ok(
+                    <$rust_type>::from_be_bytes(bytes.try_into().map_err(|_| invalid())?)
+                        .to_string(),
+                )
+            };
+        }
+        return match *ty {
+            Type::INT8 => number!(i64),
+            Type::INT4 => number!(i32),
+            Type::INT2 => number!(i16),
+            Type::FLOAT8 => number!(f64),
+            Type::FLOAT4 => number!(f32),
+            Type::BOOL => match bytes {
+                [0] => Ok("false".to_string()),
+                [1] => Ok("true".to_string()),
+                _ => Err(invalid()),
+            },
+            Type::UUID => uuid::Uuid::from_slice(bytes)
+                .map(|value| format!("'{value}'"))
+                .map_err(|_| invalid()),
             Type::TIMESTAMP | Type::TIMESTAMPTZ => {
-                if bytes.len() == 8 {
-                    let pg_micros = i64::from_be_bytes(bytes[..8].try_into().unwrap_or_default());
-                    let unix_micros = pg_micros + 946_684_800_000_000i64;
-                    let secs = unix_micros.div_euclid(1_000_000);
-                    let nsecs = (unix_micros.rem_euclid(1_000_000) * 1_000) as u32;
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                        return format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f"));
-                    }
-                }
+                let pg_micros = i64::from_be_bytes(bytes.try_into().map_err(|_| invalid())?);
+                let unix_micros = pg_micros
+                    .checked_add(946_684_800_000_000)
+                    .ok_or_else(invalid)?;
+                let dt =
+                    chrono::DateTime::from_timestamp_micros(unix_micros).ok_or_else(invalid)?;
+                Ok(format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f")))
             }
             Type::VARCHAR | Type::TEXT => {
-                if let Ok(s) = std::str::from_utf8(bytes) {
-                    return format!("'{}'", s.replace('\'', "''"));
-                }
+                let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+                Ok(format!("'{}'", text.replace('\'', "''")))
             }
-            _ => {}
-        }
+            _ => Ok(decode_text_param_bytes(bytes)),
+        };
     }
+    Ok(decode_text_param_bytes(bytes))
+}
 
+fn decode_text_param_bytes(bytes: &[u8]) -> String {
     // Fallback heuristic decoding
     if bytes
         .iter()
@@ -19093,6 +19730,10 @@ fn parse_value_list(s: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[path = "malformed_bind_tests.rs"]
+mod malformed_bind_tests;
+
+#[cfg(test)]
 // These legacy parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod s4_tests {
@@ -19104,6 +19745,21 @@ mod s4_tests {
     use rockstream_ops::ColumnValue;
     use rockstream_types::acl::{AclEntry, Role};
     use std::sync::Arc;
+
+    #[test]
+    fn parameter_binding_preserves_original_source() {
+        let sql = "SELECT 'ø $20' AS \"id$30\", /* $40 */\r\n $1::VARCHAR(4) AS v -- $50";
+        assert_eq!(
+            substitute_params_typed(
+                sql,
+                &[Some(bytes::Bytes::from_static(b"x$1"))],
+                &[Type::TEXT],
+                &pgwire::api::portal::Format::UnifiedText,
+            )
+            .unwrap(),
+            "SELECT 'ø $20' AS \"id$30\", /* $40 */\r\n 'x$1'::VARCHAR(4) AS v -- $50",
+        );
+    }
 
     struct NoopViewReader;
 
@@ -19825,5 +20481,244 @@ mod source_batch_tests {
             ),
             ("10.25".to_string(), "5.50".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_array_parameter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prisma_nested_catalog_any_bind_is_text_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT info.column_name FROM information_schema.columns info JOIN (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname = ANY($1)) schemas ON schemas.nspname = info.table_schema";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn unqualified_catalog_any_bind_is_array() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT namespace.nspname FROM pg_namespace AS namespace WHERE namespace.nspname = ANY($1) ORDER BY namespace.nspname";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::TEXT_ARRAY]);
+    }
+
+    #[tokio::test]
+    async fn explicitly_cast_catalog_any_bind_keeps_declared_type() {
+        let catalog = CatalogStubs::new();
+        let sql = "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = ANY($1::int4[])";
+        let types = match infer_parameter_types(&catalog, sql).await {
+            Ok(types) => types,
+            Err(err) => panic!("parameter inference failed: {err}"),
+        };
+        assert_eq!(types, vec![Type::INT4_ARRAY]);
+    }
+}
+
+#[cfg(test)]
+mod v072_subscription_producer_bounds_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoundedSnapshotReader {
+        seen_limit: AtomicUsize,
+        rows_available: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ViewReader for BoundedSnapshotReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            self.seen_limit
+                .store(limit.unwrap_or(usize::MAX), Ordering::SeqCst);
+            let count = self.rows_available.min(limit.unwrap_or(usize::MAX));
+            Ok(vec![b"value".to_vec(); count])
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            Some(4)
+        }
+    }
+
+    async fn check_snapshot(rows_available: usize) -> (usize, bool) {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_snapshot".to_owned(),
+            sql: "SELECT value FROM base".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        let response = handler
+            .handle_subscribe("SUBSCRIBE v072_snapshot AS OF NOW WITH SNAPSHOT", None)
+            .await
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
+        let limit = reader.seen_limit.load(Ordering::SeqCst);
+        let rejected = matches!(response.as_slice(), [Response::Error(_)]);
+        (limit, rejected)
+    }
+
+    #[tokio::test]
+    async fn snapshot_reader_receives_one_row_overflow_probe() {
+        let (limit, rejected) = check_snapshot(1).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(!rejected);
+    }
+
+    #[tokio::test]
+    async fn oversized_producer_snapshot_fails_before_stream_formation() {
+        let (limit, rejected) = check_snapshot(SUBSCRIBE_SNAPSHOT_MAX_ROWS + 50).await;
+        assert_eq!(limit, SUBSCRIBE_SNAPSHOT_MAX_ROWS + 1);
+        assert!(rejected);
+    }
+    #[tokio::test]
+    async fn unauthorized_subscriber_cannot_scan_or_reserve_a_live_stream() {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_private".to_owned(),
+            sql: "SELECT value FROM source".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available: 1,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        {
+            let mut session = handler.sessions.entry("viewer".to_owned()).or_default();
+            session.principal = Principal::Jwt {
+                sub: "ungranted-viewer".to_owned(),
+            };
+        }
+        let denied = handler
+            .handle_subscribe(
+                "SUBSCRIBE v072_private AS OF NOW WITH SNAPSHOT",
+                Some("viewer"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
+        assert!(matches!(denied.as_slice(), [Response::Error(_)]));
+        assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.subscribe_registry.active_streams(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_cannot_escape_failed_explicit_transaction() {
+        let catalog = Arc::new(CatalogStubs::new());
+        catalog.add_view_in_namespace(crate::catalog_stubs::CatalogView {
+            name: "v072_private".to_owned(),
+            sql: "SELECT value FROM source".to_owned(),
+            columns: vec![crate::catalog_stubs::CatalogColumn {
+                name: "value".to_owned(),
+                data_type: "Utf8".to_owned(),
+            }],
+            namespace: "public".to_owned(),
+            op_id: None,
+        });
+        let reader = Arc::new(BoundedSnapshotReader {
+            seen_limit: AtomicUsize::new(0),
+            rows_available: 1,
+        });
+        let handler = GatewayHandler::new(catalog, reader.clone());
+        {
+            let mut session = handler.sessions.entry("aborted".to_owned()).or_default();
+            session.begin_explicit();
+            session.fail_transaction();
+        }
+        let denied = handler
+            .dispatch_async_with_conn(
+                "SUBSCRIBE v072_private AS OF NOW WITH SNAPSHOT",
+                Some("aborted"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("subscription test setup failed: {error}"));
+        assert!(matches!(denied.as_slice(), [Response::Error(_)]));
+        assert_eq!(reader.seen_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.subscribe_registry.active_streams(), 0);
+    }
+}
+
+#[cfg(test)]
+mod v072_storage_select_scan_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_truncated_or_oversized_storage_results_without_partial_rows() {
+        let rows = vec![
+            (Bytes::from_static(b"a"), Bytes::from_static(b"one")),
+            (Bytes::from_static(b"b"), Bytes::from_static(b"two")),
+        ];
+        assert_eq!(
+            checked_complete_storage_scan("orders", rows.clone(), false, 2)
+                .unwrap_or_else(|error| panic!("complete results must succeed: {error}")),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
+        assert!(checked_complete_storage_scan("orders", rows.clone(), true, 2).is_err());
+        assert!(checked_complete_storage_scan("orders", rows, false, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v072_datafusion_fallback_limits {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    fn small_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            datafusion::arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .unwrap_or_else(|error| panic!("valid tiny batch: {error}"))
+    }
+
+    #[test]
+    fn row_and_byte_budgets_count_complete_batches_without_truncation() {
+        let batch = small_batch();
+        let bytes = batch.get_array_memory_size();
+        assert_eq!(
+            account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 3, 0, &batch)
+                .unwrap_or_else(|error| panic!("exact row boundary: {error}")),
+            (FALLBACK_QUERY_MAX_ROWS, bytes)
+        );
+        assert!(account_fallback_query_batch(FALLBACK_QUERY_MAX_ROWS - 2, 0, &batch).is_err());
+        assert_eq!(
+            account_fallback_query_batch(0, FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes, &batch)
+                .unwrap_or_else(|error| panic!("exact byte boundary: {error}")),
+            (3, FALLBACK_QUERY_MAX_ARRAY_BYTES)
+        );
+        assert!(account_fallback_query_batch(
+            0,
+            FALLBACK_QUERY_MAX_ARRAY_BYTES - bytes + 1,
+            &batch
+        )
+        .is_err());
+        assert!(account_fallback_query_batch(usize::MAX, 0, &batch).is_err());
+        assert!(account_fallback_query_batch(0, usize::MAX, &batch).is_err());
     }
 }

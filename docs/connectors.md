@@ -13,15 +13,15 @@ connectors.
 
 ## Strategic contract
 
-The retained connector and sink surface is Core: it is release-gated, named in
-the generated [`capability matrix`](capability-matrix.md), and covered by the
-existing exact-transcript proof suites.
+The two source connectors are Core and release-gated. The Kafka sink is
+Experimental and delivers bounded runtime view snapshot/change envelopes. The generated
+[`capability matrix`](capability-matrix.md) records these tiers.
 
 | Capability | Tier | Guarantee reference | Named proof |
 | --- | --- | --- | --- |
 | PostgreSQL CDC source | **Core** | [PostgreSQL CDC](#postgresql-cdc) | [`postgres_cdc_snapshot_stream_fence_has_exact_transcript`](../crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs) |
 | Kafka source | **Core** | [Kafka source](#kafka-source) | [`kafka_source_mid_epoch_rebalance_recovers_exact_transcript`](../crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs) |
-| Kafka sink | **Core** | [Kafka sink](#kafka-sink) | [`kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly`](../crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs) |
+| Kafka sink | **Experimental** | [Kafka sink](#kafka-sink) | Bounded view snapshot/change envelopes; full Core qualification remains incomplete. |
 
 These are the only external connector boundaries. Removed Iceberg, Delta,
 object-store, S3, and HTTP webhook surfaces fail closed with `RS-4017`; their
@@ -154,13 +154,52 @@ CREATE SOURCE events_source TYPE kafka (
 
 ## Kafka sink
 
+`rockstream_ops::kafka_sink::KafkaViewSink` exports the production `ViewSinkOp`
+delta log. Construct it with a connected `KafkaSink`, the view's `ShardDb`,
+operator ID, and column count, then call `deliver_next()` until it returns false.
+The first envelope contains the complete materialized snapshot; later envelopes
+contain signed changes for one nonempty view epoch each. The legacy
+`SinkConnector::pre_commit(epoch, row_count)` still emits count markers.
+SQL `CREATE SINK` does not configure this runtime adapter.
+
+The canonical v1 payload is a JSON object with `version: 1`, `connector_id`,
+`view` (operator ID), `epoch` (sink transaction sequence starting at zero),
+`view_epoch` (last included view epoch, or null for an empty initial view),
+`kind` (`snapshot` or `changes`), and `rows`. Each row has `values` in schema
+order and a signed integer `weight`. Values are `"Null"`, `{"Int64":1}`,
+`{"Utf8":"a"}`, `{"Boolean":true}`, or `{"Float64":"3ff0000000000000"}`
+(the 16 hexadecimal IEEE-754 bits, preserving NaNs and signed zero).
+Whole rows identify Z-set entries; an update retracts the old row and inserts
+the new row in the same envelope. Sum weights for identical rows to reconstruct
+the relation. One Kafka record, keyed by the decimal sink epoch on partition
+zero, is one complete Kafka transaction. A `read_committed` consumer treats the
+atomic `snapshot` envelope as snapshot completion before subsequent changes.
+
+The shard checkpoint retains the full pending payload, target identity, snapshot
+state, view cursor, and next transaction sequence. The adapter flushes this state
+before Kafka commit and finalizes the cursor after commit. On restart, reconnect
+the producer to fence its old transaction, then resume `deliver_next()`. Recovery
+checks durable topic delivery before republishing. An unresolved lookup returns
+`RS-4030` and leaves the checkpoint pending.
+
+Use one owner, a dedicated topic/connector ID, an append-only monotonically
+committed view log, and a fixed schema. Retain the log and Kafka delivery records
+until recovery no longer needs them. Envelopes above 900 KiB and view log reads
+above 64 MiB fail closed; chunked snapshots, automatic log compaction, SQL sink
+wiring, and full Core release qualification remain outside this adapter.
+
+The [#122 acceptance contract](acceptance-contracts/122.md) is checked through a
+real consumer, including exact payloads, four crash windows, and wrong-value,
+missing-deletion, and duplicate-change controls. Marker tests remain transport
+checks only.
+
 | Axis | Guarantee |
 | --- | --- |
-| Delivery / recovery | Transactional, checkpoint-coupled commit; recovery re-runs safely without a second externally visible epoch. |
+| Delivery / recovery | Experimental bounded snapshot/change envelopes through `KafkaViewSink`; legacy count markers through `pre_commit`. Recovery checks all topic partitions before republishing. Setup failures, poll failures, and timeouts remain pending; only a complete stable scan confirms absence. |
 | Bound / fill metric / backpressure | `KAFKA_SINK_MAX_STAGED_EPOCHS=5`, `kafka_sink_staged_epochs_count`, and `backpressure_active`; staged-epoch admission rejects overflow. |
 | Degraded states | Pre-commit/commit uncertainty, timeout, staged-epoch backpressure, and idempotent recovery are explicit. |
-| Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, and `RS-4005`; recover with the action in the registry. |
-| Proof matrix | The seven Kafka sink cells below. |
+| Failure codes | `RS-4002`, `RS-4003`, `RS-4004`, `RS-4005`, and `RS-4030`; retry unknown-outcome recovery with the original pending handle after restoring lookup. |
+| Proof matrix | `kafka_view_delivery_tests` checks exact view rows and recovery; the seven marker transport cells below retain their narrower scope. |
 
 ## Failure-code ownership
 
@@ -188,13 +227,13 @@ CREATE SOURCE events_source TYPE kafka (
 | `RS-4020` | Backfill live-delta buffer |
 | `RS-4021` | Backfill admission reservation |
 | `RS-4022` | Backfill publication state |
+| `RS-4030` | Kafka sink delivery lookup is unresolved; retry recovery |
 
 ## Guarantee matrix
 
-Every row names the exact TestContainers proof. Each proof records the full
-payload/key/weight/LSN or offset transcript before and after recovery, and
-asserts no loss, no duplicate, and recovery within the existing 60-second
-freshness budget.
+The source rows name TestContainers transcript proofs. Kafka view delivery is
+checked by `crates/rockstream-ops/tests/kafka_view_delivery_tests.rs`. The Kafka
+sink cells below exercise legacy marker transport and recovery only.
 
 ### PostgreSQL CDC
 
@@ -223,6 +262,8 @@ freshness budget.
 | Transactional source/sink interaction | `kafka_source_sink_transaction_coupling_has_exact_transcript` |
 
 ### Kafka sink
+
+Epoch/count marker transport checks only; row-delivery qualification is unsupported.
 
 | Cell | Test |
 | --- | --- |

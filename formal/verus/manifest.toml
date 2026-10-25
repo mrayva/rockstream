@@ -592,7 +592,7 @@ domain = "A logical commit is authoritative only after the complete batch succee
 assumptions = ["SlateDB and ObjectStore provide the documented atomic write, flush, and ambiguous-I/O behavior; cross-process fencing remains an adapter responsibility."]
 implementation = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
 theorems = ["crates/rockstream-verified/src/persistence.rs::commit_outcome"]
-production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::commit_m3", "crates/rockstream-ops/src/group_commit.rs::do_flush"]
+production_callers = ["crates/rockstream-connectors/src/source_epoch.rs::commit_m3", "crates/rockstream-ops/src/group_commit/physical.rs::persist", "crates/rockstream-ops/src/group_commit/physical.rs::finish"]
 regression_tests = ["crates/rockstream-verified/src/lib.rs::vs5_kernels_reject_replay_and_protect_boundaries"]
 evidence = [
     "docs/adr/0006-persistence-replay-compaction.md",
@@ -674,4 +674,47 @@ regression_tests = ["crates/rockstream-runtime/src/recovery.rs::ready_requires_c
 evidence = [
     "cargo test --locked -p rockstream-runtime --lib recovery",
     "cargo test --locked -p rockstream-storage --test catalog_storage_tests",
+]
+
+[[claims]]
+id = "VS7-03"
+status = "adapter-qualified"
+domain = "PgWire length reads succeed only within the received bytes; complete bounded frames advance exactly past their own header and body; incomplete frames preserve input until more bytes arrive."
+assumptions = ["The vendored PgWire decoder passes the received buffer and wire length into the executable kernel; per-message body parsers validate their own fields after frame isolation."]
+implementation = ["crates/rockstream-verified/src/pgwire_framing.rs::read_length", "crates/rockstream-verified/src/pgwire_framing.rs::frame_span", "vendor/pgwire-0.28.0/src/messages/codec.rs::decode_packet"]
+theorems = ["crates/rockstream-verified/src/pgwire_framing.rs::read_length", "crates/rockstream-verified/src/pgwire_framing.rs::frame_span"]
+production_callers = ["vendor/pgwire-0.28.0/src/messages/codec.rs::get_length", "vendor/pgwire-0.28.0/src/messages/codec.rs::decode_packet", "vendor/pgwire-0.28.0/src/messages/mod.rs::decode"]
+regression_tests = ["vendor/pgwire-0.28.0/src/messages/codec.rs::every_valid_frame_split_preserves_bytes_then_consumes_only_its_frame", "vendor/pgwire-0.28.0/src/messages/codec.rs::invalid_lengths_fail_without_consumption_and_complete_bad_bodies_leave_next_frame", "crates/rockstream-gateway/tests/v072_pgwire_malformed_frame_tests.rs::malformed_frames_fail_closed_and_next_client_still_works"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p pgwire --lib framing_properties",
+    "cargo test --locked -p rockstream-gateway --test v072_pgwire_malformed_frame_tests",
+]
+
+[[claims]]
+id = "VS7-02"
+status = "adapter-qualified"
+domain = "Physical commit transfers each epoch between pending, in-flight, uncertain, and committed ownership; retained counts decrease only after durable completion, frontiers are monotone, and ACKs require durable success."
+assumptions = ["The driver owns exactly the entries removed from pending or uncertain maps; ShardDb reports write/flush outcomes under its backend durability contract; the kernel does not prove physical I/O or process scheduling."]
+implementation = ["crates/rockstream-verified/src/physical_commit.rs::begin_owner", "crates/rockstream-verified/src/physical_commit.rs::finish_transition", "crates/rockstream-ops/src/group_commit/physical.rs::finish"]
+theorems = ["crates/rockstream-verified/src/physical_commit.rs::begin_owner", "crates/rockstream-verified/src/physical_commit.rs::finish_transition"]
+production_callers = ["crates/rockstream-ops/src/group_commit/physical.rs::drive", "crates/rockstream-ops/src/group_commit/physical.rs::finish"]
+regression_tests = ["crates/rockstream-ops/src/group_commit/physical.rs::unknown_flush_keeps_later_epoch_queued_until_reconciliation", "crates/rockstream-ops/src/group_commit/physical.rs::cancelled_or_timed_out_request_at_each_storage_gate_keeps_both_epochs", "crates/rockstream-ops/src/group_commit/physical.rs::dropped_driver_flight_retains_exact_uncertain_ownership", "crates/rockstream-ops/src/group_commit/physical.rs::lfs_subprocess_cuts_have_only_legal_atomic_recoveries"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-ops --lib boundary_tests",
+]
+
+[[claims]]
+id = "VS7-01"
+status = "adapter-qualified"
+domain = "A reservation releases local channel counters only for its owning channel instance, while aggregate bytes and requests fall once on cancellation or ACK."
+assumptions = ["Each channel instance owns a unique live Arc token; the controller lock serializes accounting transitions; a permit is released or handed off once; channel keys with any delivered reservation are retired at teardown because wire ACKs carry no generation."]
+implementation = ["crates/rockstream-verified/src/ownership.rs::same_owner", "crates/rockstream-verified/src/ownership.rs::release_accounting", "crates/rockstream-runtime/src/exchange/flow_control.rs::release_batch_permit"]
+theorems = ["crates/rockstream-verified/src/ownership.rs::same_owner", "crates/rockstream-verified/src/ownership.rs::release_accounting"]
+production_callers = ["crates/rockstream-runtime/src/exchange/flow_control.rs::handoff", "crates/rockstream-runtime/src/exchange/flow_control.rs::release_batch_permit"]
+regression_tests = ["crates/rockstream-runtime/src/exchange/flow_control.rs::old_permit_cannot_release_recreated_channel", "crates/rockstream-runtime/src/exchange/flow_control.rs::delivered_cancelled_and_torn_down_reservations_keep_exact_charges", "crates/rockstream-runtime/src/exchange/flow_control.rs::lowering_live_row_budget_preserves_charges"]
+evidence = [
+    "cargo verus verify -p rockstream-verified --locked",
+    "cargo test --locked -p rockstream-runtime --lib exchange::flow_control",
 ]

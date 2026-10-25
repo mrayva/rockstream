@@ -77,7 +77,7 @@ printf '\nmutation\n' >> "$TMP_ROOT/docs/capability-matrix.md"
 run_bad "generated matrix drift"
 cp "$ROOT/docs/capability-matrix.md" "$TMP_ROOT/docs/capability-matrix.md"
 
-python3 -c 'from pathlib import Path; import re; root=Path("'"$TMP_ROOT"'"); version=re.search(r"^version = \"([^\"]+)\"$", (root/"capabilities.toml").read_text(), re.M).group(1).removesuffix(".0"); p=root/"ROADMAP.md"; s=p.read_text(); mutated=re.sub(rf"^\| \*{{0,2}}{re.escape(version)}\*{{0,2}} \|(?=.*✅ Done)", "| v0.590 |", s, count=1, flags=re.M); assert mutated != s; p.write_text(mutated)'
+python3 -c 'from pathlib import Path; import re; root=Path("'"$TMP_ROOT"'"); version=re.search(r"^version = \"([^\"]+)\"$", (root/"capabilities.toml").read_text(), re.M).group(1).removesuffix(".0"); p=root/"ROADMAP.md"; s=p.read_text(); mutated=re.sub(rf"^\| \*{{0,2}}{re.escape(version)}\*{{0,2}} \|(?=.*(?:✅ Done|⏳ Candidate))", "| v0.590 |", s, count=1, flags=re.M); assert mutated != s; p.write_text(mutated)'
 run_bad "roadmap drift"
 cp "$ROOT/ROADMAP.md" "$TMP_ROOT/ROADMAP.md"
 
@@ -114,6 +114,22 @@ cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("kafka_sink_buffer_bounded_with_fill_metric", "missing_sink_metric", 1))'
 run_bad "missing sink state growth proof" "proof target does not resolve"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Experimental\"", "id = \"sink.kafka\"\nkind = \"sink\"\nname = \"Kafka sink\"\ntier = \"Core\""); p.write_text(s)'
+run_bad "sink promoted without Core qualification" "sink.kafka must be Experimental"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("KafkaViewSink delivers typed view change rows with signed weights in one ordered transaction envelope per nonempty view epoch.", "Materialized-view change rows are delivered."); p.write_text(s)'
+run_bad "incremental claim drift" "sink.kafka incremental requires its exact row-delivery claim and consumer proof"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("KafkaViewSink delivers one complete materialized snapshot envelope before live change envelopes.", "Snapshot rows are delivered."); p.write_text(s)'
+run_bad "snapshot claim drift" "sink.kafka backfill requires its exact row-delivery claim and consumer proof"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); s=s.replace("proof = \"\"\nproof_levels_achieved = []", "proof = \"crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_emits_epoch_count_marker_only\"\nproof_levels_achieved = [\"L0\"]"); p.write_text(s)'
+run_bad "marker proof qualifies full Core delivery" "sink.kafka remains Experimental; full Core proof levels are not qualified"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
 if ! python3 "$ROOT/scripts/check-capability-contract.py" "$ROOT" >"$OUT" 2>&1; then

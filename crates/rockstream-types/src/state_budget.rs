@@ -100,7 +100,9 @@ use std::sync::atomic::AtomicBool;
 #[derive(Debug)]
 pub struct WorkloadBudget {
     workload_id: WorkloadId,
-    max_bytes: u64,
+    // The original owner stays shared with existing views across policy edits.
+    // A read lock fences admissions against concurrent limit reductions.
+    max_bytes: parking_lot::RwLock<u64>,
     current_bytes: AtomicU64,
     notice_emitted_80: AtomicBool,
     warning_emitted_95: AtomicBool,
@@ -111,7 +113,7 @@ impl WorkloadBudget {
     pub fn new(workload_id: WorkloadId, max_bytes: u64) -> Self {
         Self {
             workload_id,
-            max_bytes,
+            max_bytes: parking_lot::RwLock::new(max_bytes),
             current_bytes: AtomicU64::new(0),
             notice_emitted_80: AtomicBool::new(false),
             warning_emitted_95: AtomicBool::new(false),
@@ -125,7 +127,29 @@ impl WorkloadBudget {
 
     /// Retrieve the maximum bytes.
     pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
+        *self.max_bytes.read()
+    }
+
+    /// Change the enforced limit without replacing the shared allocation owner.
+    ///
+    /// The exclusive lock serializes this check with every prospective
+    /// acquisition; lowering below currently charged bytes fails atomically.
+    /// An unlimited workload uses u64::MAX (distinct from the hard limit 0).
+    pub fn reconfigure_max_bytes(&self, max_bytes: u64) -> Result<(), StateBudgetError> {
+        let mut limit = self.max_bytes.write();
+        let allocated = self.current_bytes.load(Ordering::Relaxed);
+        if allocated > max_bytes {
+            return Err(StateBudgetError {
+                operator_name: format!("workload-{}", self.workload_id.0),
+                max_bytes,
+                current_bytes: allocated,
+                requested_bytes: 0,
+            });
+        }
+        *limit = max_bytes;
+        self.notice_emitted_80.store(false, Ordering::Relaxed);
+        self.warning_emitted_95.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Retrieve current bytes.
@@ -135,13 +159,22 @@ impl WorkloadBudget {
 
     /// Charge/acquire bytes against the workload budget.
     pub fn try_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+        // Hold the read guard through the successful CAS. Otherwise a policy
+        // reduction could race a reservation checked against the old limit.
+        let limit = self.max_bytes.read();
+        let max_bytes = *limit;
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
-            let proposed = current.saturating_add(bytes);
-            if self.max_bytes > 0 && proposed > self.max_bytes {
+            let proposed = current
+                .checked_add(bytes)
+                .ok_or_else(|| quota_overflow_error("workload-memory", current, bytes))?;
+            // WorkloadDef::memory_limit=None means unbounded. Some(0) is a
+            // real hard limit, not an unlimited sentinel: only a zero-byte
+            // reservation may be admitted at zero capacity.
+            if proposed > max_bytes {
                 return Err(StateBudgetError {
                     operator_name: format!("workload-{}", self.workload_id.0),
-                    max_bytes: self.max_bytes,
+                    max_bytes,
                     current_bytes: current,
                     requested_bytes: bytes,
                 });
@@ -153,19 +186,19 @@ impl WorkloadBudget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    if self.max_bytes > 0 {
-                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                    if max_bytes > 0 {
+                        let pct = (proposed as f64 / max_bytes as f64) * 100.0;
                         if pct >= 95.0 && !self.warning_emitted_95.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
                                 "RS-5019: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
-                                self.workload_id, pct, proposed, self.max_bytes
+                                self.workload_id, pct, proposed, max_bytes
                             );
                         } else if pct >= 80.0
                             && !self.notice_emitted_80.swap(true, Ordering::Relaxed)
                         {
                             tracing::info!(
                                 "RS-5018: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
-                                self.workload_id, pct, proposed, self.max_bytes
+                                self.workload_id, pct, proposed, max_bytes
                             );
                         }
                     }
@@ -178,6 +211,7 @@ impl WorkloadBudget {
 
     /// Release bytes from the workload budget.
     pub fn release(&self, bytes: u64) {
+        let max_bytes = self.max_bytes();
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current.saturating_sub(bytes);
@@ -188,8 +222,8 @@ impl WorkloadBudget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    if self.max_bytes > 0 {
-                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                    if max_bytes > 0 {
+                        let pct = (proposed as f64 / max_bytes as f64) * 100.0;
                         if pct < 95.0 {
                             self.warning_emitted_95.store(false, Ordering::Relaxed);
                         }
@@ -206,6 +240,23 @@ impl WorkloadBudget {
 }
 
 // ─── StateBudget ─────────────────────────────────────────────────────────────
+
+/// Atomically account restored state even when it exceeds the active soft or
+/// hard policy. Recovery must never make usage counters wrap to zero.
+fn checked_force_add(counter: &AtomicU64, bytes: u64, label: &str) -> Result<(), StateBudgetError> {
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        let next = current
+            .checked_add(bytes)
+            .ok_or_else(|| quota_overflow_error(label, current, bytes))?;
+        if counter
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+}
 
 /// An operator-scoped state budget: tracks how many bytes of arrangement state
 /// are in use and rejects acquisitions that would exceed the declared limit.
@@ -306,7 +357,12 @@ impl StateBudget {
         // not both "succeed" and overshoot the budget together.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
-            let proposed = current.saturating_add(bytes);
+            let Some(proposed) = current.checked_add(bytes) else {
+                if let Some(ref wl) = self.workload_budget {
+                    wl.release(bytes);
+                }
+                return Err(quota_overflow_error("operator-memory", current, bytes));
+            };
             if proposed > self.max_bytes {
                 if let Some(ref wl) = self.workload_budget {
                     wl.release(bytes);
@@ -349,26 +405,31 @@ impl StateBudget {
         }
     }
 
-    /// Unconditionally acquire `bytes` without enforcing the budget limit.
+    /// Record existing state on restart, bypassing the configured limit but
+    /// **never** overflowing the accounted workload or operator total.
     ///
-    /// Use this for pre-existing state loaded on restart (where enforcement
-    /// has already been applied previously). Also used in tests to set up
-    /// a pre-filled budget.
-    pub fn force_acquire(&self, bytes: u64) {
-        if let Some(ref wl) = self.workload_budget {
-            wl.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+    /// A budget reduction may leave pre-existing state over its new ceiling:
+    /// keep its actual charge visible while refusing *new* admissions. Return
+    /// an error rather than wrapping an AtomicU64 back to a tiny number.
+    pub fn force_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+        if let Some(ref workload) = self.workload_budget {
+            checked_force_add(&workload.current_bytes, bytes, "workload-recovery")?;
         }
-        self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Err(error) = checked_force_add(&self.current_bytes, bytes, "operator-recovery") {
+            if let Some(ref workload) = self.workload_budget {
+                workload.release(bytes);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Release `bytes` of state (e.g., on tombstone GC or operator shutdown).
     ///
     /// Saturates at zero rather than wrapping.
     pub fn release(&self, bytes: u64) {
-        if let Some(ref wl) = self.workload_budget {
-            wl.release(bytes);
-        }
-        // Saturating subtract via compare-exchange loop.
+        // Saturating subtract via compare-exchange loop. Only the bytes removed
+        // from this operator may be released from the shared workload budget.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current.saturating_sub(bytes);
@@ -379,6 +440,9 @@ impl StateBudget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    if let Some(ref wl) = self.workload_budget {
+                        wl.release(current - proposed);
+                    }
                     if self.max_bytes > 0 {
                         let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
                         if pct < 95.0 {
@@ -395,17 +459,26 @@ impl StateBudget {
         }
     }
 
-    /// Reset the usage counter to zero. For use in tests only.
+    /// Reset only this operator's charge. Shared workload owners and other
+    /// operators must retain their outstanding reservations.
     #[doc(hidden)]
     pub fn reset(&self) {
+        let released = self.current_bytes.swap(0, Ordering::Relaxed);
         if let Some(ref wl) = self.workload_budget {
-            wl.current_bytes.store(0, Ordering::Relaxed);
-            wl.notice_emitted_80.store(false, Ordering::Relaxed);
-            wl.warning_emitted_95.store(false, Ordering::Relaxed);
+            wl.release(released);
         }
-        self.current_bytes.store(0, Ordering::Relaxed);
         self.notice_emitted_80.store(false, Ordering::Relaxed);
         self.warning_emitted_95.store(false, Ordering::Relaxed);
+    }
+}
+
+// On final operator destruction, release only bytes still owned by this
+// meter. A shared workload budget can outlive any one operator.
+impl Drop for StateBudget {
+    fn drop(&mut self) {
+        if let Some(ref wl) = self.workload_budget {
+            wl.release(*self.current_bytes.get_mut());
+        }
     }
 }
 
@@ -444,6 +517,9 @@ impl WorkloadQuotaLedgerEntry {
 #[derive(Debug)]
 pub struct DistributedQuotaLedger {
     entries: dashmap::DashMap<WorkloadId, Arc<WorkloadQuotaLedgerEntry>>,
+    // Serialize registry mutations so capacity checks and insertion are atomic.
+    // Steady-state reservations do not take this lock.
+    registration_lock: parking_lot::Mutex<()>,
     max_workloads: usize,
     total_reservations: AtomicU64,
     total_rejections: AtomicU64,
@@ -465,6 +541,7 @@ impl DistributedQuotaLedger {
     pub fn with_capacity(max_workloads: usize) -> Self {
         Self {
             entries: dashmap::DashMap::new(),
+            registration_lock: parking_lot::Mutex::new(()),
             max_workloads,
             total_reservations: AtomicU64::new(0),
             total_rejections: AtomicU64::new(0),
@@ -478,6 +555,7 @@ impl DistributedQuotaLedger {
         memory_limit_bytes: u64,
         max_parallelism: u32,
     ) -> Result<(), StateBudgetError> {
+        let _registration = self.registration_lock.lock();
         if !self.entries.contains_key(&workload_id) && self.entries.len() >= self.max_workloads {
             return Err(StateBudgetError {
                 operator_name: format!("ledger-capacity-{}", workload_id.0),
@@ -508,6 +586,7 @@ impl DistributedQuotaLedger {
 
     /// Unregister a workload from the ledger.
     pub fn unregister_workload(&self, workload_id: WorkloadId) {
+        let _registration = self.registration_lock.lock();
         self.entries.remove(&workload_id);
     }
 
@@ -525,7 +604,7 @@ impl DistributedQuotaLedger {
         parallelism: u32,
     ) -> Result<QuotaGuard, StateBudgetError> {
         let entry = self.entries.get(&workload_id).map(|r| r.value().clone());
-        if let Some(entry) = entry {
+        if let Some(ref entry) = entry {
             let memory_limit = entry.memory_limit_bytes.load(Ordering::Relaxed);
             if memory_limit > 0 {
                 loop {
@@ -660,44 +739,18 @@ impl DistributedQuotaLedger {
         }
         self.total_reservations.fetch_add(1, Ordering::Relaxed);
         Ok(QuotaGuard {
-            ledger: Some(self.clone()),
-            workload_id,
+            entry,
             bytes: requested_bytes,
             parallelism,
-            released: false,
         })
     }
 
-    /// Release batch resources from the ledger.
+    /// Release resources from the current registration for a workload.
+    /// Reservation guards instead retain and release their original entry so
+    /// unregistering and reusing an ID cannot release the replacement's quota.
     pub fn release_batch(&self, workload_id: WorkloadId, bytes: u64, parallelism: u32) {
         if let Some(entry) = self.entries.get(&workload_id) {
-            loop {
-                let current = entry.current_memory_bytes.load(Ordering::Relaxed);
-                let proposed = current.saturating_sub(bytes);
-                if entry
-                    .current_memory_bytes
-                    .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-            loop {
-                let current_p = entry.current_parallelism.load(Ordering::Relaxed);
-                let proposed_p = current_p.saturating_sub(parallelism as u64);
-                if entry
-                    .current_parallelism
-                    .compare_exchange_weak(
-                        current_p,
-                        proposed_p,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
+            release_quota_entry(&entry, bytes, parallelism);
         }
     }
 
@@ -723,24 +776,45 @@ impl DistributedQuotaLedger {
     }
 }
 
-/// RAII Guard for prospective quota batch reservation. Automatically releases resources when dropped.
+fn release_quota_entry(entry: &WorkloadQuotaLedgerEntry, bytes: u64, parallelism: u32) {
+    loop {
+        let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+        let proposed = current.saturating_sub(bytes);
+        if entry
+            .current_memory_bytes
+            .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    loop {
+        let current_p = entry.current_parallelism.load(Ordering::Relaxed);
+        let proposed_p = current_p.saturating_sub(parallelism as u64);
+        if entry
+            .current_parallelism
+            .compare_exchange_weak(current_p, proposed_p, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+/// RAII guard bound to the entry that admitted the reservation, not its reusable ID.
+/// Unregistering a workload never transfers its reservations to a new generation.
 #[derive(Debug)]
 pub struct QuotaGuard {
-    ledger: Option<Arc<DistributedQuotaLedger>>,
-    workload_id: WorkloadId,
+    entry: Option<Arc<WorkloadQuotaLedgerEntry>>,
     bytes: u64,
     parallelism: u32,
-    released: bool,
 }
 
 impl QuotaGuard {
-    /// Explicitly release quota reservation without dropping.
+    /// Release this reservation exactly once, even after its owner is unregistered.
     pub fn release(&mut self) {
-        if !self.released {
-            if let Some(ref ledger) = self.ledger {
-                ledger.release_batch(self.workload_id, self.bytes, self.parallelism);
-            }
-            self.released = true;
+        if let Some(entry) = self.entry.take() {
+            release_quota_entry(&entry, self.bytes, self.parallelism);
         }
     }
 }
@@ -860,10 +934,12 @@ pub struct WorkerBudgetLedger {
     total_budget_bytes: u64,
     foreground_reservation_bytes: u64,
     allocator_overhead_pct: u64,
+    // Admission linearizes on this counter, not on independently sampled categories.
+    allocated_bytes: AtomicU64,
     categories: [AtomicU64; 8],
     waiter_count: AtomicU64,
     max_waiters: u64,
-    shared_cache_charged: AtomicBool,
+    shared_cache_charged: parking_lot::Mutex<bool>,
 }
 
 impl WorkerBudgetLedger {
@@ -889,10 +965,11 @@ impl WorkerBudgetLedger {
             total_budget_bytes: total_budget_bytes as u64,
             foreground_reservation_bytes: foreground_reservation_bytes as u64,
             allocator_overhead_pct: Self::DEFAULT_ALLOCATOR_OVERHEAD_PCT,
+            allocated_bytes: AtomicU64::new(0),
             categories: Default::default(),
             waiter_count: AtomicU64::new(0),
             max_waiters: max_waiters as u64,
-            shared_cache_charged: AtomicBool::new(false),
+            shared_cache_charged: parking_lot::Mutex::new(false),
         }
     }
 
@@ -937,49 +1014,59 @@ impl WorkerBudgetLedger {
         }
     }
 
+    /// Release a waiter slot without wrapping an empty queue to u64::MAX.
+    ///
+    /// A duplicate release cannot permanently make the queue appear full.
     pub fn decrement_waiters(&self) {
-        self.waiter_count.fetch_sub(1, Ordering::SeqCst);
+        let _ = self
+            .waiter_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            });
     }
 
     pub fn category_bytes(&self, category: MemoryCategory) -> u64 {
         self.categories[category.index()].load(Ordering::Relaxed)
     }
 
+    /// Reserved bytes, including admissions whose category publication is in flight.
+    /// Category samples reconcile exactly after acquisitions/releases complete;
+    /// admission never relies on an incoherent cross-category snapshot.
     pub fn total_allocated_bytes(&self) -> u64 {
-        self.categories
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .sum()
+        self.allocated_bytes.load(Ordering::Acquire)
+    }
+
+    fn gross_bytes(&self, allocated: u64) -> u128 {
+        let allocated = u128::from(allocated);
+        allocated + allocated * u128::from(self.allocator_overhead_pct) / 100
     }
 
     pub fn available_background_bytes(&self) -> u64 {
         let max_bg = self
             .total_budget_bytes
             .saturating_sub(self.foreground_reservation_bytes);
-        let allocated = self.total_allocated_bytes();
-        let overhead = (allocated * self.allocator_overhead_pct) / 100;
-        let gross = allocated.saturating_add(overhead);
-        max_bg.saturating_sub(gross)
+        u128::from(max_bg).saturating_sub(self.gross_bytes(self.total_allocated_bytes())) as u64
     }
 
     pub fn available_foreground_bytes(&self) -> u64 {
-        let allocated = self.total_allocated_bytes();
-        let overhead = (allocated * self.allocator_overhead_pct) / 100;
-        let gross = allocated.saturating_add(overhead);
-        self.total_budget_bytes.saturating_sub(gross)
+        u128::from(self.total_budget_bytes)
+            .saturating_sub(self.gross_bytes(self.total_allocated_bytes())) as u64
     }
 
     pub fn charge_shared_cache_once(
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<bool, StateBudgetError> {
-        if !self.shared_cache_charged.swap(true, Ordering::SeqCst) {
-            let permit = self.try_acquire(MemoryCategory::BlockAndMetadataCaches, bytes, false)?;
-            permit.defuse();
-            Ok(true)
-        } else {
-            Ok(false)
+        // Serialize initialization, not all allocations. Failed reservations leave
+        // the cache uncharged and retryable; no caller observes a speculative flag.
+        let mut charged = self.shared_cache_charged.lock();
+        if *charged {
+            return Ok(false);
         }
+        let permit = self.try_acquire(MemoryCategory::BlockAndMetadataCaches, bytes, false)?;
+        permit.defuse();
+        *charged = true;
+        Ok(true)
     }
 
     pub fn try_acquire(
@@ -999,7 +1086,8 @@ impl WorkerBudgetLedger {
                 .saturating_sub(self.foreground_reservation_bytes)
         };
 
-        if max_budget > 0 && bytes > max_budget {
+        // Zero capacity is a hard bound, including a fully reserved background budget.
+        if bytes > max_budget {
             return Err(StateBudgetError {
                 operator_name: format!("oversized-{}", category.name()),
                 max_bytes: max_budget,
@@ -1010,11 +1098,10 @@ impl WorkerBudgetLedger {
 
         loop {
             let current_allocated = self.total_allocated_bytes();
-            let proposed_allocated = current_allocated.saturating_add(bytes);
-            let overhead = (proposed_allocated * self.allocator_overhead_pct) / 100;
-            let gross = proposed_allocated.saturating_add(overhead);
-
-            if max_budget > 0 && gross > max_budget {
+            let proposed_allocated = current_allocated
+                .checked_add(bytes)
+                .ok_or_else(|| quota_overflow_error("worker-memory", current_allocated, bytes))?;
+            if self.gross_bytes(proposed_allocated) > u128::from(max_budget) {
                 return Err(StateBudgetError {
                     operator_name: format!("worker-budget-{}", category.name()),
                     max_bytes: max_budget,
@@ -1023,25 +1110,46 @@ impl WorkerBudgetLedger {
                 });
             }
 
-            let cat_idx = category.index();
-            let cur_cat = self.categories[cat_idx].load(Ordering::Relaxed);
-            if self.categories[cat_idx]
+            if self
+                .allocated_bytes
                 .compare_exchange_weak(
-                    cur_cat,
-                    cur_cat + bytes,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
+                    current_allocated,
+                    proposed_allocated,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 )
                 .is_ok()
             {
+                // The global reservation covers this increment, so a category
+                // cannot overflow even when different categories admit concurrently.
+                self.categories[category.index()].fetch_add(bytes, Ordering::Release);
                 return Ok(MemoryPermit::new(self.clone(), category, bytes));
             }
         }
     }
 
+    /// Release only bytes present in the category; never wrap an empty ledger.
     pub fn release(&self, category: MemoryCategory, bytes: u64) {
-        if bytes > 0 {
-            self.categories[category.index()].fetch_sub(bytes, Ordering::SeqCst);
+        let counter = &self.categories[category.index()];
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            let released = current.min(bytes);
+            if released == 0 {
+                return;
+            }
+            if counter
+                .compare_exchange_weak(
+                    current,
+                    current - released,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // Publish category release first, keeping admission conservative.
+                self.allocated_bytes.fetch_sub(released, Ordering::Release);
+                return;
+            }
         }
     }
 }
@@ -1065,7 +1173,7 @@ mod tests {
     #[test]
     fn acquire_over_budget_fails() {
         let b = StateBudget::new("op", 1024);
-        b.force_acquire(900);
+        b.force_acquire(900).unwrap();
         let err = b.try_acquire(200).unwrap_err();
         assert_eq!(err.max_bytes, 1024);
         assert_eq!(err.current_bytes, 900);
@@ -1078,7 +1186,7 @@ mod tests {
     #[test]
     fn release_reduces_counter() {
         let b = StateBudget::new("op", 1024);
-        b.force_acquire(800);
+        b.force_acquire(800).unwrap();
         b.release(300);
         assert_eq!(b.current_bytes(), 500);
     }
@@ -1093,7 +1201,7 @@ mod tests {
     #[test]
     fn utilization_fraction() {
         let b = StateBudget::new("op", 1000);
-        b.force_acquire(250);
+        b.force_acquire(250).unwrap();
         let u = b.utilization();
         assert!((u - 0.25).abs() < 1e-9, "utilization={u}");
     }
@@ -1137,7 +1245,7 @@ mod tests {
     #[test]
     fn operator_name_in_error() {
         let b = StateBudget::new("aggregate_sum", 100);
-        b.force_acquire(90);
+        b.force_acquire(90).unwrap();
         let err = b.try_acquire(20).unwrap_err();
         assert_eq!(err.operator_name, "aggregate_sum");
     }

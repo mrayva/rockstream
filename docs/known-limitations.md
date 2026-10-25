@@ -18,7 +18,11 @@ Temporal sliding-window queries with dynamic wall-clock predicates (e.g. `WHERE 
 
 ## 3. Quarantined Third-Party Sinks
 
-Only the core connectors (Kafka source, PostgreSQL CDC source, and Kafka sink) are supported in v1.0. Legacy or unmaintained third-party connectors are rejected at admission with `RS-4017`.
+Kafka source and PostgreSQL CDC source are Core. The Kafka sink is Experimental:
+its runtime view adapter emits snapshot/change envelopes up to 900 KiB and
+reads retained view logs up to 64 MiB. SQL sink wiring, chunked snapshots, and
+automatic log compaction are unsupported. Legacy or unmaintained
+third-party connectors are rejected at admission with `RS-4017`.
 
 ---
 

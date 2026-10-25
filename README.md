@@ -126,9 +126,9 @@ RockStream labels every public capability by its compatibility commitment. The
 
 | Tier | Meaning | Current examples |
 | --- | --- | --- |
-| Core | Release-gated with named proof tests | Reads, scalar expressions, DML, transaction semantics, views and view DAGs, `SUBSCRIBE`, freshness controls, Kafka source, PostgreSQL CDC source, Kafka sink |
+| Core | Release-gated with named proof tests | Reads, scalar expressions, DML, transaction semantics, views and view DAGs, `SUBSCRIBE`, freshness controls, Kafka source, PostgreSQL CDC source |
 | Maintain | Supported and regression-tested, but not a growth area | Secondary indexes, workload quotas, resource visibility, query diagnostics, system catalog SQL |
-| Experimental | Available subsets with no continuity guarantee | Aggregates, joins and set operations, window and time operators |
+| Experimental | Available subsets with no continuity guarantee | Aggregates, joins and set operations, window and time operators, bounded Kafka view delivery |
 
 ### Important boundaries
 
@@ -140,14 +140,16 @@ RockStream labels every public capability by its compatibility commitment. The
   particular, floating-point keys and some text-key combinations are rejected.
 - User-defined merge laws and user-visible CRDT column types are post-v1 work.
 - The v1 connector set is Kafka source, PostgreSQL CDC source, and Kafka sink.
+  The Kafka sink is Experimental; its runtime adapter delivers bounded
+  materialized-view snapshots and signed changes with payload recovery.
   Iceberg, Delta, object-store sink, S3 source, and webhook source frontends are
   removed and fail closed.
 
 Read [language features](docs/language-features.md), the
 [SQL support reference](docs/reference/sql-support.md), and
 [known limitations](docs/known-limitations.md) before evaluating a production
-workload. Data-lake exports should use the Kafka sink with a downstream writer;
-see [connector migration](docs/connector-migration.md).
+workload. Kafka row delivery has explicit runtime and size limits; automatic
+data-lake export is unsupported. See [connector migration](docs/connector-migration.md).
 
 ## Inspiration
 
@@ -177,8 +179,10 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Project status
 
-The current workspace version is **v0.61.0**. Engineering work toward the v1
-release qualification is active; RockStream does not yet claim a `v1.0.0`
+The current workspace source version is **v0.72.0**. A source-version bump
+is not itself a published release: a release requires passing checks on the
+exact candidate and an immutable, signed `v0.72.0` tag. Engineering work toward
+a qualified v1 release continues; RockStream does not yet claim a `v1.0.0`
 release. The checked-in [capability matrix](docs/capability-matrix.md),
 [evidence manifest](docs/evidence-manifest.json), and [version sign-offs](sign-offs/)
 record what has shipped and how each milestone was verified.
@@ -264,6 +268,23 @@ cargo test --workspace
 `make check` runs the complete local CI suite, including contract and formal
 verification checks. See [test commands](docs/test-commands.md) for focused and
 release-qualification commands.
+
+### OpenWiki
+
+Use [OpenWiki](https://github.com/langchain-ai/openwiki#model-providers) with the
+`openai-chatgpt` provider to use your ChatGPT subscription's Codex allowance.
+OpenWiki 0.7.0 is the configured baseline; install it with
+`rtk proxy npm install -g openwiki@0.7.0`. From the repository root:
+
+```bash
+OPENWIKI_PROVIDER=openai-chatgpt rtk proxy openwiki code --init
+```
+
+Sign in with your ChatGPT account in the browser wizard and select a model.
+For later runs, use `--update` to preserve and refresh the existing wiki.
+The [wiki brief](openwiki/INSTRUCTIONS.md) sets RockStream's documentation scope;
+`.openwikiignore` excludes credentials, caches, build output, and raw artifacts.
+The Codex integration can also use these files through its existing session.
 
 ## Contributing
 

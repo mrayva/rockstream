@@ -1,0 +1,240 @@
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use super::codec;
+use super::Message;
+use crate::error::{PgWireError, PgWireResult};
+
+pub const MESSAGE_TYPE_BYTE_COPY_DATA: u8 = b'd';
+
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Debug, Default, new)]
+pub struct CopyData {
+    pub data: Bytes,
+}
+
+impl Message for CopyData {
+    #[inline]
+    fn message_type() -> Option<u8> {
+        Some(MESSAGE_TYPE_BYTE_COPY_DATA)
+    }
+
+    fn message_length(&self) -> usize {
+        4 + self.data.len()
+    }
+
+    fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {
+        buf.put(self.data.as_ref());
+        Ok(())
+    }
+
+    fn decode_body(buf: &mut BytesMut, len: usize) -> PgWireResult<Self> {
+        // A direct decoder caller must not be able to underflow or over-read
+        // the body even if the surrounding frame decoder was bypassed.
+        let body_len = len.checked_sub(4).ok_or(PgWireError::InvalidMessageBody)?;
+        if buf.len() < body_len {
+            return Err(PgWireError::InvalidMessageBody);
+        }
+        let data = buf.split_to(body_len).freeze();
+        Ok(Self::new(data))
+    }
+}
+
+pub const MESSAGE_TYPE_BYTE_COPY_DONE: u8 = b'c';
+
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Debug, Default, new)]
+pub struct CopyDone;
+
+impl Message for CopyDone {
+    #[inline]
+    fn message_type() -> Option<u8> {
+        Some(MESSAGE_TYPE_BYTE_COPY_DONE)
+    }
+
+    fn message_length(&self) -> usize {
+        4
+    }
+
+    fn encode_body(&self, _buf: &mut BytesMut) -> PgWireResult<()> {
+        Ok(())
+    }
+
+    fn decode_body(_buf: &mut BytesMut, _len: usize) -> PgWireResult<Self> {
+        Ok(Self::new())
+    }
+}
+
+pub const MESSAGE_TYPE_BYTE_COPY_FAIL: u8 = b'f';
+
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Debug, Default, new)]
+pub struct CopyFail {
+    pub message: String,
+}
+
+impl Message for CopyFail {
+    #[inline]
+    fn message_type() -> Option<u8> {
+        Some(MESSAGE_TYPE_BYTE_COPY_DONE)
+    }
+
+    fn message_length(&self) -> usize {
+        4 + self.message.len() + 1
+    }
+
+    fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {
+        codec::put_cstring(buf, &self.message);
+        Ok(())
+    }
+
+    fn decode_body(buf: &mut BytesMut, _len: usize) -> PgWireResult<Self> {
+        let msg = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
+        Ok(Self::new(msg))
+    }
+}
+
+pub const MESSAGE_TYPE_BYTE_COPY_IN_RESPONSE: u8 = b'G';
+
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Debug, Default, new)]
+pub struct CopyInResponse {
+    pub format: i8,
+    pub columns: i16,
+    pub column_formats: Vec<i16>,
+}
+
+impl Message for CopyInResponse {
+    #[inline]
+    fn message_type() -> Option<u8> {
+        Some(MESSAGE_TYPE_BYTE_COPY_IN_RESPONSE)
+    }
+
+    fn message_length(&self) -> usize {
+        4 + 1 + 2 + self.column_formats.len() * 2
+    }
+
+    fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {
+        buf.put_i8(self.format);
+        buf.put_i16(self.columns);
+        for cf in &self.column_formats {
+            buf.put_i16(*cf);
+        }
+        Ok(())
+    }
+
+    fn decode_body(buf: &mut BytesMut, _len: usize) -> PgWireResult<Self> {
+        let format = buf.get_i8();
+        let columns = buf.get_i16();
+        let mut column_formats = Vec::with_capacity(columns as usize);
+        for _ in 0..columns {
+            column_formats.push(buf.get_i16());
+        }
+
+        Ok(Self::new(format, columns, column_formats))
+    }
+}
+
+pub const MESSAGE_TYPE_BYTE_COPY_OUT_RESPONSE: u8 = b'H';
+
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Debug, Default, new)]
+pub struct CopyOutResponse {
+    pub format: i8,
+    pub columns: i16,
+    pub column_formats: Vec<i16>,
+}
+
+impl Message for CopyOutResponse {
+    #[inline]
+    fn message_type() -> Option<u8> {
+        Some(MESSAGE_TYPE_BYTE_COPY_OUT_RESPONSE)
+    }
+
+    fn message_length(&self) -> usize {
+        4 + 1 + 2 + self.column_formats.len() * 2
+    }
+
+    fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {
+        buf.put_i8(self.format);
+        buf.put_i16(self.columns);
+        for cf in &self.column_formats {
+            buf.put_i16(*cf);
+        }
+        Ok(())
+    }
+
+    fn decode_body(buf: &mut BytesMut, _len: usize) -> PgWireResult<Self> {
+        let format = buf.get_i8();
+        let columns = buf.get_i16();
+        let mut column_formats = Vec::with_capacity(columns as usize);
+        for _ in 0..columns {
+            column_formats.push(buf.get_i16());
+        }
+
+        Ok(Self::new(format, columns, column_formats))
+    }
+}
+
+pub const MESSAGE_TYPE_BYTE_COPY_BOTH_RESPONSE: u8 = b'W';
+
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Debug, Default, new)]
+pub struct CopyBothResponse {
+    pub format: i8,
+    pub columns: i16,
+    pub column_formats: Vec<i16>,
+}
+
+impl Message for CopyBothResponse {
+    #[inline]
+    fn message_type() -> Option<u8> {
+        Some(MESSAGE_TYPE_BYTE_COPY_BOTH_RESPONSE)
+    }
+
+    fn message_length(&self) -> usize {
+        4 + 1 + 2 + self.column_formats.len() * 2
+    }
+
+    fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {
+        buf.put_i8(self.format);
+        buf.put_i16(self.columns);
+        for cf in &self.column_formats {
+            buf.put_i16(*cf);
+        }
+        Ok(())
+    }
+
+    fn decode_body(buf: &mut BytesMut, _len: usize) -> PgWireResult<Self> {
+        let format = buf.get_i8();
+        let columns = buf.get_i16();
+        let mut column_formats = Vec::with_capacity(columns as usize);
+        for _ in 0..columns {
+            column_formats.push(buf.get_i16());
+        }
+
+        Ok(Self::new(format, columns, column_formats))
+    }
+}
+
+#[cfg(test)]
+mod copy_data_regressions {
+    use super::*;
+
+    #[test]
+    fn copy_data_rejects_bad_lengths_before_splitting() {
+        for (len, contents) in [(0usize, &b"abc"[..]), (3, &b"abc"[..]), (5, &b""[..])] {
+            let mut body = BytesMut::from(contents);
+            let before = body.clone();
+            assert!(matches!(
+                CopyData::decode_body(&mut body, len),
+                Err(PgWireError::InvalidMessageBody)
+            ));
+            assert_eq!(body, before, "invalid length consumed body");
+        }
+
+        let mut body = BytesMut::from(&b"abcxyz"[..]);
+        let message = CopyData::decode_body(&mut body, 7).unwrap();
+        assert_eq!(message.data.as_ref(), b"abc");
+        assert_eq!(body.as_ref(), b"xyz");
+    }
+}

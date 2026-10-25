@@ -1,49 +1,70 @@
 #![no_main]
+use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
-use rockstream_gateway::{
-    catalog_stubs::CatalogStubs, view_reader::ViewReadStrategy, GatewayError, GatewayServer,
-    ViewReader,
+use pgwire::messages::{
+    extendedquery::{Bind, Execute, Parse},
+    simplequery::Query,
+    startup::Startup,
+    Message, PgWireFrontendMessage,
 };
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-
-struct FuzzViewReader;
-
-#[async_trait::async_trait]
-impl ViewReader for FuzzViewReader {
-    async fn read_view(
-        &self,
-        _view_name: &str,
-        _limit: Option<usize>,
-        _strategy: ViewReadStrategy,
-    ) -> Result<Vec<Vec<u8>>, GatewayError> {
-        Ok(vec![])
-    }
-
-    fn published_frontier(&self) -> Option<u64> {
-        None
-    }
-}
 
 fuzz_target!(|data: &[u8]| {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build();
+    let _ = Startup::decode(&mut BytesMut::from(data));
+    let _ = PgWireFrontendMessage::decode(&mut BytesMut::from(data));
 
-    if let Ok(rt) = rt {
-        rt.block_on(async {
-            let catalog = Arc::new(CatalogStubs::new());
-            let view_reader = Arc::new(FuzzViewReader);
-            let server =
-                GatewayServer::with_catalog("127.0.0.1:0".parse().unwrap(), catalog, view_reader);
-
-            if let Ok((addr, _handle)) = server.serve_background().await {
-                if let Ok(mut socket) = TcpStream::connect(addr).await {
-                    let _ = socket.write_all(data).await;
-                    let _ = socket.shutdown().await;
-                }
-            }
-        });
+    let Some(kind) = data.first() else { return };
+    let text: String = data
+        .iter()
+        .skip(1)
+        .take(32)
+        .map(|byte| char::from(byte % 95 + 32))
+        .collect();
+    let mut frame = BytesMut::new();
+    let expected = if kind % 5 == 0 {
+        let mut message = Startup::new();
+        message.parameters.insert("user".into(), text);
+        message.encode(&mut frame).unwrap();
+        format!("{message:?}")
+    } else {
+        let message = match kind % 5 {
+            1 => PgWireFrontendMessage::Query(Query::new(text)),
+            2 => PgWireFrontendMessage::Parse(Parse::new(Some("stmt".into()), text, vec![23])),
+            3 => PgWireFrontendMessage::Bind(Bind::new(
+                Some("portal".into()),
+                Some("stmt".into()),
+                vec![0],
+                vec![
+                    Some(Bytes::copy_from_slice(&data[1..data.len().min(17)])),
+                    None,
+                ],
+                vec![0],
+            )),
+            _ => PgWireFrontendMessage::Execute(Execute::new(
+                Some("portal".into()),
+                i32::from(*data.get(1).unwrap_or(&0)),
+            )),
+        };
+        message.encode(&mut frame).unwrap();
+        format!("{message:?}")
+    };
+    let split = usize::from(*data.get(2).unwrap_or(&0)) % frame.len();
+    let mut input = BytesMut::from(&frame[..split]);
+    let before = input.clone();
+    if kind % 5 == 0 {
+        assert!(Startup::decode(&mut input).unwrap().is_none());
+    } else {
+        assert!(PgWireFrontendMessage::decode(&mut input).unwrap().is_none());
     }
+    assert_eq!(input, before);
+    input.extend_from_slice(&frame[split..]);
+    let actual = if kind % 5 == 0 {
+        format!("{:?}", Startup::decode(&mut input).unwrap().unwrap())
+    } else {
+        format!(
+            "{:?}",
+            PgWireFrontendMessage::decode(&mut input).unwrap().unwrap()
+        )
+    };
+    assert_eq!(actual, expected);
+    assert!(input.is_empty());
 });

@@ -4,11 +4,22 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "**/AGENTS.md"
+      - "**/openwiki/**"
+      - "**/.openwikiignore"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/AGENTS.md"
+      - "**/openwiki/**"
+      - "**/.openwikiignore"
+  workflow_dispatch:
+  schedule:
+    - cron: "45 3 * * *"
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,8 +28,27 @@ env:
   ROCKSTREAM_REQUIRE_DOCKER: "1"
 
 jobs:
+  ci-policy:
+    name: Select qualification lane
+    runs-on: ubuntu-latest
+    outputs:
+      expensive: ${{ steps.select.outputs.expensive }}
+      scope: ${{ steps.select.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: select
+        run: python3 scripts/ci-selection.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-selection
+          path: target/ci-selection.json
+          if-no-files-found: error
+
   control-plane-ha:
     name: Control-plane HA smoke
+    needs: docker-build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,14 +58,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Require Docker
         run: docker info
-      - name: Build unified-binary test image
-        run: docker build -t rockstream-tc-test:latest .
-      - name: Control-plane HA tests
+      - uses: ./.github/actions/load-candidate-image
+        with:
+          image-id: ${{ needs.docker-build.outputs.image-id }}
+      - name: Record HA test case execution
         env:
           RS_TC_DEBUG: "1"
-        run: cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1 --nocapture
+        run: python3 scripts/ci-test-inventory.py run --job pr-ha
+      - name: Upload HA test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-ha
+          path: target/ci-test-results/
+          if-no-files-found: error
 
   check-quality:
+    needs: ci-policy
     name: Check quality
     runs-on: ubuntu-latest
     permissions:
@@ -45,24 +84,33 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
+        if: needs.ci-policy.outputs.scope == 'full'
         with:
           toolchain: "1.88"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.ci-policy.outputs.scope == 'full'
       - name: Free runner disk space
+        if: needs.ci-policy.outputs.scope == 'full'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: cargo fmt
+        if: needs.ci-policy.outputs.scope == 'full'
         run: cargo fmt --all --check
       - name: cargo clippy
+        if: needs.ci-policy.outputs.scope == 'full'
         run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
       - name: install cargo-deny
+        if: needs.ci-policy.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-deny
       - name: cargo deny
+        if: needs.ci-policy.outputs.scope == 'full'
         run: cargo deny --all-features check
       - name: install cargo-audit
+        if: needs.ci-policy.outputs.scope == 'full'
         uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
+        if: needs.ci-policy.outputs.scope == 'full'
         run: cargo audit $(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sed 's/^/--ignore /')
       - name: threat-model link check
         run: bash scripts/check-threat-model-links.sh
@@ -114,13 +162,97 @@ jobs:
         run: bash scripts/check-operator-state-bytes.sh
       - name: operator-state-bytes checker self-test
         run: bash scripts/check-operator-state-bytes.test.sh
+      - name: CI test-accounting self-tests
+        run: python3 scripts/ci-test-inventory.test.py
+      - name: Benchmark scheduling self-tests
+        run: python3 -B scripts/run-benchmark-gate.test.py
+      - name: CI lane and image self-tests
+        run: python3 scripts/ci-policy.test.py
+      - name: CI prose-only scope and required-check self-tests
+        run: python3 -B scripts/ci-scope.test.py
+      - name: Validate Cargo test target assignment
+        if: needs.ci-policy.outputs.scope == 'full'
+        run: python3 scripts/ci-test-inventory.py check --out target/ci-test-results/assignment.json
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
       - name: path-coupling checker self-test
         run: bash scripts/check-path-coupling.test.sh
+      - name: qualification execution gate self-tests
+        run: bash scripts/check-qualification-mutations.test.sh
+
+  verus-qualify:
+    name: VS6 clean phase (${{ matrix.os }}, ${{ matrix.phase }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        phase: [debug, release]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
+      VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}
+      VERUS_QUALIFICATION_PHASE: ${{ matrix.phase }}
+    steps:
+      - name: Validate qualification selection
+        env:
+          EXPENSIVE: ${{ needs.ci-policy.outputs.expensive }}
+        run: test "$EXPENSIVE" = true || test "$EXPENSIVE" = false
+      - uses: actions/checkout@v4
+        if: needs.ci-policy.outputs.expensive == 'true'
+      - uses: dtolnay/rust-toolchain@master
+        if: needs.ci-policy.outputs.expensive == 'true'
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@master
+        if: needs.ci-policy.outputs.expensive == 'true'
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: needs.ci-policy.outputs.expensive == 'true'
+      - name: Cache pinned Verus
+        if: needs.ci-policy.outputs.expensive == 'true'
+        uses: actions/cache@v4
+        with:
+          path: .cache/verus
+          key: verus-${{ runner.os }}-${{ runner.arch }}-0.2026.09.13.671956e
+      - name: Install pinned Verus
+        if: needs.ci-policy.outputs.expensive == 'true'
+        run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
+      - name: Verify Rust kernels
+        if: matrix.phase == 'debug'
+        run: make verify-rust
+      - name: Verify proof contracts
+        if: matrix.phase == 'debug'
+        run: make verify-proof-contracts
+      - name: Run clean VS6 qualification matrix
+        if: needs.ci-policy.outputs.expensive == 'true'
+        run: make qualify-verus
+      - name: Upload VS6 qualification evidence
+        if: always() && needs.ci-policy.outputs.expensive == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verus-phase-${{ matrix.target }}-${{ matrix.phase }}
+          overwrite: true
+          path: evidence/verus/${{ matrix.target }}/${{ matrix.phase }}
+          if-no-files-found: error
+          retention-days: 14
 
   verus-verify:
     name: Verus verify and qualify (VS6)
+    timeout-minutes: 90
+    needs: [ci-policy, verus-qualify]
+    if: always()
     strategy:
       fail-fast: false
       matrix:
@@ -130,48 +262,81 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
     env:
-      VERUS_QUALIFICATION_TARGET: ${{ matrix.target }}
+      VERUS_QUALIFICATION_OUTPUT: evidence/verus/${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate all qualification phases or the explicit prose exclusion
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-scope.py check-verus
+      - uses: dtolnay/rust-toolchain@master
+        if: needs.ci-policy.outputs.scope == 'full'
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+        if: needs.ci-policy.outputs.scope == 'full'
+      - uses: actions/download-artifact@v4
+        if: needs.ci-policy.outputs.scope == 'full'
+        with:
+          name: verus-phase-${{ matrix.target }}-debug
+          path: target/verus-phases/debug
+      - uses: actions/download-artifact@v4
+        if: needs.ci-policy.outputs.scope == 'full'
+        with:
+          name: verus-phase-${{ matrix.target }}-release
+          path: target/verus-phases/release
+      - name: Assemble complete source-bound qualification
+        if: needs.ci-policy.outputs.scope == 'full'
+        env:
+          QUALIFY_TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/record-verus-qualification.py --root . --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --status passed --merge target/verus-phases --target "$QUALIFY_TARGET" \
+            --output "$VERUS_QUALIFICATION_OUTPUT/qualification.json"
+      - name: Exercise production wrapper
+        if: needs.ci-policy.outputs.scope == 'full'
+        run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
+      - name: Smoke-test the clean workspace Cargo consumers
+        if: needs.ci-policy.outputs.scope == 'full'
+        run: |
+          "$VERUS_QUALIFICATION_OUTPUT/rockstream-debug" --help
+          "$VERUS_QUALIFICATION_OUTPUT/rockstream-release" --help
+      - name: Upload complete VS6 qualification evidence
+        if: always() && needs.ci-policy.outputs.scope == 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verus-qualification-${{ matrix.target }}
+          overwrite: true
+          path: evidence/verus/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+
+  verus-consumer:
+    name: Ordinary CLI consumer (${{ matrix.os }})
+    timeout-minutes: 90
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
-          components: rustfmt, clippy
-          targets: ${{ matrix.target }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.98.1"
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Cache pinned Verus
-        uses: actions/cache@v4
         with:
-          path: .cache/verus
-          key: verus-${{ runner.os }}-${{ runner.arch }}-0.2026.09.13.671956e
-      - name: Install pinned Verus
-        run: echo "$(bash scripts/install-verus.sh)" >> "$GITHUB_PATH"
-      - name: Verify Rust kernels
-        run: make verify-rust
-      - name: Verify proof contracts
-        run: make verify-proof-contracts
-      - name: Run clean VS6 qualification matrix
-        run: make qualify-verus
-      - name: Upload VS6 qualification evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: verus-qualification-${{ matrix.target }}
-          path: evidence/verus/
-          if-no-files-found: warn
-          retention-days: 14
-      - name: Exercise production wrapper
-        run: cargo test --locked -p rockstream-plan --test virtual_bucket_routing_tests
+          shared-key: verus-ordinary-consumer
+      # CLI-only feature resolution differs from the clean workspace qualification.
       - name: Build ordinary Cargo consumer
         run: cargo build --locked --release -p rockstream-cli
 
   check-tests:
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     name: Check tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     strategy:
@@ -180,9 +345,12 @@ jobs:
         shard:
           - workspace
           - crates
-          - gateway
           - sim-unit
           - sim-integration
+          - oracle
+          - ops
+          - storage-sql
+          - gateway-components
     permissions:
       actions: write
       contents: read
@@ -201,69 +369,131 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Require Docker
-        if: matrix.shard == 'gateway' || matrix.shard == 'crates'
+        if: contains(fromJSON('["crates", "oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
         run: docker info
-      - uses: docker/setup-buildx-action@v3
-        if: matrix.shard == 'gateway'
-      - name: Build unified-binary test image
-        if: matrix.shard == 'gateway'
-        run: |
-          docker buildx build \
-            --tag rockstream-tc-test:latest \
-            --load \
-            --cache-from type=gha,scope=rockstream-tc-test-check \
-            --cache-to type=gha,mode=max,scope=rockstream-tc-test-check \
-            .
-      - name: Workspace tests
+      - name: Record workspace test case execution
         if: matrix.shard == 'workspace'
-        run: |
-          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
-      - name: Crate tests
+        run: python3 scripts/ci-test-inventory.py run --job pr-workspace
+      - name: Record crate test case execution
         if: matrix.shard == 'crates'
-        run: |
-          cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
-          cargo test -p rockstream-control --lib --tests -- --test-threads=1
-          cargo test -p rockstream-ops --lib --tests -- --test-threads=1
-          cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
-          cargo test -p rockstream-storage --lib --tests -- --test-threads=1
-          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
-      - name: Gateway tests
-        if: matrix.shard == 'gateway'
-        run: |
-          mkdir -p target
-          rm -f target/pgwire-test-results.json
-          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER=1 RUSTC_BOOTSTRAP=1 cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json > target/pgwire-test-results.json
-          cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
-          cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
-          cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
-          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS=60 ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS=10 cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests -- --test-threads=1
-      - name: Simulation unit tests
+        run: python3 scripts/ci-test-inventory.py run --job pr-crates
+      - name: Record simulation unit case execution
         if: matrix.shard == 'sim-unit'
-        run: cargo test -p rockstream-sim --features simulation --lib -- --test-threads=1
-      - name: Simulation integration tests
+        run: python3 scripts/ci-test-inventory.py run --job pr-sim-unit
+      - name: Record all ordinary simulation integration cases
         if: matrix.shard == 'sim-integration'
-        run: cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
-      - name: Remove Docker test image
-        if: always() && matrix.shard == 'gateway'
-        run: docker image rm rockstream-tc-test:latest || true
+        run: python3 scripts/ci-test-inventory.py run --job pr-sim
+      - name: Record balanced package shard execution
+        if: contains(fromJSON('["oracle", "ops", "storage-sql", "gateway-components"]'), matrix.shard)
+        run: python3 scripts/ci-test-inventory.py run --job pr-${{ matrix.shard }}
+      - name: Qualification helper checks (not release evidence)
+        if: matrix.shard == 'sim-integration'
+        run: bash scripts/run-release-qualification.sh --fast --output target/qualification-helpers.json
+      - name: Upload qualification helper results
+        if: always() && matrix.shard == 'sim-integration'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-helpers
+          path: target/qualification-helpers.json
+          if-no-files-found: error
+      - name: Upload exact test execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-${{ matrix.shard }}
+          path: target/ci-test-results/
+          if-no-files-found: error
+
+  gateway:
+    name: Check tests (gateway)
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-tests-gateway
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      # GatewayServer runs in process; its external services use their own images.
+      - name: Require Docker
+        run: docker info
+      - name: Record gateway cases and PGWire conformance events once
+        run: python3 scripts/ci-test-inventory.py run --job pr-gateway
+      - name: Upload exact gateway test execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-gateway
+          path: target/ci-test-results/
+          if-no-files-found: error
+      - name: Upload PGWire conformance events
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgwire-conformance-${{ github.sha }}
+          path: target/pgwire-test-results.json
+          if-no-files-found: error
+
+  postgres-differential:
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
+    name: PostgreSQL 18.0 differential integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Require reference infrastructure
+        run: |
+          docker info
+          docker pull postgres:18.0
+      - name: Account for default-feature PostgreSQL differential cases
+        run: python3 scripts/ci-test-inventory.py run --job pr-postgres-differential
+      - name: Upload exact differential execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-accounting-postgres-differential
+          path: target/ci-test-results/
+          if-no-files-found: error
 
   check:
     name: Check
     if: always()
     needs:
+      - ci-policy
       - check-quality
       - check-tests
+      - gateway
+      - postgres-differential
+      - control-plane-ha
+      - formal-verify
+      - verus-verify
+      - verus-consumer
+      - nexmark-regression-gate
+      - benchmark
+      - docker-build
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if any Check shard failed
-        if: needs.check-quality.result != 'success' || needs.check-tests.result != 'success'
-        run: |
-          echo "A Check shard did not pass."
-          exit 1
-      - name: Check shards passed
-        run: echo "All Check shards passed."
+      - uses: actions/checkout@v4
+      - name: Validate required checks and explicitly scoped prose-only exclusions
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-scope.py check
 
   formal-verify:
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     name: Formal verify (M1–M4, M6–M7)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -360,19 +590,29 @@ jobs:
 
   nexmark-regression-gate:
     name: Nexmark regression gate
+    needs: ci-policy
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Validate qualification selection
+        env:
+          EXPENSIVE: ${{ needs.ci-policy.outputs.expensive }}
+        run: test "$EXPENSIVE" = true || test "$EXPENSIVE" = false
       - uses: actions/checkout@v4
+        if: needs.ci-policy.outputs.expensive == 'true'
       - uses: dtolnay/rust-toolchain@master
+        if: needs.ci-policy.outputs.expensive == 'true'
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
+        if: needs.ci-policy.outputs.expensive == 'true'
       - name: run nexmark bench
+        if: needs.ci-policy.outputs.expensive == 'true'
         env:
           ROCKSTREAM_NEXMARK_GATE: "1"
         run: cargo bench -p rockstream-ops --bench nexmark -- --noplot | tee nexmark-bench.out
       - name: compare against v0.36 baseline
+        if: needs.ci-policy.outputs.expensive == 'true'
         run: |
           if cargo run -p rockstream-ops --bin nexmark_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.36.json --output nexmark-bench.out; then
             exit 0
@@ -386,85 +626,50 @@ jobs:
             fi
           done
           exit 1
+      - name: Record intentional documentation-only exclusion
+        if: needs.ci-policy.outputs.expensive == 'false'
+        run: echo "Full qualification excluded by the recorded documentation-only PR policy."
 
-  benchmark:
-    name: Performance-regression gate (ops/storage/runtime/control)
+  benchmark-suites:
+    name: Benchmark (${{ matrix.suite }})
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     runs-on: ubuntu-latest
-    # Locally measured sum of the four `cargo bench --noplot` wall-clock
-    # times is ~4 minutes on a warm cache; sized generously above that plus
-    # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
-    # `.claude/v0.45.4-evidence.md`.
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [ops, storage, runtime, control]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
-      - name: run rockstream-ops bench
-        run: cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee ops-bench.out
-      - name: compare rockstream-ops against v0.45.4 baseline
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.45.4-ops.json --output ops-bench.out --tag ops; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "ops benchmark gate failed; retry $attempt/2 to reject host-noise false positives"
-            output="ops-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee "$output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.45.4-ops.json --output "$output" --tag ops; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: run rockstream-storage bench
-        run: cargo bench -p rockstream-storage --bench storage_bench -- --noplot | tee storage-bench.out
-      - name: compare rockstream-storage against v0.45.4 baseline
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-storage/benches/baseline/v0.45.4-storage.json --output storage-bench.out --tag storage; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "storage benchmark gate failed; retry $attempt/2 to reject host-noise false positives"
-            output="storage-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-storage --bench storage_bench -- --noplot | tee "$output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-storage/benches/baseline/v0.45.4-storage.json --output "$output" --tag storage; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: run rockstream-runtime bench
-        run: cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee runtime-bench.out
-      - name: compare rockstream-runtime against v0.51 baseline
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output runtime-bench.out --tag runtime; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "runtime benchmark gate failed; retrying (${attempt}/2) to reject host-noise false positives"
-            retry_output="runtime-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee "$retry_output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output "$retry_output" --tag runtime; then
-              exit 0
-            fi
-          done
-          exit 1
-      - name: run rockstream-control bench
-        run: cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee control-bench.out
-      - name: compare rockstream-control against v0.45.4 baseline
-        run: |
-          if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-control/benches/baseline/v0.45.4-control.json --output control-bench.out --tag control; then
-            exit 0
-          fi
-          for attempt in 1 2; do
-            echo "control benchmark gate failed; retry $attempt/2 to reject host-noise false positives"
-            output="control-bench-retry-${attempt}.out"
-            cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee "$output"
-            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-control/benches/baseline/v0.45.4-control.json --output "$output" --tag control; then
-              exit 0
-            fi
-          done
-          exit 1
+        with:
+          shared-key: benchmark-${{ matrix.suite }}
+      - name: Run package benchmark and existing regression gate
+        run: bash scripts/run-benchmark-gate.sh "${{ matrix.suite }}"
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.suite }}
+          overwrite: true
+          path: "*-bench-*.out"
+          if-no-files-found: error
+
+  benchmark:
+    name: Performance-regression gate (ops/storage/runtime/control)
+    needs: [ci-policy, benchmark-suites]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate all benchmark suites or the explicit prose exclusion
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-scope.py check-benchmarks
 
   release-version-check:
     name: Version / tag alignment
@@ -486,8 +691,12 @@ jobs:
           echo "OK: versions match"
 
   docker-build:
+    needs: ci-policy
+    if: needs.ci-policy.outputs.scope == 'full'
     name: Docker image (release binary)
     runs-on: ubuntu-latest
+    outputs:
+      image-id: ${{ steps.identity.outputs.image-id }}
     steps:
       - uses: actions/checkout@v4
       - name: Guard against shipping a debug binary
@@ -501,7 +710,28 @@ jobs:
           # content and the build itself are checked on every push/PR.
           grep -q -- '--release' Dockerfile
           grep -q 'target/release/rockstream' Dockerfile
-      - name: docker build
-        run: docker build -t rockstream:ci .
+      - uses: docker/setup-buildx-action@v3
+      - name: Build candidate production image once
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: rockstream:ci-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=ci-production-image
+          cache-to: type=gha,mode=max,scope=ci-production-image
       - name: smoke-test the built image
-        run: docker run --rm --entrypoint rockstream rockstream:ci --help
+        run: docker run --rm --entrypoint rockstream "rockstream:ci-$GITHUB_SHA" --help
+      - id: identity
+        name: Record candidate image identity
+        run: |
+          echo "image-id=$(docker image inspect --format '{{.Id}}' "rockstream:ci-$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+          mkdir -p target/ci-image
+          docker save --output target/ci-image/candidate.tar "rockstream:ci-$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-image-${{ github.sha }}
+          path: target/ci-image/candidate.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error

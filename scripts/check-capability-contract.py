@@ -103,10 +103,10 @@ def check_documented_tiers(
     expected_rows = {
         "PostgreSQL CDC source": "Core",
         "Kafka source": "Core",
-        "Kafka sink": "Core",
+        "Kafka sink": "Experimental",
     }
     if connector_rows != expected_rows:
-        fail(errors, "connector documentation must list exactly the three Core surfaces")
+        fail(errors, "connector documentation must list two Core sources and the Experimental Kafka sink")
     if "RS-4017" not in connector_text or "connector-migration.md" not in connector_text:
         fail(errors, "connector documentation must retain the RS-4017 migration reference")
     if not (root / "docs/connector-migration.md").is_file():
@@ -137,8 +137,28 @@ def check_external_surface(capabilities: list[dict], errors: list[str]) -> None:
             details.append(f"missing {', '.join(missing)}")
         fail(errors, f"connector/sink inventory mismatch ({'; '.join(details)})")
     for item in capabilities:
-        if item.get("kind") in {"connector", "sink"} and item.get("tier") != "Core":
-            fail(errors, f"{item.get('id')} must be Core")
+        if item.get("kind") not in {"connector", "sink"}:
+            continue
+        expected_tier = "Experimental" if item.get("id") == "sink.kafka" else "Core"
+        if item.get("tier") != expected_tier:
+            fail(errors, f"{item.get('id')} must be {expected_tier}")
+        if item.get("id") == "sink.kafka":
+            if item.get("proof") or item.get("proof_levels_achieved"):
+                fail(errors, "sink.kafka remains Experimental; full Core proof levels are not qualified")
+            rows = item.get("behavior", [])
+            for behavior in ("incremental", "backfill"):
+                claims = [
+                    (row.get("statement"), row.get("proof"))
+                    for row in rows if row.get("behavior") == behavior
+                ]
+                expected = (
+                    "KafkaViewSink delivers typed view change rows with signed weights in one ordered transaction envelope per nonempty view epoch."
+                    if behavior == "incremental" else
+                    "KafkaViewSink delivers one complete materialized snapshot envelope before live change envelopes."
+                )
+                proof = "crates/rockstream-ops/tests/kafka_view_delivery_tests.rs::view_snapshot_changes_and_recovery_match_exact_consumer_stream"
+                if claims != [(expected, proof)]:
+                    fail(errors, f"sink.kafka {behavior} requires its exact row-delivery claim and consumer proof")
 
 
 def check_proof_levels(capabilities: list[dict], errors: list[str]) -> None:
@@ -191,7 +211,8 @@ def check_roadmap(root: Path, contract: dict, errors: list[str]) -> None:
         fail(errors, f"cannot read {roadmap}: {error}")
         return
     roadmap_version = version.removesuffix(".0")
-    if not re.search(rf"^\| \*{{0,2}}{re.escape(roadmap_version)}\*{{0,2}} \|.*✅ Done", text, re.MULTILINE):
+    completion = "✅ Done|⏳ Candidate" if version == "v0.72.0" else "✅ Done"
+    if not re.search(rf"^\| \*{{0,2}}{re.escape(roadmap_version)}\*{{0,2}} \|.*(?:{completion})", text, re.MULTILINE):
         fail(errors, f"roadmap does not mark contract version {version} as Done")
 
 
@@ -265,12 +286,12 @@ def generated_block(text: str) -> str | None:
 def check_full_semantics(
     root: Path, contract: dict, capabilities: list[dict], errors: list[str]
 ) -> None:
-    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0", "v0.67.0", "v0.67.1", "v0.68.0", "v0.69.0", "v0.70.0", "v0.71.0"}:
-        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, v0.66.0, v0.67.0, v0.67.1, v0.68.0, v0.69.0, v0.70.0, or v0.71.0")
+    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0", "v0.67.0", "v0.67.1", "v0.68.0", "v0.69.0", "v0.70.0", "v0.71.0", "v0.72.0"}:
+        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, v0.66.0, v0.67.0, v0.67.1, v0.68.0, v0.69.0, v0.70.0, or v0.71.0, or v0.72.0")
 
 
     for capability in capabilities:
-        if capability.get("tier") != "Core":
+        if capability.get("tier") != "Core" and capability.get("id") != "sink.kafka":
             continue
         rows = capability.get("behavior")
         if not isinstance(rows, list):
@@ -344,8 +365,8 @@ def main() -> int:
     errors: list[str] = []
     contract, capabilities = load_source(root, errors)
     if contract:
-        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0", "v0.67.0", "v0.67.1", "v0.68.0", "v0.69.0", "v0.70.0", "v0.71.0"}:
-            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, v0.66.0, v0.67.0, v0.67.1, v0.68.0, v0.69.0, v0.70.0, or v0.71.0")
+        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.18", "v0.59.20", "v0.59.22", "v0.59.24", "v0.60.0", "v0.61.0", "v0.64.0", "v0.65.0", "v0.66.0", "v0.67.0", "v0.67.1", "v0.68.0", "v0.69.0", "v0.70.0", "v0.71.0", "v0.72.0"}:
+            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.18, v0.59.20, v0.59.22, v0.59.24, v0.60.0, v0.61.0, v0.64.0, v0.65.0, v0.66.0, v0.67.0, v0.67.1, v0.68.0, v0.69.0, v0.70.0, or v0.71.0, or v0.72.0")
 
         check_promises(root, contract.get("promise"), errors)
         check_roadmap(root, contract, errors)

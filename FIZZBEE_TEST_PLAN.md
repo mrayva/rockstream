@@ -493,6 +493,18 @@ The naming convention is `<Model>-<S|L><n>`: `S` = safety, `L` = liveness.
   - `CheckBeforeCommit`: query-then-act observes committed-vs-aborted and
     re-runs `pre_commit → commit` only on broker abort, never double-delivering.
 
+Kafka recovery refines `CheckBeforeCommit` with an unknown lookup outcome
+(#121). Consumer setup failures, poll failures, timeouts, and transactions not
+yet stable through the captured high watermark return retryable `RS-4030`.
+Recovery preserves the pending handle and delivery/staging bookkeeping and
+does not publish while that outcome is unknown. Confirmed absence requires a
+complete `read_committed` scan of every partition stable through its captured
+`read_uncommitted` high watermark before scanning; confirmed presence resolves
+the delivered epoch and clears staging. The model abstracts lookup as known:
+unknown retries correspond to taking no recovery action, and progress assumes
+lookup eventually becomes available. The broker fault schedule and lookup
+error taxonomy are checked by the concrete tests mapped in §3.6.
+
 **Liveness**
 
 - **M3-L1 — Delivery progress.** `always eventually`: under `fair` commit and
@@ -683,6 +695,121 @@ model; no new FizzBee transition or invariant is asserted.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+Issue #203 replaces the public `aws_kms` provider's ARN/region-derived local
+encryption with signed KMS `Encrypt` and `Decrypt` requests. Both operations
+must send the configured `KeyId`; denied, unavailable, and wrong-key operations
+must fail with `RS-2422` without local fallback. This external authorization
+boundary changes no M1–M7 coordination transition or invariant, so its concrete
+protocol obligations are covered by implementation tests rather than a FizzBee
+cryptography or IAM model.
+
+`crates/rockstream-control/tests/aws_kms_tests.rs` checks independently supplied
+key/ciphertext outputs, full request bodies and SigV4 signatures, denial,
+unavailability, wrong-key rejection, malformed responses, redirects, and invalid
+credential headers. `secrets_kek_conformance_tests.rs` verifies complete secret
+identity, type, metadata and credential maps across env/KMS/env rewrapping,
+including an untouched second secret and encrypted-artifact scans. The existing
+`secrets_lifecycle_tests.rs` and `secrets_redaction_tests.rs` cover env-backed
+persistence, lifecycle and audit redaction. Local protocol fixtures do not prove
+AWS authorization enforcement: `real_kms_enforces_key_and_principal_permissions`
+requires scoped live AWS fixtures and remains explicitly ignored and recorded
+as unexecuted in `scripts/ci-test-matrix.json` until those fixtures are supplied.
+
+Issue #202 preserves secret readability across failed or interrupted KEK
+rotation in `crates/rockstream-control`. Rotation excludes secret reads and
+mutations, stages every rewrapped envelope, and publishes one atomic SlateDB
+batch or in-memory catalog replacement. Staging failures leave stored envelopes
+unchanged. Submitted writes retain their synchronization guards after caller
+cancellation, and rotation acknowledges success only after durable storage
+completes. Both providers remain available around ambiguous commits; restart
+recovery uses `RetainedKekProvider` and retries with the replacement provider.
+These local synchronization, encryption-provider, and storage-I/O guarantees
+are outside the M1–M7 FizzBee state machines and rely on SlateDB atomicity and
+durability as described in ADR 0006. Runtime assertions live in
+`crates/rockstream-control/tests/secrets_rotation_failure_tests.rs`:
+`failed_second_wrap_preserves_every_secret_and_allows_retry` compares complete
+same-named secrets across namespaces and verifies unchanged catalog bytes after
+staging failure; `submitted_rotation_survives_cancellation_and_wal_errors`
+checks cancellation, WAL faults, exact reopened envelopes, and complete payloads
+after retained-key recovery. The suite also covers concurrent operations,
+successful rotation, legacy mixed generations, and catalog/audit redaction.
+These tests do not claim live KMS or abrupt process-termination qualification.
+
+Issue #126 observes the existing M4 worker-disconnect and lease-reassignment
+path together with M3 Kafka transaction recovery. `ControlService` emits the
+`worker.disconnected` audit event when the worker session ends, before removing
+the worker and reassigning its leases. This event supplies a failure-detection
+timestamp; it neither grants ownership nor changes fencing or commit decisions.
+The M3/M4 state machines therefore need no new transition or invariant.
+`worker_failure_recovery_from_view_and_kafka` kills a real worker process with a
+durable Kafka transaction pending, observes a replacement owner and higher lease
+token, and compares complete typed weighted view history, source offsets, and
+consumed Kafka records against independent expected results. A separate view
+reader must return the correct relation at frontier 5 within the recovery
+deadline. Corrupted values, duplicate records, suppressed progress, and a missed
+deadline each fail their intended validator check. The versioned manifest and
+actual observations are described in `docs/testing/worker-failure-recovery.md`.
+This is one measured recovery sample, not a p99 estimate or qualification of
+other chaos categories; process scheduling, broker/storage I/O, and elapsed time
+remain implementation evidence outside the abstract FizzBee models.
+
+Issue #122 adds a bounded production view-log adapter to Kafka. The M3 model
+still abstracts epochs, not row contents. The adapter persists the full pending
+envelope and view cursor before Kafka commit, then finalizes progress. Restart
+fences the old producer and resolves the pending transaction through the existing
+CheckBeforeCommit protocol. A snapshot is one atomic envelope before any live
+epoch; all envelopes use partition zero. No new FizzBee invariant is asserted.
+`view_snapshot_changes_and_recovery_match_exact_consumer_stream` compiles the
+production view, consumes real Kafka records, and compares independently specified
+rows, signed weights, keys, and transaction boundaries. LFS reopen covers crashes
+before snapshot/update/delete commit and after Kafka commit before progress save.
+The exact oracle rejects wrong values, omitted deletions, and duplicate changes.
+`sink.kafka` remains Experimental pending full Core release qualification;
+marker tests alone cannot qualify row delivery.
+
+Issue #133 / v0.72 R6 additionally bounds *suspended* worker-local exchange
+credit waiters, separately from accepted in-flight batches and bytes.
+`FlowController::acquire_credit` and `acquire_batch_permit` reserve one
+atomic `CreditWaiterSlot` only after immediate row/batch admission fails,
+up to `max_pending_requests`; saturation returns `RS-3006` before a new
+queued request can retain state. A pending future's cancellation, task abort,
+successful wakeup, or error drops its own reservation. For legacy row credits,
+`ChannelWaiterSlot` also owns its per-channel `Notify` map reference and
+reclaims the key after the last waiter, with pointer-identity fencing so
+teardown and replacement cannot lose another channel's notifier.
+
+`crates/rockstream-runtime/tests/v072_exchange_credit_waiters.rs` asserts
+the actual quota/overflow/release state for immediate admission, saturated
+row and batch waits, abort and successful wakeup, oversized rejections, and
+32 cancelled distinct channels without retained notifier keys. Three
+targeted `flow_control` unit regressions exercise notify-before-recheck
+ordering and zero-reservation fast paths. These are local Tokio-future and
+resource-owner invariants: they do **not** change the abstract M1–M7
+frontier, lease, or durable-commit transitions and cannot prove fairness or
+RSS limits. The fixed-owner capacity/retry behavior in
+`formal/edge_quota_exhaustion.fizz` remains an abstraction, not a model of
+futures or per-channel notifier identity. This documents the formal boundary
+required by DC.2; the v0.72 resource inventory, physical memory bounds,
+producer-side pressure and release-process evidence remain incomplete.
+
+Issue #236 strengthens exchange reservation identity after channel teardown.
+An acknowledgment carries only the channel key and epoch/sequence, not a unique
+channel generation. Consequently, a key that has delivered a frame is retired
+for the lifetime of its controller: a delayed acknowledgment must not release
+credits held by a replacement channel with the same key. Fresh keys that have
+never delivered remain reusable. Reservation handoff and release compare the
+owning channel token before changing per-channel row, batch, or byte accounting;
+aggregate outstanding credits remain attached to the original reservation
+until its own completion or teardown. A late or duplicate ACK cannot transfer
+ownership to another channel. The production
+`v072_exchange_credit_waiters` and flow-controller lifecycle tests assert
+this accounting through cancellation, teardown, and stale ACKs. The associated
+Verus ownership kernel proves only the local owner/release arithmetic.
+The abstract FizzBee M1–M7 models do not contain channel generations, Tokio
+permits, or per-channel byte budgets, so they do not prove ACK identity or wire
+liveness. This is an implementation-level refinement under the DC.2
+coordination-model coupling rule, not a new abstract transition.
+
 Issue #117 closes an implementation-level liveness gap in exchange flow control.
 `FlowController::acquire_batch_permit`, used by `WorkerStreamMultiplexer::send_frame`,
 and the separately reachable row-only `acquire_credit` register their Tokio
@@ -869,7 +996,11 @@ shuffle frames, while surviving non-zero weights collapse into a single emitted 
 This in-memory compaction is outside the core M1–M7 FizzBee coordination state machines
 (operating entirely within single-epoch micro-batch buffers), verified by
 `crates/rockstream-runtime/tests/in_flight_zset_epoch_compaction_tests.rs` with exact
-output assertions covering net-zero omission and window boundary drains.
+output assertions covering net-zero omission and window boundary drains. Worker-wide
+configuration updates validate positive, ordered duration bounds and reject a window
+outside them before replacing the accepted config; the `client.rs` regression asserts
+an invalid update preserves the prior value. This setter is local configuration and
+adds no M1–M7 coordination transition.
 
 The v0.69 PostgreSQL CDC golden connector establishes the complete snapshot and
 WAL fence coordination protocol, quad-LSN progress persistence, transaction
@@ -931,6 +1062,7 @@ check, not just an aspirational claim.
 | COV-M2 | `crates/rockstream-sim/tests/frontier_publisher_election.rs::three_frontier_aggregators_stale_publisher_never_republishes` (v0.45.6 S8): three simulated `FrontierAggregator`s contend for the same `frontier/leader` CAS record; `buggify!("frontier.stale_publish_race", p)` forces a fenced aggregator to attempt a late publish after a new leader's CAS has already succeeded, reaching the `fencing_occurred` coverage-witness state and asserting the stale attempt is always rejected. Spec: `formal/m2_frontier_agg.fizz` COV-M2. | `rockstream-sim` |
 | M3-S1–S4 | Assert idempotency-key uniqueness before `prepare`; assert one external artifact per key after recovery. Specifically: `assert_no_duplicate_delivery` (M3-S1), `assert_no_lost_delivery_after_checkpoint` (M3-S2), `assert_epoch_committed_only_after_cluster_checkpoint` (M3-S3), `assert_recovery_dispatch_idempotent` (M3-S4) — all in `crates/rockstream-connectors/src/sink_connector.rs`. Checkpoint-coupled commit is enforced by the verified adapter boundary (`CoupledBatchDescriptor` / `commit_m3` in `crates/rockstream-connectors/src/source_epoch.rs`), mechanically deriving and validating coupled mutations before delegating to `coupled_commit_is_durable`. | `rockstream-connectors` |
 | COV-M3 | `crates/rockstream-connectors/tests/kafka_tx_timeout_tests.rs::seeded_kafka_tx_timeout_fault_injection_across_seeds` uses `buggify!("kafka.tx_timeout", p)` to force the broker to abort an open transaction between `pre_commit` and `commit`, reaching the coverage-witness state, then drives `CheckBeforeCommit` recovery and asserts exactly-once delivery. Spec: `formal/m3_sink_2pc.fizz` COV-M3. | `rockstream-connectors` |
+| M3-S1, M3-S4 — unknown Kafka delivery | `crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::{kafka_sink_uncertain_broker_response_recovers_exactly_once_within_slo,kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly}` drop the real EndTxn response or request, restart, and block lookup while another producer remains usable. They assert exact `RS-4030` errors, unchanged full topic key/payload sequences, and one original record plus resolved delivery/staging state after two recovery attempts with lookup restored. `kafka_sink_lookup_timeout_does_not_confirm_absence_before_stable_end` covers unresolved transactions; `crates/rockstream-connectors/src/kafka_sink.rs::tests::lookup_distinguishes_setup_poll_absence_and_presence` checks the other lookup outcomes. | `rockstream-connectors` |
 | M4-S1, M4-S3 | `assert_valid_writer(shard_id, token, current_token, …)` in `crates/rockstream-runtime/src/fence.rs` before every epoch commit; `assert_single_lease_holder(shard_id, count)` checked after every lease `acquire`/`force_acquire` call. Panics with `RS-1702` on stale token. Spec: `formal/m4_self_fencing.fizz` M4-S1, M4-S3. | `rockstream-runtime` |
 | M4-S2 | `SelfFenceGuard::must_self_fence()` / `assert_within_deadline()` in `crates/rockstream-runtime/src/fence.rs`; worker must call `guard.tick(can_reach_control)` on every heartbeat and terminate when `must_self_fence()` returns `true`. Panics with `RS-1702` on deadline exceeded. Spec: `formal/m4_self_fencing.fizz` M4-S2. | `rockstream-runtime` |
 | M4-S4 | No `assert!` fires when an object-store-only partition occurs (worker cannot reach object store but can still reach control plane): the worker blocks (backpressure) rather than self-fencing, because lease validity is determined by control-plane contact alone. Verified by `test_checkpoint_under_slow_input` (object-store stall → backpressure, not panic). Spec: `formal/m4_self_fencing.fizz` M4-S4. | `rockstream-runtime`, `rockstream-sim` |
@@ -1217,3 +1349,121 @@ RockStream usage. (Sourced from the FizzBee design-verification tutorials.)
 > ([FizzBee msg-delivery-guarantees](https://fizzbee.io/design/tutorials/msg-delivery-guarantees/)),
 > which is the more established mechanism and is mandatory for M2's
 > reordering proof regardless. Test harness and durability assertions align with v0.64.
+
+## v0.72 bounded adaptive epoch windows (issue #134)
+
+The in-memory epoch compactor may adjust only the time when a logical epoch is
+eligible for its existing flush path. It must not change the epoch's identity,
+reorder dependencies, or replace the durability/acknowledgement transition.
+
+Model refinement obligations:
+
+- Reject zero, reversed, or out-of-range lower/upper startup bounds.
+- The chosen window is always inside the validated closed interval. Four
+  inputs are required: ingest rows/s, observed durable-commit latency, state
+  pressure, and target committed-result freshness.
+- Reserve the observed durable commit time before selecting an epoch window.
+  If the target cannot fit the minimum epoch window plus commit time, expose
+  an explicit infeasible decision instead of claiming the target was met.
+- Adaptation can change when work becomes flush-eligible but not its rows,
+  signed weights, epoch number, ordering, or durable acknowledgement.
+- Commit failure, retries, restart, competing workload fairness, queue bounds,
+  and independent result correctness still require separate integrated proof.
+
+The source-level decision and live-expiration regressions are in
+`crates/rockstream-runtime/tests/v072_adaptive_epoch_tests.rs`. They validate
+this local transition, **not** the full #134 durable/fair scheduling contract.
+
+## v0.72 worker-budget admission and cancellation ownership (issue #133)
+
+The worker quota changes refine the resource-ownership transition used by
+the control/data-plane models. They do not change the durable epoch or
+lease-fencing protocol, and this note is **not** a formal proof or v0.72
+acceptance verdict.
+
+The resource ledger abstraction for future FizzBee refinement is:
+
+- **Admit:** under the worker hard bound (including documented allocator
+  overhead), reserve one global byte total atomically before publishing
+  category ownership. Admission must reject rather than wrap arithmetic or
+  consume protected foreground capacity for background work.
+- **Release:** each acquired permit releases exactly its charged category and
+  workload *generation*. A stale permit may not decrement a replacement
+  workload that happens to reuse its identifier.
+- **Waiter:** increment the bounded waiter count before waiting; cancellation,
+  disconnect, timeout and success drop the same owning guard exactly once.
+  A rejected waiter does not own a decrement.
+- **Shared cache:** charge at most once after successful reservation; a failed
+  reservation leaves initialization retryable.
+- **Safety oracle:** after every quiescent transition, the global reserved total
+  equals the sum of category reservations, no counter underflows, all admitted
+  bytes fit the hard envelope, and cancelled work holds no waiter reservation.
+
+These transitions are exercised by
+`crates/rockstream-types/tests/v072_worker_budget_tests.rs` and
+`crates/rockstream-runtime/tests/v072_quota_lifecycle.rs`. Subsequent
+modeling must include shard-removal/restart cleanup, quota propagation, and
+fair competing-workload liveness before v0.72 can claim integrated proof.
+
+## v0.72 exchange row-credit fast admission (issue #134)
+
+`FlowController::acquire_credit` now attempts its existing channel-lock
+reservation before accessing or creating the per-key notifier. This preserves
+the same credit transition while eliminating waiter bookkeeping on the
+immediate-admission path; it does **not** alter epoch order, the shard lease,
+acknowledgement identity, or durable commit semantics.
+
+The protocol transitions for subsequent FizzBee refinement are:
+
+- **Fast admission:** while holding the channel state lock, grant only if
+  `available_rows >= requested_rows`. Subtract once and add exactly the same
+  count to `rows_in_flight`. A failed attempt performs neither mutation and
+  does not register a waiter. Oversized requests reject before creating state.
+- **Waiter registration:** on insufficient credit, find/create the per-key
+  notifier, enable the notification future, then **recheck** channel credits
+  under the same lock. An ACK racing with registration must either expose
+  available credits to that recheck or notify an enabled waiter.
+- **Release:** an acknowledged row reservation returns at most its recorded
+  credit to the same channel, preserving the hard window. Aborted waiters do
+  not consume credits or leave phantom in-flight reservations.
+- **Teardown:** concurrent exchange destruction must not strand pending work
+  or allow stale acknowledgements to grant a different exchange credit.
+
+Three regression tests in `crates/rockstream-runtime/src/exchange/flow_control.rs`
+check the uncontended ledger, waiter ACK race, and pre-admission rejection.
+The repository's frozen exchange-flow performance gate must still be measured
+and pass; these unit tests and this transition mapping are **not** formal
+model checking or complete #134/#132 capacity qualification.
+
+## v0.72 practical shard-placement balancing (issue #134)
+
+`ShardScheduler::assign_initial_shards` and worker-loss reassignment now
+count existing live leases and
+each assignment completed in a batch, choosing among the *least-loaded
+compatible* healthy workers and retaining the existing capacity-headroom
+tie-break. Reusing an already healthy compatible shard lease remains a no-op.
+This changes only initial placement preference, not the coordination protocol:
+leader gating, a unique lease holder, fencing-token generation and worker-loss
+reassignment remain owned by the existing shard lease/raft models. Existing
+`crates/rockstream-control/src/scheduler.rs` tests exercise placement across
+multiple workers, pre-existing leases and fencing stability. Placement counts
+are advisory; they are not a global memory reservation, throughput guarantee
+or proof of starvation freedom under sustained workload contention.
+
+## v0.72 bounded local SELECT scans (issue #135)
+
+The local gateway's ordinary `SELECT FROM` storage read now uses the
+existing bounded `ShardDb::scan_prefix_bounded` producer instead of eagerly
+materializing an unlimited `scan_prefix` result. Storage returns the same
+logical keys for formats v1/v2/v3; the v3 dispatch condition is restored to
+match the existing unbounded and paginated reads. Over-budget scans carry an
+explicit truncation marker; the gateway rejects such results before encoding
+any rows. Injected storage failures continue to propagate instead of being
+interpreted as empty scans. This is a **read-only resource admission** change:
+it does not change shard lease ownership, fencing, commit ordering, durable
+acknowledgements, or the M1–M7 coordination protocol. Unit regressions cover
+complete/truncated/row-over-budget responses and v3 logical-key/failure behavior.
+
+## v0.72 CLI checkpoint export integrity (#221)
+
+The CLI backup operation selects one committed control checkpoint and must enumerate its required immutable shard manifest, WAL and SST objects before exporting. A merely visible-prefix inventory is insufficient: missing referenced shard storage must fail with a checkpoint-integrity error and must not create a terminal success marker. The management and CLI export paths now share the existing checkpoint-aware inventory; this does not alter M3 cluster checkpoint durability, lease fencing or the committed checkpoint itself. Concrete coverage: `cli_prefix_export_rejects_missing_committed_shard_objects_before_success` deletes a real checkpointed shard before CLI export and requires failure without a commit marker; `lfs_export_restore_fresh_cluster_is_bit_identical` preserves the positive committed state recovery contract. Error-code catalog aliasing for RS-5035 is tracked separately as D1 in #221.

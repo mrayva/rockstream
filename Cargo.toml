@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# Keep the upstream security backport out of workspace-wide formatting, but
+# still resolve it as the pinned patched dependency below.
+exclude = ["vendor/pgwire-0.28.0"]
 members = [
     "crates/rockstream-cli",
     "crates/rockstream-connectors",
@@ -26,7 +29,7 @@ overflow-checks = true
 strip = "symbols"
 
 [workspace.package]
-version = "0.71.0"
+version = "0.72.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -94,7 +97,7 @@ chrono = { version = "0.4", features = ["clock"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rust_decimal = "1"
 postgres-types = { version = "0.2", features = ["with-uuid-1", "with-serde_json-1", "array-impls"] }
-rdkafka = "0.36"
+rdkafka = "0.39"
 ring = { version = "0.17", default-features = false, features = ["std"] }
 vstd = "=0.0.0-2026-09-06-0133"
 
@@ -117,3 +120,7 @@ rockstream-sql = { path = "crates/rockstream-sql" }
 rockstream-storage = { path = "crates/rockstream-storage" }
 rockstream-test-support = { path = "crates/rockstream-test-support" }
 rockstream-types = { path = "crates/rockstream-types" }
+
+[patch.crates-io]
+# Security backport for pgwire 0.28.0 (issue #227). See vendored README.
+pgwire = { path = "vendor/pgwire-0.28.0" }

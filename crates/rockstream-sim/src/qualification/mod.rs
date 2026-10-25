@@ -9,6 +9,8 @@ pub mod metrics_collector;
 pub mod oracle_auditor;
 pub mod orchestrator;
 pub mod recovery_observer;
+pub mod rolling_upgrade;
+pub mod worker_failure;
 pub mod workload;
 
 pub use env_check::{
