@@ -675,8 +675,9 @@ impl SqlFrontend {
             let rest = s["CREATE INDEX".len()..].trim();
 
             // Split on " ON " (case-insensitive)
+            // ASCII-only uppercasing keeps byte offsets aligned with `rest`.
             let on_pos =
-                rest.to_uppercase()
+                rest.to_ascii_uppercase()
                     .find(" ON ")
                     .ok_or_else(|| SqlError::DdlParseError {
                         message: "CREATE INDEX requires ON clause".to_string(),
@@ -690,9 +691,12 @@ impl SqlFrontend {
             })?;
             let table = after_on[..paren_open].trim().to_string();
 
-            let paren_close = after_on.rfind(')').ok_or_else(|| SqlError::DdlParseError {
-                message: "CREATE INDEX: unclosed parenthesis in column list".to_string(),
-            })?;
+            let paren_close = after_on
+                .rfind(')')
+                .filter(|close| *close > paren_open)
+                .ok_or_else(|| SqlError::DdlParseError {
+                    message: "CREATE INDEX: unclosed parenthesis in column list".to_string(),
+                })?;
             let cols_str = &after_on[paren_open + 1..paren_close];
             let index_cols: Vec<String> = cols_str
                 .split(',')
@@ -1355,6 +1359,16 @@ mod tests {
                 where_pred: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_ddl_create_index_malformed_parens_do_not_panic() {
+        let frontend = SqlFrontend::new();
+        // Found by fuzz_sql_parser: the closing paren precedes the opening one.
+        assert!(frontend.parse_ddl("CREATE INDEXzid  ON a)( t\n").is_err());
+        assert!(frontend.parse_ddl("CREATE INDEX i ON a)(").is_err());
+        // `to_uppercase` changes the byte length of "ß", so offsets must not come from it.
+        assert!(frontend.parse_ddl("CREATE INDEX ß ON t (c)").is_ok());
     }
 
     #[test]
