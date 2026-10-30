@@ -240,11 +240,15 @@ def run_test(
     timed_out = False
     resource_stop = False
     status = None
+    test_env = env.copy()
+    test_env["ROCKSTREAM_CHAOS_ARTIFACT_DIR"] = str(
+        log.with_name(f"{log.stem}-artifacts").resolve()
+    )
     with log.open("wb") as output:
         process = subprocess.Popen(
             case["test_command"],
             cwd=cwd,
-            env=env,
+            env=test_env,
             stdout=output,
             stderr=subprocess.STDOUT,
             start_new_session=(os.name == "posix"),
@@ -480,6 +484,7 @@ def run_lane(output: Path) -> int:
             "CARGO_PROFILE_DEV_DEBUG": "0",
             "CARGO_PROFILE_TEST_DEBUG": "0",
             "CARGO_BUILD_JOBS": "2",
+            "ROCKSTREAM_QUALIFICATION_REVISION": report["source_sha"],
         })
         configured_target = Path(env.get("CARGO_TARGET_DIR", target)).absolute()
         if target.is_symlink() or configured_target != target.absolute():

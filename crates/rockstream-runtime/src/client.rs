@@ -55,6 +55,8 @@ impl WorkerDeployment {
 }
 
 pub type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
+type FrontierReportWaiter =
+    Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Result<u64, String>>>>>;
 
 fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<String, SchemaRef>> {
     descriptor
@@ -405,6 +407,7 @@ pub async fn setup_test_deployment(
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new("worker-42".to_string()));
     let storage_context = Arc::new(
         rockstream_storage::storage_context::WorkerStorageContext::new_with_worker_id(
@@ -421,6 +424,7 @@ pub async fn setup_test_deployment(
         topology_workers,
         msg_tx,
         fence_waiters: fence_waiters.clone(),
+        frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager,
         storage_context: storage_context.clone(),
         compaction_config: comp_config_lock,
@@ -812,6 +816,7 @@ pub struct WorkerClientHandle {
     msg_tx: mpsc::Sender<WorkerMessage>,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
+    frontier_report_waiter: FrontierReportWaiter,
     secret_manager: Arc<WorkerSecretManager>,
     storage_context: Arc<rockstream_storage::storage_context::WorkerStorageContext>,
     compaction_config: Arc<RwLock<EpochCompactionConfig>>,
@@ -967,6 +972,33 @@ impl WorkerClientHandle {
         rx.await.map_err(|_| {
             io::Error::new(io::ErrorKind::ConnectionAborted, "Response channel closed")
         })
+    }
+
+    /// Report committed shard progress and await the control-plane response.
+    /// The current wire protocol permits one outstanding report per client.
+    pub async fn report_shard_frontier(
+        &self,
+        shard_id: ShardId,
+        epoch: u64,
+    ) -> Result<u64, String> {
+        // shortcut: the wire protocol has no request ID, so one report may be pending per client; add correlation IDs before supporting concurrent reports.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut waiter = self.frontier_report_waiter.lock();
+            if waiter.is_some() {
+                return Err("a frontier report is already pending".to_owned());
+            }
+            *waiter = Some(tx);
+        }
+        self.msg_tx
+            .send(WorkerMessage::ReportShardFrontier { shard_id, epoch })
+            .await
+            .map_err(|_| {
+                self.frontier_report_waiter.lock().take();
+                "Client channel closed".to_owned()
+            })?;
+        rx.await
+            .map_err(|_| "Control response channel closed".to_owned())?
     }
 }
 
@@ -1198,6 +1230,7 @@ where
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let frontier_report_waiter = Arc::new(parking_lot::Mutex::new(None));
     let secret_manager = Arc::new(WorkerSecretManager::new(format!(
         "worker-{proposed_worker_id}"
     )));
@@ -1220,6 +1253,7 @@ where
         topology_workers: topology_workers.clone(),
         msg_tx: msg_tx.clone(),
         fence_waiters: fence_waiters.clone(),
+        frontier_report_waiter: frontier_report_waiter.clone(),
         secret_manager: secret_manager.clone(),
         storage_context: storage_context.clone(),
         compaction_config: compaction_config.clone(),
@@ -1246,6 +1280,7 @@ where
     let worker_id_clone = worker_id.clone();
     let active_shards_clone = active_shards.clone();
     let fence_waiters_clone = fence_waiters.clone();
+    let frontier_report_waiter_clone = frontier_report_waiter.clone();
     let storage_dir = storage_dir.to_path_buf();
     let secret_manager_clone = secret_manager.clone();
     let deployments_clone = deployments.clone();
@@ -1873,6 +1908,9 @@ where
                     }
                 }
                 ControlMessage::ClusterFrontierAdvanced { epoch } => {
+                    if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
+                        let _ = waiter.send(Ok(epoch));
+                    }
                     tracing::info!("Cluster frontier advanced to {}", epoch);
                     let dbs: Vec<rockstream_storage::ShardDb> = active_shards_clone
                         .read()
@@ -1889,6 +1927,22 @@ where
                                 e
                             );
                         }
+                    }
+                }
+                ControlMessage::OperationFailed { code, message, .. } => {
+                    if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
+                        // Preserve the registered error code supplied by the control plane.
+                        let error = format!("{code}: {message}");
+                        let _ = waiter.send(Err(error));
+                    }
+                }
+                ControlMessage::NotLeader { current_leader } => {
+                    if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
+                        let error = format!(
+                            "{}: not leader: {current_leader:?}",
+                            rockstream_types::error_code::RS_1731
+                        );
+                        let _ = waiter.send(Err(error));
                     }
                 }
                 ControlMessage::SecretTokenIssued { token } => {
@@ -1922,6 +1976,9 @@ where
             }
         }
 
+        if let Some(waiter) = frontier_report_waiter_clone.lock().take() {
+            let _ = waiter.send(Err("Control channel closed".to_owned()));
+        }
         // Clean up remaining active shards on shutdown/disconnect
         let dbs_to_close: Vec<ShardDb> = {
             let mut shards = active_shards_clone.write();
