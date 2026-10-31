@@ -100,6 +100,8 @@ jobs:
           old_root="$RUNNER_TEMP/rolling-upgrade-old"
           mkdir -p "$old_root" "$ROCKSTREAM_UPGRADE_ARTIFACT_DIR"
           git archive "$ROCKSTREAM_ROLLING_N_REVISION" | tar -x -C "$old_root"
+          # Revisions older than the pgwire vendoring have no vendor/; the shared Dockerfile COPYs it.
+          mkdir -p "$old_root/vendor"
           mkdir -p "$old_root/crates/rockstream-sim/examples" "$old_root/crates/rockstream-sim/tests/common"
           cp crates/rockstream-sim/examples/upgrade_worker.rs "$old_root/crates/rockstream-sim/examples/"
           cp crates/rockstream-sim/tests/common/recovery.rs "$old_root/crates/rockstream-sim/tests/common/"

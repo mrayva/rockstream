@@ -5,6 +5,9 @@ RUN apt-get update && apt-get install -y g++ make cmake pkg-config libssl-dev pr
 WORKDIR /usr/src/rockstream
 COPY Cargo.toml Cargo.lock capabilities.toml ./
 COPY crates/ crates/
+# Path-patched dependencies (pgwire security backport, #227). The old-revision
+# build context may predate vendor/; the workflow creates it empty.
+COPY vendor/ vendor/
 COPY fuzz/ fuzz/
 COPY formal/ formal/
 COPY contracts/ contracts/
