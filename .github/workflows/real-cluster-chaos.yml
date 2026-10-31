@@ -1,4 +1,4 @@
-# Real Kafka and MinIO worker, source-ACK, and sink-cursor recovery; no p99 claim.
+# Real Kafka and MinIO worker, ACK, sink-cursor, and bounded ENOSPC recovery; no p99 claim.
 
 name: Real Cluster Chaos Soak
 
@@ -32,6 +32,7 @@ on:
       - "docs/testing/worker-source-ack-gap-kafka-minio-v1.json"
       - "docs/testing/worker-source-ack-gap-recovery.md"
       - "docs/testing/worker-sink-cursor-gap-kafka-minio-v1.json"
+      - "docs/testing/worker-state-enospc-kafka-minio-v1.json"
       - "docs/testing/postgres-cdc-kafka-minio-v1.json"
       - "docs/testing/postgres-cdc-kafka-minio-v1.md"
       - "docs/testing/worker-failure-recovery.md"
@@ -73,6 +74,10 @@ jobs:
         run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests source_ack_gap_recovery_from_kafka_and_minio -- --exact
       - name: Prove real-process Kafka sink commit and MinIO cursor gap recovery
         run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests sink_transaction_cursor_gap_recovers_exactly_once -- --exact
+      - name: Prove bounded MinIO ENOSPC withholds Kafka source ACK and recovers
+        env:
+          ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos
+        run: cargo test --locked -p rockstream-sim --features simulation,docker_tests --test real_cluster_chaos_soak_tests worker_state_enospc_withholds_source_ack_and_recovers_exactly -- --exact --test-threads=1
       - name: Prove real PostgreSQL CDC slot ACK recovery into Kafka
         env:
           ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos/postgres-cdc
@@ -90,3 +95,4 @@ jobs:
           for summary in target/real-cluster-chaos/recovery-*/real-cluster-chaos-summary.md; do if [ -f "$summary" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi; done
           if [ -f target/real-cluster-chaos/stale-owner/stale-owner-summary.md ]; then cat target/real-cluster-chaos/stale-owner/stale-owner-summary.md >> "$GITHUB_STEP_SUMMARY"; fi
           for summary in target/real-cluster-chaos/sink-cursor-gap-*/sink-cursor-gap-summary.md; do if [ -f "$summary" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi; done
+          for summary in target/real-cluster-chaos/worker-state-enospc-*/worker-state-enospc-summary.md; do if [ -f "$summary" ]; then cat "$summary" >> "$GITHUB_STEP_SUMMARY"; fi; done
